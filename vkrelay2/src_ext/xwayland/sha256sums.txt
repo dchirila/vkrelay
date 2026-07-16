@@ -1,0 +1,8 @@
+# Pinned SHA-256 of the Ubuntu Jammy source-package inputs for Xwayland 2:22.1.1-1ubuntu0.20
+# (jammy-security). Authoritative integrity pins for build_private_xwayland.sh. The orig tarball is
+# byte-identical to pristine upstream xwayland-22.1.1.tar.xz; ALL Ubuntu security fixes live in the
+# .debian.tar.xz quilt series (60+ CVE patches), which dpkg-source applies before our guard.
+5dca3498a0d381d483195db9b8a15b61475d937eb9a7b7b57a2e2b7d60456194  xwayland_22.1.1-1ubuntu0.20.dsc
+c36e977ad50dd755cac94936d617003bf1a9ce61b6ccdedd7655c74b73152292  xwayland_22.1.1-1ubuntu0.20.debian.tar.xz
+f5d0e0ba37e19bb87c62f61da5970bd204939f2120620964bed4cc8495baa657  xwayland_22.1.1.orig.tar.xz
+5cf0f7c63c5943a24ab012e89fd08f66c0c2ab9a2f1a08297e3ab7967c330a23  xwayland_22.1.1.orig.tar.xz.asc

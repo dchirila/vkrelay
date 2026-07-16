@@ -1,0 +1,26 @@
+# Build outputs
+/build/
+/out/
+**/build/
+**/out/
+**/CMakeUserPresets.json
+
+# Binary packages assembled by scripts/dev/package_release.sh
+vkrelay2/dist/
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+
+# OS cruft
+Thumbs.db
+.DS_Store
+
+# Local descriptor scratch (launch descriptors written at runtime)
+*.vkrelay2-descriptor.json
+
+# Vendored-dep offline source cache (src_ext build recipes fetch + hash-verify on demand;
+# the pinned sha256sums.txt + patches are authoritative, the tarball itself is not tracked)
+vkrelay2/src_ext/*/dist/

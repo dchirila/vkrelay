@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+# vkrelay2 user-facing launcher entry point.
+#
+# This is a THIN user interface only. It never builds a shell command string
+# from the target app's arguments: everything after "--" is forwarded verbatim
+# as an argv array to the compiled vkrelay2-launch helper, which crosses the
+# process boundary as a structured launch descriptor.
+#
+# It also brings up the Windows-side daemon on demand: the daemon (which owns
+# host Vulkan) is reused if one is already listening, else launched detached so
+# subsequent runs reuse it. The WSL client reaches it over the well-known port
+# without anyone typing host:port.
+#
+# WSL networking modes:
+#   * Mirrored (the modern WSL2 default, and what we recommend): Windows and WSL
+#     share the loopback, so the daemon binds 127.0.0.1, the client reaches it via
+#     127.0.0.1, and there is NO Windows Firewall prompt. This is the default here.
+#   * NAT (older default): loopback does not cross to Windows. Set VKRELAY2_BIND=0.0.0.0
+#     so the daemon listens on all interfaces; the script then reaches it via the
+#     default gateway automatically. The first such launch prompts the Windows
+#     Firewall (allow it once). Prefer enabling mirrored mode in .wslconfig:
+#       [wsl2]
+#       networkingMode=mirrored
+#
+# Examples:
+#   vkrun --list-gpus
+#   vkrun --gpu auto -- vkcube
+#   vkrun --gpu high-performance -- /path/to/app --title "a b c"
+#
+# Env overrides (rarely needed):
+#   VKRELAY2_LAUNCH        path to the Linux vkrelay2-launch binary
+#   VKRELAY2_WIN_BUILD     dir holding vkrelay2-supervisor.exe + vkrelay2-worker.exe
+#   VKRELAY2_DAEMON_HOST   force the host to reach the daemon at (skips auto-detect)
+#   VKRELAY2_DAEMON_PORT   control-plane port (default 13579)
+#   VKRELAY2_BIND          daemon bind address when auto-launching (default 127.0.0.1,
+#                          no firewall prompt; set 0.0.0.0 for NAT-mode WSL)
+#   VKRELAY2_NO_DAEMON=1   do not try to start/contact a daemon (offline / mock)
+#   VKRELAY2_ALLOW_MOCK_GPUS=1  testing only: let --list-gpus print the MOCKED adapter list
+#                          (offline fallback or a mock-worker daemon); refused by default
+#   VKRELAY2_WORKER_LOG    WSL path for the stderr redirect of a daemon this launcher AUTO-STARTS
+#                          (default: vkrelay2-worker-daemon.log beside the worker exe). A REUSED
+#                          daemon keeps the redirect it was originally started with -- for reuse
+#                          the override only names where the failure bundle LOOKS. A smoke that
+#                          owns its daemon (unique port -> always auto-starts) therefore gets an
+#                          owned log, never touching the default one.
+#   VKRELAY2_XWAYLAND_BIN  explicit Xwayland executable. Without it, a compatible provenance-
+#                          checked build/src_ext/xwayland/stage/Xwayland is preferred over PATH.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The private-session helpers (display/session/ICD bring-up) AND the WSLg read-only /tmp/.X11-unix
+# namespace workaround live in the shared lib, so this app-run path and the canary smokes share one
+# implementation. Sourced early (the lib is pure function definitions, no side effects) so
+# vkr_reexec_in_private_x11_namespace is available before daemon bring-up.
+# shellcheck source=lib_private_session.sh
+source "${script_dir}/lib_private_session.sh"
+
+# the launcher prefers RELEASE artifacts but the `--all` gate builds
+# DEBUG -- so a green gate does NOT refresh what an app run executes. Left silent, a developer can
+# gate (debug), then app-test yesterday's release worker/ICD/sidecar and never know. This closes
+# the trap at the point of use: report the flavor + mtime of each selected component, and WARN
+# LOUDLY + actionably when a chosen RELEASE artifact is OLDER than its debug sibling (the exact
+# "you rebuilt debug, release is stale" tell). Purely advisory (never blocks a run); the explicit
+# VKRELAY2_* overrides bypass the whole thing.
+vkr_build_flavor_of() { # <path> -> release|debug|other
+    case "$1" in
+    */build/linux-release/* | */build/windows-release/*) echo release ;;
+    */build/linux-debug/* | */build/windows-debug/*) echo debug ;;
+    *) echo other ;;
+    esac
+}
+vkr_report_component_flavor() { # <label> <path>
+    local label="$1" path="$2"
+    [[ -e "${path}" ]] || return 0
+    local flavor mt
+    flavor="$(vkr_build_flavor_of "${path}")"
+    mt="$(date -r "${path}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?')"
+    vkr_phase "build: ${label} flavor=${flavor} (${path##*/}, mtime ${mt})"
+    if [[ "${flavor}" == "release" ]]; then
+        local sib="${path}"
+        sib="${sib/\/build\/linux-release\///build/linux-debug/}"
+        sib="${sib/\/build\/windows-release\///build/windows-debug/}"
+        if [[ "${sib}" != "${path}" && -e "${sib}" && "${sib}" -nt "${path}" ]]; then
+            echo "vkrun: WARNING -- the release ${label} (${path##*/}) is OLDER" \
+                "than its debug build; you may be app-testing a STALE release stack. Run" \
+                "'scripts/dev/rebuild_all.sh --release' to refresh it (or set the matching" \
+                "VKRELAY2_* override to pin a build)." >&2
+            vkr_phase "build: WARNING ${label} release is stale vs debug"
+        fi
+    fi
+}
+
+# Locate the vkrelay2-launch binary: explicit override, then alongside this
+# script, then a sibling build tree, then PATH.
+launch_bin="${VKRELAY2_LAUNCH:-}"
+if [[ -z "${launch_bin}" ]]; then
+    # RELEASE before DEBUG. The debug trees are -O0 + (on MSVC) checked-iterator STL --
+    # measured 4x+ slower end to end on real apps -- so a user-facing run must take the release
+    # binaries whenever they exist. Explicit overrides (VKRELAY2_LAUNCH / VKRELAY2_WIN_BUILD /
+    # VKRELAY2_ICD_MANIFEST / VKRELAY2_SIDECAR_BIN) still pin either tree, and the debug fallback
+    # keeps dev boxes working with only the debug preset built.
+    for candidate in \
+        "${script_dir}/vkrelay2-launch" \
+        "${script_dir}/../../build/linux-release/vkrelay2-launch" \
+        "${script_dir}/../../build/linux-debug/vkrelay2-launch"; do
+        if [[ -x "${candidate}" ]]; then
+            launch_bin="${candidate}"
+            break
+        fi
+    done
+fi
+if [[ -z "${launch_bin}" ]]; then
+    if command -v vkrelay2-launch >/dev/null 2>&1; then
+        launch_bin="vkrelay2-launch"
+    else
+        echo "vkrun: cannot find vkrelay2-launch (set VKRELAY2_LAUNCH)" >&2
+        exit 127
+    fi
+fi
+
+# --- Windows-side daemon bring-up (reuse-or-launch) -------------------------
+
+daemon_port="${VKRELAY2_DAEMON_PORT:-13579}"
+
+# The Windows host as seen from WSL2: NAT mode reaches it via the default gateway;
+# mirrored / localhostForwarding mode reaches it via loopback. (Empty on failure.)
+gateway_ip() { ip route show default 2>/dev/null | awk '{print $3; exit}'; }
+
+# Host candidates to reach the daemon: an explicit override wins; else loopback
+# (mirrored WSL) then the default gateway (NAT-mode WSL).
+daemon_host_candidates() {
+    if [[ -n "${VKRELAY2_DAEMON_HOST:-}" ]]; then
+        printf '%s\n' "${VKRELAY2_DAEMON_HOST}"
+        return
+    fi
+    printf '127.0.0.1\n'
+    local gw
+    gw="$(gateway_ip)"
+    [[ -n "${gw}" && "${gw}" != "127.0.0.1" ]] && printf '%s\n' "${gw}"
+}
+
+# Echoes the first candidate host that answers on daemon_port (short timeout), or
+# nothing. A plain TCP connect+close; the daemon tolerates it as a dropped session.
+# NOTE: a successful connect only proves the listen backlog accepts -- it does NOT prove the
+# one-at-a-time control loop is healthy (a daemon wedged behind a stalled session still accepts).
+# Use daemon_healthy() to decide reuse; reachable_host() now only distinguishes "a port is open"
+# (wedged) from "nothing is listening" (launch a fresh daemon).
+reachable_host() {
+    local h
+    for h in $(daemon_host_candidates); do
+        if timeout 2 bash -c "exec 3<>/dev/tcp/${h}/${daemon_port}" 2>/dev/null; then
+            printf '%s\n' "${h}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Protocol-level health check: echoes the first candidate host whose daemon
+# actually ANSWERS a control handshake (vkrelay2-launch --ping has its own tight C++ deadline), or
+# nothing. A `timeout` belt guards against the launch process itself hanging. This is what decides
+# reuse -- so a wedged daemon (port open, loop stuck) is NOT mistaken for a healthy one.
+daemon_healthy() {
+    local h
+    for h in $(daemon_host_candidates); do
+        if timeout 6 "${launch_bin}" --ping --daemon "${h}:${daemon_port}" >/dev/null 2>&1; then
+            printf '%s\n' "${h}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Resolves the dir holding the Windows daemon + worker (.exe). Empty on a host
+# with no Windows build (e.g. native Linux).
+resolve_win_build() {
+    local dirs=()
+    [[ -n "${VKRELAY2_WIN_BUILD:-}" ]] && dirs+=("${VKRELAY2_WIN_BUILD}")
+    # release before debug (same rationale as the launch_bin candidates above).
+    dirs+=("${script_dir}/../../build/windows-release" "${script_dir}/../../build/windows-debug")
+    local d
+    for d in "${dirs[@]}"; do
+        if [[ -x "${d}/vkrelay2-supervisor.exe" && -x "${d}/vkrelay2-worker.exe" ]]; then
+            printf '%s\n' "${d}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Ensures a daemon is reachable, exporting VKRELAY2_DAEMON_HOST to the host that
+# answered. Reuses a running daemon; else launches one detached on the Windows
+# side (Start-Process) so later runs reuse it. Best-effort: on failure the
+# launcher still falls back to its local mock list.
+ensure_daemon() {
+    # Deterministic worker-log path (beside the worker exe) so the failure bundle can fold in the
+    # daemon/worker stderr whether we START the daemon (redirected below) or REUSE one a prior run
+    # started with the same redirect. Best-effort: unset if there is no Windows build.
+    if command -v wslpath >/dev/null 2>&1; then
+        local _wb
+        if _wb="$(resolve_win_build)"; then
+            export VKR_WORKER_LOG_WSL="${VKRELAY2_WORKER_LOG:-${_wb}/vkrelay2-worker-daemon.log}"
+        fi
+    fi
+    local host
+    # Reuse only a HEALTHY daemon -- one that answers a real handshake, not merely a port that accepts
+    # (a wedged daemon still accepts, and reusing it is exactly what produced the hang).
+    if host="$(daemon_healthy)"; then
+        export VKRELAY2_DAEMON_HOST="${host}"
+        vkr_phase "daemon: reusing a healthy daemon at ${host}:${daemon_port}"
+        return 0
+    fi
+    # A port is open but the handshake did not answer -> the daemon is WEDGED. Do not launch a second
+    # one (the bind would fail): fail closed with a clear restart instruction instead of hanging.
+    if host="$(reachable_host)"; then
+        echo "vkrun: a process is listening on ${host}:${daemon_port} but its control" >&2
+        echo "  plane did not answer a handshake within the health-check deadline -- the daemon appears" >&2
+        echo "  WEDGED. Stop it (kill vkrelay2-supervisor.exe on the Windows side) and re-run." >&2
+        vkr_phase "daemon: WEDGED at ${host}:${daemon_port} (port open, handshake unanswered) -- failing closed"
+        return 1
+    fi
+
+    if ! command -v powershell.exe >/dev/null 2>&1 || ! command -v wslpath >/dev/null 2>&1; then
+        return 1 # not a WSL host bridging to Windows; nothing to launch
+    fi
+    local win_build
+    if ! win_build="$(resolve_win_build)"; then
+        echo "vkrun: no daemon reachable and no Windows build found" \
+             "(set VKRELAY2_WIN_BUILD to the dir holding vkrelay2-supervisor.exe)" >&2
+        return 1
+    fi
+
+    # Preflight (Intel-iGPU bring-up findings): powershell.exe resolving on PATH does NOT prove
+    # Windows binaries can run -- a missing WSLInterop binfmt_misc registration (seen flaking on
+    # systemd-enabled distros) makes every .exe exec die with "Exec format error", and the
+    # backgrounded Start-Process below swallows exactly that into /dev/null, leaving only the
+    # generic 20s timeout. Probe interop by actually EXECUTING powershell once and name the
+    # remedy on failure. Only this auto-start path pays the probe; reusing a healthy daemon
+    # never reaches here.
+    if ! powershell.exe -NoProfile -NonInteractive -Command 'exit 0' </dev/null >/dev/null 2>&1; then
+        echo "vkrun: cannot EXECUTE Windows binaries from WSL (powershell.exe" >&2
+        echo "  failed to run -- usually a missing WSLInterop binfmt registration), so the daemon" >&2
+        echo "  cannot be auto-started. Re-register interop (as root):" >&2
+        echo "    echo ':WSLInterop:M::MZ::/init:PF' > /proc/sys/fs/binfmt_misc/register" >&2
+        echo "  and make it survive restarts via /etc/wsl.conf:" >&2
+        echo "    [boot]" >&2
+        echo "    command = /bin/sh -c \"[ -e /proc/sys/fs/binfmt_misc/WSLInterop ] || echo :WSLInterop:M::MZ::/init:PF > /proc/sys/fs/binfmt_misc/register\"" >&2
+        vkr_phase "daemon: preflight FAILED -- WSL interop cannot execute Windows binaries"
+        return 1
+    fi
+
+    # we are about to START this worker binary -- report its flavor +
+    # warn if it is a stale release build (a reused daemon, handled above, keeps whatever it was
+    # started with; the health check gates its liveness).
+    vkr_report_component_flavor "windows worker" "${win_build}/vkrelay2-worker.exe"
+    local sup_win wrk_win bind
+    sup_win="$(wslpath -w "${win_build}/vkrelay2-supervisor.exe")"
+    wrk_win="$(wslpath -w "${win_build}/vkrelay2-worker.exe")"
+    # Bind loopback by default: in mirrored-networking WSL (the modern default) the
+    # client reaches it via 127.0.0.1 with NO Windows Firewall prompt. NAT-mode WSL
+    # cannot reach a loopback bind -- set VKRELAY2_BIND=0.0.0.0 (the script then
+    # reaches it via the default gateway; that first launch prompts the firewall).
+    bind="${VKRELAY2_BIND:-127.0.0.1}"
+    # Preflight: NAT-mode WSL cannot reach a Windows loopback bind at all -- without this, the
+    # only symptom is the generic 20s health-wait timeout below. Name the known-dead combination
+    # BEFORE starting the daemon. Advisory (the wait still runs), so a setup with its own
+    # routing/port-proxy keeps working; mirrored/other modes and explicit binds are untouched.
+    if [[ "${bind}" == "127.0.0.1" ]] && command -v wslinfo >/dev/null 2>&1 \
+        && [[ "$(wslinfo --networking-mode 2>/dev/null)" == "nat" ]]; then
+        echo "vkrun: WARNING -- WSL networking mode is NAT and the daemon is about" >&2
+        echo "  to bind 127.0.0.1 on Windows, which NAT-mode WSL cannot reach. Either enable mirrored" >&2
+        echo "  networking ([wsl2] networkingMode=mirrored in %UserProfile%\\.wslconfig, then" >&2
+        echo "  wsl --shutdown) or re-run with VKRELAY2_BIND=0.0.0.0 (allow the Windows Firewall" >&2
+        echo "  prompt once)." >&2
+        vkr_phase "daemon: WARNING NAT networking + loopback bind (expected unreachable)"
+    fi
+    # Auto-start a REAL-backend daemon: a real daemon serves --list-gpus fine and is what an app-run
+    # needs (mock workers produce no real window). A reused daemon is still backend-checked at the
+    # session handshake (lib_private_session.sh fails closed on a mock one).
+    local args="'--serve','--worker','${wrk_win}','--bind','${bind}','--vulkan-backend','real'"
+    [[ "${daemon_port}" != "13579" ]] && args="${args},'--port','${daemon_port}'"
+
+    # Capture the daemon/worker stderr (the relay's authoritative record-failure / UNIMPL / crash
+    # reasons) to a Windows-side file the WSL cleanup can fold into the failure bundle.
+    # The file lives beside the worker exe so both sides can name it; only a daemon WE start is
+    # captured (a reused one keeps its original redirect). VKR_WORKER_LOG_WSL is read by
+    # vkr_session_cleanup.
+    local worker_log_wsl worker_log_win
+    worker_log_wsl="${VKRELAY2_WORKER_LOG:-${win_build}/vkrelay2-worker-daemon.log}"
+    worker_log_win="$(wslpath -w "${worker_log_wsl}")"
+    export VKR_WORKER_LOG_WSL="${worker_log_wsl}"
+
+    echo "vkrun: starting the vkrelay2 daemon on the Windows side..." >&2
+    vkr_phase "daemon: starting a fresh daemon on the Windows side"
+    # CRITICAL (field hang): do NOT block on the powershell invocation. WSL interop is the trap --
+    # `Start-Process -RedirectStandardError/-RedirectStandardOutput` forces UseShellExecute=false, so
+    # the DETACHED daemon inherits powershell's interop handles; the WSL `/init` proxy for powershell
+    # then does not return until the DAEMON ITSELF exits (its whole lifetime). Run synchronously, that
+    # hangs the launcher right here -- BEFORE the bounded health wait below -- which is exactly the
+    # field symptom (launcher stuck at "starting a fresh daemon", daemon up but never contacted).
+    # Redirecting powershell's own stdin from /dev/null does NOT help (verified). So BACKGROUND it,
+    # let the health-wait loop confirm the daemon, then REAP the interop proxy -- the daemon is an
+    # independent Win32 process (Start-Process) and SURVIVES the proxy being killed (verified).
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \
+        "Start-Process -FilePath '${sup_win}' -ArgumentList ${args} -RedirectStandardError '${worker_log_win}' -RedirectStandardOutput '${worker_log_win}.out' -WindowStyle Hidden" \
+        </dev/null >/dev/null 2>&1 &
+    local ps_proxy=$!
+    vkr_phase "daemon: Windows Start-Process launched (backgrounded interop proxy pid ${ps_proxy})"
+
+    # Wait until the daemon is HEALTHY (answers a handshake), not merely until its port accepts -- so
+    # we never proceed to --open-session against a daemon that is still coming up. Reap the
+    # detached interop proxy on the way out (success OR failure); killing it does not kill the daemon.
+    local waited=0
+    while ((waited < 20)); do
+        if host="$(daemon_healthy)"; then
+            export VKRELAY2_DAEMON_HOST="${host}"
+            kill "${ps_proxy}" 2>/dev/null || true
+            vkr_phase "daemon: started + healthy at ${host}:${daemon_port}"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    kill "${ps_proxy}" 2>/dev/null || true
+    echo "vkrun: daemon not reachable on port ${daemon_port} after 20s." \
+         "If this is NAT-mode WSL, retry with VKRELAY2_BIND=0.0.0.0 (allow the Windows" \
+         "Firewall prompt once), or enable mirrored networking in .wslconfig." >&2
+    return 1
+}
+
+# Only launcher-side arguments (those BEFORE the first "--") select a mode or the
+# daemon. Everything after "--" is the target app's argv and must never be read as a
+# launcher flag (e.g. `-- /bin/echo --list-gpus` must run echo, not list GPUs).
+launcher_args=()
+for arg in "$@"; do
+    [[ "${arg}" == "--" ]] && break
+    launcher_args+=("${arg}")
+done
+
+# Detect the selected mode (only launcher-side args, before "--", select one).
+has_mode=0
+list_gpus_requested=0
+app_launch_mode=0 # an explicit --run / --run-descriptor: these spawn a target app
+if [[ ${#launcher_args[@]} -gt 0 ]]; then
+    for arg in "${launcher_args[@]}"; do
+        case "${arg}" in
+            --run | --run-descriptor | --print-descriptor | --descriptor-out | --list-gpus | --help | -h)
+                has_mode=1
+                ;;
+        esac
+        [[ "${arg}" == "--list-gpus" ]] && list_gpus_requested=1
+        case "${arg}" in
+            --run | --run-descriptor) app_launch_mode=1 ;;
+        esac
+    done
+fi
+
+# App-run = the wrapper is about to spawn a target app, so it MUST establish the worker session
+# + private display + ICD first and FAIL CLOSED otherwise -- it never falls through to the
+# system Vulkan stack. Two forms reach here: an explicit --run / --run-descriptor mode, or the
+# implicit "no mode + a target app after --". (The explicit --run / --run-descriptor modes must not
+# bypass this either. Raw descriptor-spawn with no session/display/ICD stays reachable by calling
+# the lower-level vkrelay2-launch directly.)
+app_run=0
+if ((app_launch_mode)); then
+    app_run=1
+elif [[ "${has_mode}" -eq 0 ]] && printf '%s\n' "$@" | grep -qx -- '--'; then
+    app_run=1
+fi
+
+# An app-run needs the private display; on a WSLg box /tmp/.X11-unix is read-only, so transparently
+# re-exec inside a private mount namespace with a writable overlay first (no sudo, no global change).
+# This precedes daemon bring-up so the entire app-run -- daemon contact + display + the app -- runs
+# in one namespace (Windows interop and TCP both work inside it). No-op when not needed.
+if ((app_run)); then
+    vkr_reexec_in_private_x11_namespace "$@"
+    # begin the phase trace BEFORE daemon contact (the first phase that can hang),
+    # so a stall in ANY bring-up phase is localized; vkr_session_cleanup folds it into the failure
+    # bundle. Best-effort -- if mktemp fails, vkr_phase degrades to stderr-only.
+    VKR_PHASE_LOG="$(mktemp "${TMPDIR:-/tmp}/vkrelay2-phase-XXXXXX.log" 2>/dev/null)" || VKR_PHASE_LOG=""
+    export VKR_PHASE_LOG
+    vkr_phase "bring-up: app-run starting (pid $$)"
+    # report the Linux launch binary's flavor now that the phase log
+    # exists (the ICD manifest + sidecar resolve from the same tree with the same release-first
+    # order, so this is representative of the whole Linux stack); the Windows worker is reported in
+    # ensure_daemon. A stale-release warning fires here if the debug sibling is newer.
+    vkr_report_component_flavor "linux launch" "${launch_bin}"
+    # Install cleanup traps NOW -- before daemon contact -- so even an early fail-fast abort (e.g. a
+    # wedged daemon detected in ensure_daemon, below) still tears down the phase-log temp and runs
+    # cleanup. Trap INT/TERM as well as EXIT: bash does NOT run an EXIT trap on an untrapped signal, so
+    # a `timeout`-killed run (SIGTERM -- exactly how a bounded OpenSCAD smoke ends) would otherwise skip
+    # cleanup AND the failure-log preservation. cleanup is idempotent.
+    trap 'vkr_session_cleanup "$?"' EXIT
+    trap 'vkr_session_cleanup 143; exit 143' TERM
+    trap 'vkr_session_cleanup 130; exit 130' INT
+fi
+
+# Modes that need the daemon (it owns host Vulkan): --list-gpus and app-run.
+if [[ "${VKRELAY2_NO_DAEMON:-0}" != "1" ]] && { ((list_gpus_requested)) || ((app_run)); }; then
+    # An app-run needs a HEALTHY daemon: if ensure_daemon can't reuse a healthy one, detects a WEDGED
+    # one, or can't launch one, FAIL FAST here instead of bringing up the private
+    # display and waiting on the --open-session backstop -- crisp fail-closed, not just bounded.
+    # --list-gpus stays best-effort (vkrelay2-launch then reports the daemon unreachable and, by
+    # default, refuses to print the mock list -- VKRELAY2_ALLOW_MOCK_GPUS=1 is the testing
+    # escape hatch), so only abort for app-run.
+    if ! ensure_daemon && ((app_run)); then
+        echo "vkrun: no healthy vkrelay2 daemon reachable; not launching" >&2
+        exit 1
+    fi
+    # learn the pinned HOST virtual desktop (physical px) from the daemon BEFORE the
+    # private display starts, so the guest X
+    # root is sized to the machine the daemon actually runs on -- never a hardcoded size. Pointer
+    # injection warps absolute-in-root, so an undersized root makes window regions beyond it
+    # unclickable. An old daemon advertises nothing (query exits 0, prints nothing) -> the display
+    # keeps its default: the backward-compatible fallback. But a FAILING query against the daemon
+    # ensure_daemon just proved healthy is a different animal (GD): silently
+    # falling through would put the session back on the undersized default root -- the exact
+    # known-bad unclickable-regions state GD exists to fix. Fail CLOSED (with a named override for
+    # whoever really wants the old behavior) instead of degrading silently.
+    if ((app_run)) && [[ -n "${VKRELAY2_DAEMON_HOST:-}" ]]; then
+        # Caller-inherited values must not survive a legacy query and masquerade as this
+        # daemon's snapshot.
+        unset VKRELAY2_DISPLAY_SNAPSHOT_ID VKRELAY2_HOST_VIRTUAL_W VKRELAY2_HOST_VIRTUAL_H \
+            VKRELAY2_HOST_WORK_W VKRELAY2_HOST_WORK_H VKRELAY2_HOST_DPI
+        if display_env="$(timeout 6 "${launch_bin}" --query-host-display \
+            --daemon "${VKRELAY2_DAEMON_HOST}:${daemon_port}" 2>/dev/null)"; then
+            while IFS= read -r line; do
+                [[ -n "${line}" ]] && export "${line?}"
+            done <<< "${display_env}"
+            if [[ -n "${VKRELAY2_HOST_VIRTUAL_W:-}" ]]; then
+                vkr_phase "daemon: display snapshot ${VKRELAY2_DISPLAY_SNAPSHOT_ID:-?} virtual ${VKRELAY2_HOST_VIRTUAL_W}x${VKRELAY2_HOST_VIRTUAL_H:-?}"
+            elif [[ -n "${VKRELAY2_HOST_WORK_W:-}" ]]; then
+                vkr_phase "daemon: legacy host work area ${VKRELAY2_HOST_WORK_W}x${VKRELAY2_HOST_WORK_H:-?} dpi ${VKRELAY2_HOST_DPI:-?}"
+            fi
+        else
+            query_rc=$?
+            if [[ "${VKRELAY2_ALLOW_DEFAULT_GUEST_ROOT:-0}" == "1" ]]; then
+                vkr_phase "daemon: host-display query FAILED (rc=${query_rc}; 124 = timeout) -- continuing on the DEFAULT guest root (VKRELAY2_ALLOW_DEFAULT_GUEST_ROOT=1)"
+            else
+                echo "vkrun: host-display query failed (rc=${query_rc}; 124 = timeout) against a healthy daemon; not launching (the default guest root would make window regions unclickable -- set VKRELAY2_ALLOW_DEFAULT_GUEST_ROOT=1 to run anyway)" >&2
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+if ((app_run)); then
+    # Bring up the private display + worker session + pin the ICD (fail-closed), then run the
+    # app as a CHILD (not exec) so we tear the display down when it exits. The lib was sourced near
+    # the top (for the namespace re-exec), so its functions are already defined here. Cleanup traps
+    # were installed above (before daemon contact).
+    manifest="${VKRELAY2_ICD_MANIFEST:-}"
+    if [[ -z "${manifest}" ]]; then
+        for cand in \
+            "$(dirname "${launch_bin}")/vkrelay2_icd.json" \
+            "${script_dir}/../../build/linux-release/vkrelay2_icd.json" \
+            "${script_dir}/../../build/linux-debug/vkrelay2_icd.json"; do
+            [[ -e "${cand}" ]] && { manifest="${cand}"; break; }
+        done
+    fi
+    # Forward the user's session-affecting flags (those before "--": --gpu / --display / --frontend)
+    # into the worker session, so the launched worker is selected with the user's choice -- matching
+    # the faithful launch-time GPU selection -- not the default auto. (The same flags also ride the
+    # child descriptor below; both must agree.)
+    session_flags=()
+    si=0
+    while [[ ${si} -lt ${#launcher_args[@]} ]]; do
+        case "${launcher_args[${si}]}" in
+            --gpu | --display | --frontend)
+                if [[ $((si + 1)) -lt ${#launcher_args[@]} ]]; then
+                    session_flags+=("${launcher_args[${si}]}" "${launcher_args[$((si + 1))]}")
+                fi
+                si=$((si + 2))
+                ;;
+            *)
+                si=$((si + 1))
+                ;;
+        esac
+    done
+    # GL-on-zink is the DEFAULT for an app-run (vkr_open_session_and_pin_icd exports the
+    # Mesa/zink env unless `--frontend vulkan13` opts out), so OpenGL apps need NO flag. Only warn on
+    # the opt-out, so a GL app that then renders blank / via llvmpipe is explained; the default and
+    # `--frontend opengl46zink` both route GL through the relay and need no note.
+    if printf '%s\n' "${session_flags[@]+"${session_flags[@]}"}" | grep -qx 'vulkan13'; then
+        echo "vkrun: NOTE -- '--frontend vulkan13' selected: GL is NOT routed through" \
+             "the relay (Vulkan-clean run); OpenGL apps will use the system GL stack (e.g. llvmpipe)." >&2
+    elif ! compgen -G '/usr/lib/*/dri/zink_dri.so' >/dev/null \
+        && ! compgen -G '/usr/lib/dri/zink_dri.so' >/dev/null; then
+        # Dependency preflight (advisory): the default GL frontend reaches the relay ONLY through
+        # Mesa's zink driver; with MESA_LOADER_DRIVER_OVERRIDE=zink exported by the session env, a
+        # Mesa without zink_dri.so fails GL context creation with an opaque app-side error. Name
+        # the missing package instead; advisory, so unusual Mesa layouts still proceed.
+        echo "vkrun: WARNING -- Mesa zink driver (zink_dri.so) not found; the" >&2
+        echo "  default GL frontend cannot route OpenGL through the relay. On Ubuntu:" >&2
+        echo "    sudo apt install libgl1-mesa-dri" >&2
+    fi
+    vkr_start_private_display \
+        || { echo "vkrun: private display setup failed; not launching" >&2; exit 1; }
+    vkr_open_session_and_pin_icd "${launch_bin}" "${manifest}" "vkrelay2-app" \
+        "${session_flags[@]+"${session_flags[@]}"}" \
+        || { echo "vkrun: session/ICD setup failed; not launching" >&2; exit 1; }
+    # Start the sidecar (X11 WM) and BLOCK on its readiness barrier before launching the app
+    # A no-op when the session carries no sidecar plane.
+    sidecar_bin="${VKRELAY2_SIDECAR_BIN:-}"
+    if [[ -z "${sidecar_bin}" ]]; then
+        for cand in \
+            "$(dirname "${launch_bin}")/vkrelay2-sidecar" \
+            "${script_dir}/../../build/linux-release/vkrelay2-sidecar" \
+            "${script_dir}/../../build/linux-debug/vkrelay2-sidecar"; do
+            [[ -x "${cand}" ]] && { sidecar_bin="${cand}"; break; }
+        done
+    fi
+    vkr_start_sidecar_and_wait_ready "${sidecar_bin}" \
+        || { echo "vkrun: sidecar setup failed; not launching" >&2; exit 1; }
+    # Capture the app's own stdout/stderr to app.log (TEE so the user still sees it live) -- it carries
+    # the GL/zink crash signature (MESA errors, the ICD abort-stub localizer, the app's own message),
+    # which the failure-log bundle (vkr_session_cleanup) preserves on a nonzero/timeout exit. An
+    # empty bundle made the last OpenSCAD crash un-chaseable. set -o pipefail + PIPESTATUS
+    # so the app's real rc survives the tee.
+    rc=0
+    set -o pipefail
+    # The projected-window path is X11: the session's WAYLAND_DISPLAY is INTERNAL plumbing (the
+    # headless compositor that hosts our Xwayland), not an app-facing presentation path. A
+    # Wayland-preferring toolkit (Blender >= 4.5 on Ubuntu 26.04) that sees it connects to the
+    # headless compositor and dies ("The Wayland connection broke"), so the APP env hides it and
+    # toolkits fall back to the projected X11 DISPLAY. The explicit `--display wayland` diagnostic
+    # mode keeps the variable (documented as not a complete presentation path).
+    app_env=(env)
+    case " ${session_flags[*]+"${session_flags[*]}"} " in
+        *" wayland "*) : ;;
+        *) app_env=(env -u WAYLAND_DISPLAY) ;;
+    esac
+    vkr_phase "app: spawning the target app (bring-up complete)"
+    if ((app_launch_mode)); then
+        # The explicit --run / --run-descriptor mode is already in "$@"; forward verbatim.
+        "${app_env[@]}" "${launch_bin}" "$@" 2>&1 | tee "${VKR_RUNTIME_DIR:-/tmp}/app.log"
+    else
+        # Implicit app-run: synthesize the --run mode in front of the forwarded argv.
+        "${app_env[@]}" "${launch_bin}" --run "$@" 2>&1 | tee "${VKR_RUNTIME_DIR:-/tmp}/app.log"
+    fi
+    rc=${PIPESTATUS[0]}
+    vkr_phase "app: exited rc=${rc}"
+    exit "${rc}"
+fi
+
+# Non-app launcher mode (--print-descriptor / --descriptor-out / --list-gpus / --help) or no
+# target app: forward as-is.
+exec "${launch_bin}" "$@"

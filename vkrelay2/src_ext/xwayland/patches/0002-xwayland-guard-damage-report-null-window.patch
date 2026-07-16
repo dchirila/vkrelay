@@ -1,0 +1,45 @@
+From: Dragos-Bogdan Chirila <dchirila@gmail.com>
+Subject: [PATCH] xwayland: guard damage_report against a NULL xwl_window
+
+damage_report() already tolerates a NULL xwl_window in its first three
+blocks (each is guarded with `if (xwl_window && ...)`), but its final block
+dereferences xwl_window unconditionally:
+
+    window_pixmap = screen->GetWindowPixmap(xwl_window->surface_window);
+    if (xwl_is_client_pixmap(window_pixmap))
+        xwl_screen->screen->DestroyPixmap(xwl_window_swap_pixmap(xwl_window, FALSE));
+
+A damage report can fire for a window that has no associated xwl_window
+(xwl_window_from_window() returns NULL for such a window). This happens in
+the rootless-composite path when a client reconfigures/moves a window during
+startup: ConfigureWindow -> xwl_move_window -> miMoveWindow -> damageCopyWindow
+-> damageRegionAppend -> damage_report, with xwl_window == NULL, crashing the
+whole guest X server with a NULL dereference at &((struct xwl_window *)0)->
+surface_window (offset 0x40 on this ABI).
+
+Mirror the guards already present earlier in the SAME function: with no
+xwl_window there is no Wayland surface pixmap to swap, so skip the final block
+instead of dereferencing NULL.
+
+Reproduced deterministically on a seatless weston-headless + rootless-Xwayland
+stack (Xwayland 24.1.x) by launching a normal GL application (Blender, OpenSCAD)
+whose startup reconfigures its window; the same guarded build survives it.
+Xwayland 23.2.x does not reach this crash, but the guard is correct there too.
+
+--- a/hw/xwayland/xwayland-window.c
++++ b/hw/xwayland/xwayland-window.c
+@@ -317,9 +317,11 @@ damage_report(DamagePtr pDamage, RegionPtr pRegion, void *data)
+     if (xwl_window && xorg_list_is_empty(&xwl_window->link_damage))
+         xorg_list_add(&xwl_window->link_damage, &xwl_screen->damage_window_list);
+
+-    window_pixmap = screen->GetWindowPixmap(xwl_window->surface_window);
+-    if (xwl_is_client_pixmap(window_pixmap))
+-        xwl_screen->screen->DestroyPixmap(xwl_window_swap_pixmap(xwl_window, FALSE));
++    if (xwl_window) {
++        window_pixmap = screen->GetWindowPixmap(xwl_window->surface_window);
++        if (xwl_is_client_pixmap(window_pixmap))
++            xwl_screen->screen->DestroyPixmap(xwl_window_swap_pixmap(xwl_window, FALSE));
++    }
+ }
+
+ static void

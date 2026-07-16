@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "note": "session-1 mocked smoke metadata; no apps run yet. Authoritative source is vkr::protocol::default_matrix(); unit_smoke_matrix asserts this stays complete.",
+  "entries": [
+    { "display_backend": "x11-xwayland", "graphics_frontend": "vulkan13", "surface_shape": "top-level", "gpu_selector": "auto", "canary": "vulkan13-x11-xwayland-top-level-canary", "implemented": false },
+    { "display_backend": "x11-xwayland", "graphics_frontend": "vulkan13", "surface_shape": "popup-menu", "gpu_selector": "auto", "canary": "vulkan13-x11-xwayland-popup-menu-canary", "implemented": false },
+    { "display_backend": "x11-xwayland", "graphics_frontend": "vulkan13", "surface_shape": "embedded-subsurface", "gpu_selector": "auto", "canary": "vulkan13-x11-xwayland-embedded-subsurface-canary", "implemented": false },
+    { "display_backend": "x11-xwayland", "graphics_frontend": "opengl46-zink", "surface_shape": "top-level", "gpu_selector": "auto", "canary": "opengl46-zink-x11-xwayland-top-level-canary", "implemented": false },
+    { "display_backend": "x11-xwayland", "graphics_frontend": "opengl46-zink", "surface_shape": "popup-menu", "gpu_selector": "auto", "canary": "opengl46-zink-x11-xwayland-popup-menu-canary", "implemented": false },
+    { "display_backend": "x11-xwayland", "graphics_frontend": "opengl46-zink", "surface_shape": "embedded-subsurface", "gpu_selector": "auto", "canary": "opengl46-zink-x11-xwayland-embedded-subsurface-canary", "implemented": false },
+    { "display_backend": "wayland-native", "graphics_frontend": "vulkan13", "surface_shape": "top-level", "gpu_selector": "auto", "canary": "vulkan13-wayland-native-top-level-canary", "implemented": false },
+    { "display_backend": "wayland-native", "graphics_frontend": "vulkan13", "surface_shape": "popup-menu", "gpu_selector": "auto", "canary": "vulkan13-wayland-native-popup-menu-canary", "implemented": false },
+    { "display_backend": "wayland-native", "graphics_frontend": "vulkan13", "surface_shape": "embedded-subsurface", "gpu_selector": "auto", "canary": "vulkan13-wayland-native-embedded-subsurface-canary", "implemented": false },
+    { "display_backend": "wayland-native", "graphics_frontend": "opengl46-zink", "surface_shape": "top-level", "gpu_selector": "auto", "canary": "opengl46-zink-wayland-native-top-level-canary", "implemented": false },
+    { "display_backend": "wayland-native", "graphics_frontend": "opengl46-zink", "surface_shape": "popup-menu", "gpu_selector": "auto", "canary": "opengl46-zink-wayland-native-popup-menu-canary", "implemented": false },
+    { "display_backend": "wayland-native", "graphics_frontend": "opengl46-zink", "surface_shape": "embedded-subsurface", "gpu_selector": "auto", "canary": "opengl46-zink-wayland-native-embedded-subsurface-canary", "implemented": false }
+  ]
+}

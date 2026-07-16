@@ -1,0 +1,8 @@
+# Keep line endings deterministic across Windows/WSL checkouts.
+# LF everywhere by default; shell scripts MUST stay LF (they run under Git Bash
+# and WSL). Windows batch files use CRLF.
+* text=auto eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+*.png binary
+*.jpg binary

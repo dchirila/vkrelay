@@ -1,0 +1,39 @@
+From: Dragos-Bogdan Chirila <dchirila@gmail.com>
+Subject: [PATCH] xwayland: guard seatless pointer-warp against a NULL wl_seat
+
+xwl_cursor_warped_to() dereferences xwl_seat->focus_window without first
+checking that the seat is non-NULL. When the Wayland compositor advertises
+no wl_seat (for example Weston's headless backend, which vkrelay2 uses and
+drives application input out-of-band through XTEST), xwl_screen_get_default_seat()
+returns NULL and any client pointer warp -- e.g. an application recentering
+the pointer during a view rotation -- crashes Xwayland with a NULL dereference
+at &((struct xwl_seat *)0)->focus_window (offset 0xa0 on this ABI).
+
+The sibling callback xwl_cursor_confined_to() already guards this exact
+condition with `if (!xwl_seat) return;`. Mirror that guard here: with no
+wl_seat there is no Wayland pointer whose position could be emulated, so
+returning without emulation is the correct behaviour. The X server's core
+warp has already happened; this callback is only the Wayland-side emulation
+hook.
+
+Reproduced deterministically by vkrelay2-rotate-canary (a pure-xcb client
+that grabs the pointer and XWarpPointer-recenters) on a seatless
+weston-headless + rootless-Xwayland stack; the same guarded build survives it.
+
+--- a/hw/xwayland/xwayland-screen.c
++++ b/hw/xwayland/xwayland-screen.c
+@@ -229,6 +229,14 @@
+     if (!xwl_seat)
+         xwl_seat = xwl_screen_get_default_seat(xwl_screen);
+ 
++    /* A seatless compositor (for example Weston's headless backend, which
++     * advertises no wl_seat) leaves xwl_screen_get_default_seat() returning
++     * NULL. There is then no Wayland pointer whose position we could emulate,
++     * so mirror the guard already present in xwl_cursor_confined_to() and bail
++     * out instead of dereferencing a NULL seat in the focus_window test below. */
++    if (!xwl_seat)
++        return;
++
+     if (!window)
+         window = XYToWindow(sprite, x, y);
+ 

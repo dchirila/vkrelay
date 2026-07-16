@@ -1,0 +1,21 @@
+# vkrelay2 static-analysis profile.
+# Not a session-1 hard gate; documented and runnable now, tightened later.
+# Run: clang-tidy -p <build-dir> <file.cpp>
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  readability-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-owning-memory
+WarningsAsErrors: ''
+HeaderFilterRegex: 'vkrelay2/.*'
+FormatStyle: file

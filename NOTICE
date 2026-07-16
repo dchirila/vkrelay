@@ -1,0 +1,17 @@
+vkrelay2
+Copyright 2026 Dragos-Bogdan Chirila
+
+This product includes software developed by Dragos-Bogdan Chirila.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this software except in compliance with the License. You may obtain a copy of
+the License at http://www.apache.org/licenses/LICENSE-2.0, or in the LICENSE
+file distributed with this software.
+
+---
+
+vkrelay2 forwards graphics work to, and depends at build and run time on,
+third-party components that are not distributed in this source repository and
+that carry their own licenses, including but not limited to: the Vulkan loader
+and headers, Mesa (including the Zink driver), Xwayland and the X.Org libraries,
+and Weston. Their respective copyrights and licenses apply to those components.

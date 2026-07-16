@@ -1,0 +1,42 @@
+name: ci
+
+# Minimal continuous integration: build the Linux half and run the unit tests. The Windows
+# supervisor/worker (MSVC) and any GPU-backed integration test stay a LOCAL gate -- they need a
+# Windows host with a real Vulkan driver, which GitHub-hosted Linux runners do not have. This job
+# is the fast, hardware-independent guard: it catches build breaks and pure-logic regressions
+# (protocol wire, display-layout math, launch-argv parsing, the mock==real oracle, ...).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-build-unit:
+    name: Linux build + unit tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ pkg-config \
+            libvulkan-dev \
+            libxcb1-dev libxcb-composite0-dev libxcb-shape0-dev \
+            libxcb-xtest0-dev libxcb-xfixes0-dev \
+            libgl-dev libx11-dev
+
+      - name: Configure
+        working-directory: vkrelay2
+        run: cmake --preset linux-release
+
+      - name: Build
+        working-directory: vkrelay2
+        run: cmake --build build/linux-release
+
+      - name: Unit tests
+        working-directory: vkrelay2
+        run: ctest --test-dir build/linux-release -R '^unit_' --output-on-failure
