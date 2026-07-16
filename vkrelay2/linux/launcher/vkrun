@@ -232,20 +232,18 @@ ensure_daemon() {
     fi
 
     # Preflight (Intel-iGPU bring-up findings): powershell.exe resolving on PATH does NOT prove
-    # Windows binaries can run -- a missing WSLInterop binfmt_misc registration (seen flaking on
-    # systemd-enabled distros) makes every .exe exec die with "Exec format error", and the
+    # Windows binaries can run -- broken WSL interop state makes every .exe exec die with
+    # "Exec format error", and the
     # backgrounded Start-Process below swallows exactly that into /dev/null, leaving only the
     # generic 20s timeout. Probe interop by actually EXECUTING powershell once and name the
     # remedy on failure. Only this auto-start path pays the probe; reusing a healthy daemon
     # never reaches here.
     if ! powershell.exe -NoProfile -NonInteractive -Command 'exit 0' </dev/null >/dev/null 2>&1; then
         echo "vkrun: cannot EXECUTE Windows binaries from WSL (powershell.exe" >&2
-        echo "  failed to run -- usually a missing WSLInterop binfmt registration), so the daemon" >&2
-        echo "  cannot be auto-started. Re-register interop (as root):" >&2
-        echo "    echo ':WSLInterop:M::MZ::/init:PF' > /proc/sys/fs/binfmt_misc/register" >&2
-        echo "  and make it survive restarts via /etc/wsl.conf:" >&2
-        echo "    [boot]" >&2
-        echo "    command = /bin/sh -c \"[ -e /proc/sys/fs/binfmt_misc/WSLInterop ] || echo :WSLInterop:M::MZ::/init:PF > /proc/sys/fs/binfmt_misc/register\"" >&2
+        echo "  failed to run), so the daemon cannot be auto-started." >&2
+        echo "  From Windows PowerShell or Command Prompt, run:" >&2
+        echo "    wsl --shutdown" >&2
+        echo "  Then reopen this distribution and retry." >&2
         vkr_phase "daemon: preflight FAILED -- WSL interop cannot execute Windows binaries"
         return 1
     fi

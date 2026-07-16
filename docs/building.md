@@ -25,15 +25,24 @@ Linux targets, but need a compatible system Xwayland or their own security-curre
 
 ## WSL Dependencies
 
-Install the normal build and runtime dependencies in the WSL distribution:
+`rebuild_all.sh` preflights the compiler, build tools, and development libraries before it changes
+either build tree. On Ubuntu, install the complete build set with:
 
 ```bash
 sudo apt update
 sudo apt install \
-    build-essential cmake ninja-build pkg-config \
-    libvulkan-dev vulkan-tools \
+    build-essential cmake ninja-build pkg-config git \
+    libvulkan-dev \
     libxcb1-dev libxcb-composite0-dev libxcb-shape0-dev libxcb-xtest0-dev libxcb-xfixes0-dev \
-    libgl-dev libx11-dev libgl1-mesa-dri mesa-utils \
+    libgl-dev libx11-dev
+```
+
+Install the runtime, diagnostic, and private-Xwayland recipe dependencies with:
+
+```bash
+sudo apt update
+sudo apt install \
+    vulkan-tools libgl1-mesa-dri mesa-utils \
     weston xwayland quilt
 ```
 
@@ -56,8 +65,8 @@ preflights both when it has to auto-start the daemon:
 
 - **Windows interop must actually execute `.exe` files.** If the `WSLInterop` binfmt registration
   is missing (this can flake on systemd-enabled distributions), every Windows binary fails with
-  `Exec format error` and the daemon can never be auto-started. The launcher probes this and
-  prints the re-registration remedy.
+  `Exec format error` and Windows builds or daemon auto-start cannot run. Both `rebuild_all.sh` and
+  the launcher probe actual `.exe` execution and recommend a full `wsl --shutdown` restart.
 - **WSL networking must let the client reach the daemon.** Mirrored networking
   (`[wsl2] networkingMode=mirrored` in `%UserProfile%\.wslconfig`) is recommended; in NAT mode the
   daemon's default `127.0.0.1` bind is unreachable from WSL and `VKRELAY2_BIND=0.0.0.0` is
@@ -69,15 +78,34 @@ path.
 
 ## Windows Dependencies
 
-Install:
+The complete Windows build lane requires:
 
-1. Visual Studio 2026 with the Desktop development with C++ workload.
-2. The Windows Vulkan SDK, including headers, loader import library, and tools.
-3. A current Vulkan driver from the GPU vendor.
+1. Visual Studio 2026 (Community, Professional, Enterprise, or Build Tools). In Visual Studio
+   Installer, select the **Desktop development with C++** workload and ensure these individual
+   components are selected:
+   - **MSVC Build Tools for x64/x86 (Latest)**;
+   - **C++ CMake tools for Windows** (provides the CMake and Ninja used by the wrapper);
+   - **Windows 11 SDK**;
+   - **C++ Clang tools for Windows**, required only for `--lint` and `--all` because the lint lane
+     uses its `clang-format.exe`.
 
-The CMake presets expect to run in an x64 Native Tools environment. Without a Vulkan SDK, the
-Windows worker still compiles with its mock backend, but real application sessions are unavailable
-and the user-facing launcher rejects that worker.
+   ATL, MFC, C++/CLI, AddressSanitizer, vcpkg, ARM toolchains, and older MSVC toolsets are not
+   required. These component names and IDs come from Microsoft's
+   [Visual Studio 2026 workload manifest](https://learn.microsoft.com/en-us/visualstudio/install/workload-component-id-vs-professional?view=visualstudio#desktop-development-with-c).
+2. The current LunarG **Vulkan SDK for Windows x64**, with **Core only**. On the installer's
+   **Select Components** screen, click **None**: **The Vulkan SDK Core (Always Installed)** remains
+   installed automatically. Leave GLM Headers, SDL libraries and headers, Volk, Shader Toolchain
+   Debug Symbols, Vulkan Memory Allocator, and ARM64 cross-compilation binaries unchecked. vkrelay2
+   requires only `Include\vulkan\vulkan.h` and `Lib\vulkan-1.lib`. The installer normally uses
+   `C:\VulkanSDK\<version>` and sets `VULKAN_SDK`; see LunarG's
+   [Windows SDK installation guide](https://vulkan.lunarg.com/doc/view/latest/windows/getting_started.html#install-the-sdk).
+3. A current Vulkan driver from the GPU vendor. This is a runtime requirement, not part of the SDK;
+   LunarG explicitly notes that the SDK does not install a driver.
+
+The CMake project can still produce a deliberately reduced mock-only worker without the SDK, but
+`rebuild_all.sh` is the complete product gate and therefore treats a missing SDK as an error. It
+checks both required SDK files before configuring CMake, preventing a partial build from appearing
+green.
 
 Note when building through `scripts/dev/rebuild_all.sh` from WSL right after installing the SDK:
 WSL's interop service caches the Windows environment, so a freshly set machine-level `VULKAN_SDK`
@@ -103,7 +131,14 @@ cd vkrelay2
 ```
 
 The script builds Linux natively in WSL and invokes the Visual Studio toolchain through Windows
-interop. It auto-detects the installed edition (Community, Professional, Enterprise, or
+interop. Before cleaning or configuring, it reports all missing Linux build dependencies and checks
+the selected Visual Studio environment, Windows SDK, and Vulkan SDK. To run only that preflight:
+
+```bash
+./scripts/dev/rebuild_all.sh --check-deps
+```
+
+The script auto-detects the installed edition (Community, Professional, Enterprise, or
 BuildTools, in that order) under:
 
 ```text

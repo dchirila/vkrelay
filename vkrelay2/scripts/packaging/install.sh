@@ -104,12 +104,10 @@ fi
 
 # --- 5. host capability checks + quickstart ---------------------------------------------
 if ! powershell.exe -NoProfile -NonInteractive -Command 'exit 0' </dev/null >/dev/null 2>&1; then
-    warn "cannot execute Windows binaries from WSL (WSLInterop binfmt registration missing).
-  The daemon cannot auto-start until this is fixed. Re-register as root:
-    echo ':WSLInterop:M::MZ::/init:PF' > /proc/sys/fs/binfmt_misc/register
-  and make it durable in /etc/wsl.conf:
-    [boot]
-    command = /bin/sh -c \"[ -e /proc/sys/fs/binfmt_misc/WSLInterop ] || echo :WSLInterop:M::MZ::/init:PF > /proc/sys/fs/binfmt_misc/register\""
+    warn "cannot execute Windows binaries from WSL, so the daemon cannot auto-start.
+  From Windows PowerShell or Command Prompt, run:
+    wsl --shutdown
+  Then reopen this distribution and retry."
 fi
 if command -v wslinfo >/dev/null 2>&1 \
     && [ "$(wslinfo --networking-mode 2>/dev/null)" = "nat" ]; then
