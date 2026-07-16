@@ -13,7 +13,7 @@ The configuration the full dual-platform gate runs on is:
 
 - Windows 11 and WSL2;
 - Ubuntu 22.04 amd64 in WSL;
-- Visual Studio 2026 Community with the x64 C++ toolchain;
+- Visual Studio 2026 (Community, Professional, or Enterprise) with the x64 C++ toolchain;
 - the LunarG Vulkan SDK visible to CMake on Windows;
 - a Windows Vulkan 1.3 driver for the selected GPU.
 
@@ -103,10 +103,17 @@ cd vkrelay2
 ```
 
 The script builds Linux natively in WSL and invokes the Visual Studio toolchain through Windows
-interop. It currently expects Visual Studio Community under:
+interop. It auto-detects the installed edition (Community, Professional, Enterprise, or
+BuildTools, in that order) under:
 
 ```text
-C:\Program Files\Microsoft Visual Studio\18\Community
+C:\Program Files\Microsoft Visual Studio\18\<Edition>
+```
+
+For a non-standard install location, point it at the install root explicitly:
+
+```bash
+export VKRELAY2_VS_DIR='D:\VS\18\Professional'
 ```
 
 Debug builds are the default:

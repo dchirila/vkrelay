@@ -56,10 +56,6 @@ done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 linux_preset="linux-${flavor}"
 windows_preset="windows-${flavor}"
-VS="C:\\Program Files\\Microsoft Visual Studio\\18\\Community"
-CLANG_FORMAT="/c/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-format.exe"
-# /c/... works from Git Bash; from WSL the same exe is under /mnt/c/...
-[[ -x "${CLANG_FORMAT}" ]] || CLANG_FORMAT="/mnt/c/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-format.exe"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 ok() { printf '\033[1;32m    %s\033[0m\n' "$*"; }
@@ -68,11 +64,49 @@ die() {
     exit 1
 }
 
+# --- Visual Studio detection -------------------------------------------------
+# The VS install root differs by edition (Community at home, Professional/Enterprise on work
+# machines, BuildTools on agents). Honor an explicit VKRELAY2_VS_DIR (Windows path), else probe
+# the standard editions in order. VS holds the Windows path (used inside the batch wrapper);
+# VS_UNIX the same root as this shell sees it (/c/... from Git Bash, /mnt/c/... from WSL).
+vs_editions=(Community Professional Enterprise BuildTools)
+VS=""
+VS_UNIX=""
+win_to_unix() { # C:\... -> existing unix path on stdout, or empty
+    local p tool
+    for tool in wslpath cygpath; do
+        command -v "${tool}" >/dev/null 2>&1 || continue
+        p="$("${tool}" -u "$1" 2>/dev/null || true)"
+        [[ -n "${p}" && -e "${p}" ]] && { printf '%s\n' "${p}"; return 0; }
+    done
+    return 0
+}
+if [[ -n "${VKRELAY2_VS_DIR:-}" ]]; then
+    VS="${VKRELAY2_VS_DIR%[\\/]}"
+    VS_UNIX="$(win_to_unix "${VS}")"
+else
+    for ed in "${vs_editions[@]}"; do
+        for prefix in /c /mnt/c; do
+            if [[ -e "${prefix}/Program Files/Microsoft Visual Studio/18/${ed}/VC/Auxiliary/Build/vcvars64.bat" ]]; then
+                VS="C:\\Program Files\\Microsoft Visual Studio\\18\\${ed}"
+                VS_UNIX="${prefix}/Program Files/Microsoft Visual Studio/18/${ed}"
+                break 2
+            fi
+        done
+    done
+fi
+CLANG_FORMAT="${VS_UNIX}/VC/Tools/Llvm/x64/bin/clang-format.exe"
+
+require_vs() { # only the Windows build and lint need VS; --linux-only must not care
+    [[ -n "${VS}" ]] || die "no Visual Studio 2026 found under 'C:\\Program Files\\Microsoft Visual Studio\\18\\{${vs_editions[*]// /,}}' -- set VKRELAY2_VS_DIR to its install root"
+}
+
 have_windows_interop() { command -v cmd.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; }
 
 # --- Windows-env wrapper: a tiny batch that enters the VS toolchain, then runs one mode ------------
 # Written into build/ (gitignored) and removed on exit. Static content (quoted heredoc); the repo
-# dir, preset, and mode ride in as %1/%2/%3 so there is no shell/backslash interpolation to mangle.
+# dir, preset, mode, and VS root ride in as %1/%2/%3/%4 so there is no shell/backslash
+# interpolation to mangle.
 wrapper_bat=""
 cleanup() { [[ -n "${wrapper_bat}" && -f "${wrapper_bat}" ]] && rm -f "${wrapper_bat}"; }
 trap cleanup EXIT
@@ -83,7 +117,7 @@ write_wrapper() {
     cat >"${wrapper_bat}" <<'BATEOF'
 @echo off
 setlocal
-set "VS=C:\Program Files\Microsoft Visual Studio\18\Community"
+set "VS=%~4"
 call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 set "PATH=%VS%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%VS%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%VS%\VC\Tools\Llvm\x64\bin;%PATH%"
 cd /d "%~1" || exit /b 1
@@ -106,11 +140,12 @@ BATEOF
 
 run_windows() { # <mode> <preset>
     local mode="$1" preset="$2"
+    require_vs
     [[ -n "${wrapper_bat}" ]] || write_wrapper
     local repo_win bat_win
     repo_win="$(wslpath -w "${repo_root}")"
     bat_win="$(wslpath -w "${wrapper_bat}")"
-    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' cmd.exe /c "${bat_win}" "${repo_win}" "${preset}" "${mode}"
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' cmd.exe /c "${bat_win}" "${repo_win}" "${preset}" "${mode}" "${VS}"
 }
 
 # --- clean ------------------------------------------------------------------
@@ -166,6 +201,8 @@ fi
 # --- lint (clang-format --Werror + bash -n) ---------------------------------
 if ((do_lint)); then
     step "lint: clang-format --Werror"
+    require_vs
+    [[ -n "${VS_UNIX}" ]] || die "cannot resolve '${VS}' to a local path (needs wslpath or cygpath)"
     [[ -x "${CLANG_FORMAT}" ]] || die "clang-format not found at ${CLANG_FORMAT}"
     have_windows_interop || die "clang-format needs Windows interop (it is the MSVC LLVM build)"
     # Exempt generated SPIR-V headers (*_spv.h): checked-in glslang output, not hand-maintained
