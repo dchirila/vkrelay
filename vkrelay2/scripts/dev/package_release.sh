@@ -9,7 +9,8 @@
 #
 # Usage:
 #   scripts/dev/package_release.sh            # package existing release builds
-#   scripts/dev/package_release.sh --build    # rebuild_all.sh --release first
+#   scripts/dev/package_release.sh --build    # rebuild vkrelay2 release halves first (not Xwayland)
+# The private-Xwayland stage is a separate, one-time-per-baseline input; --build does not create it.
 #
 # Output: dist/vkrelay2-<version>-<codename>-<arch>.tar.gz. A RELEASE package fails closed unless it
 #         comes from an exact, clean version tag AND a private Xwayland stage the recipe stamped

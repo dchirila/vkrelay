@@ -108,9 +108,11 @@ the ordinary `-- application ...` form is preferred for interactive use.
 ## Display Selection
 
 The launch descriptor accepts `--display auto|x11|wayland`. The supported projected-window path is
-currently X11 through the launcher's private rootless Xwayland server. Leave the value at `auto` for
-normal use. `wayland` is not a complete native-Wayland presentation path and should not be used as
-one.
+currently X11 through the launcher's private rootless Xwayland session. The executable for that
+session may be a compatible guarded stage, a copy bundled in a binary package, or an explicitly
+selected tested server; “private session” does not imply rebuilding Xwayland for every run. Leave the
+value at `auto` for normal use. `wayland` is not a complete native-Wayland presentation path and
+should not be used as one.
 
 ## Daemon and Networking
 
@@ -210,7 +212,10 @@ The following are properties of the current implementation, not configuration er
   builds it for the host distribution automatically on Ubuntu 22.04, 24.04, and 26.04 amd64 (it
   builds from that distribution's own security-current Xwayland source and applies only the
   applicable guard patch(es)), and the launcher auto-selects the result. Other distributions need a
-  compatible system Xwayland or their own security-current baseline.
+  compatible system Xwayland or their own security-current baseline. This binary is required for an
+  application launch, but not for `--list-gpus`, building vkrelay2, or running its normal `ctest`
+  suite; binary packages already include it. See [When the private build is
+  needed](building.md#when-the-private-build-is-needed).
 - There is no OS-level installer, service registration, or stable configuration file. A supported
   binary tar package is available (see [Installing](install.md)); a source checkout runs from
   build-tree paths.

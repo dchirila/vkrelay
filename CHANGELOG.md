@@ -14,6 +14,15 @@ between minor releases.
 - `scripts/dev/rebuild_all.sh` now preflights the complete Linux and Windows build dependencies
   before touching build trees, reports actionable Ubuntu/Visual Studio/Vulkan SDK installation
   guidance, and supports a preflight-only `--check-deps` mode.
+- Clarified that the guarded private Xwayland is an application-run and release-package dependency,
+  added a matching Linux readiness check to `rebuild_all.sh`, and documented when its separate build
+  stage must be refreshed. Direct builds, `--windows-only`, `--list-gpus`, normal `ctest` runs, and
+  binary-package installation do not build the stage. Preflight-only success now also returns status
+  zero when no temporary Windows wrapper was created.
+- Fixed `VKRELAY2_XWL_INSTALL_DEPS=1` on Ubuntu 22.04 by resolving the extracted source package's
+  `debian/control` through `mk-build-deps`; Jammy APT rejects the previously used local control path.
+- Isolated private-Xwayland package tests from WSLg's host GPU stack by selecting Mesa `llvmpipe` on
+  WSL, and fixed strict-gate reporting so full Meson test names remain intact.
 
 ## 0.1.0 — 2026-07-16
 
