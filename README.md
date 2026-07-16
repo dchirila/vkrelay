@@ -130,7 +130,13 @@ observe the license's disclaimer of warranty and limitation of liability.
 vkrelay2 forwards to a real host Vulkan driver and depends at build and run time on third-party
 components (the Vulkan loader, Mesa/Zink, Xwayland, Weston) that carry their own licenses.
 
-## Acknowledgements & future direction
+## Disclaimer
+
+vkrelay2 is a personal project, developed entirely on my own time and with my own resources. It is not
+affiliated with, sponsored, or endorsed by my employer, and nothing in this repository represents the
+views or positions of my employer or of any company mentioned.
+
+## Acknowledgements
 
 Although the value proposition of this project is easy to summarize ("make native-feeling OpenGL and
 Vulkan work in WSL"), there is a lot of depth underneath. As an after-work project built over two
@@ -141,7 +147,12 @@ agentic engineering effort, with a human at the steering wheel. That this "agent
 something functional and testable is quite astonishing — living proof of the power of these emerging
 tools.
 
-That said, while the software is functional, I would advise caution: consider it a strong prototype
+Last, but not least, I would like to express my gratitude to my family and friends, who put up with
+my absent-mindedness over the past two months.
+
+## Maturity & future direction
+
+While the software is functional, I would advise caution: consider it a strong prototype
 for now. I would be happy to see it grow, but that will take more people getting involved — GPU
 vendors and/or Microsoft. Contributions are welcome.
 
