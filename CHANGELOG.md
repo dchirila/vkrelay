@@ -4,6 +4,14 @@ All notable changes to vkrelay2 are documented here. The project follows
 [Semantic Versioning](https://semver.org/). While the version is below 1.0, behavior may change
 between minor releases.
 
+## Unreleased
+
+### Build
+
+- `scripts/dev/rebuild_all.sh` no longer requires Visual Studio Community: it auto-detects the
+  installed edition (Community, Professional, Enterprise, or BuildTools) and honors a
+  `VKRELAY2_VS_DIR` override for non-standard install roots.
+
 ## 0.1.0 — 2026-07-16
 
 Initial public release.
