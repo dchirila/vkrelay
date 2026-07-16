@@ -20,6 +20,7 @@
 #   scripts/dev/rebuild_all.sh --release       # use the *-release presets
 #   scripts/dev/rebuild_all.sh --linux-only    # skip the Windows half
 #   scripts/dev/rebuild_all.sh --windows-only  # skip the Linux half
+#   scripts/dev/rebuild_all.sh --check-deps    # preflight only; do not clean/build/test/lint
 # Flags combine, e.g.  scripts/dev/rebuild_all.sh --clean --all
 set -euo pipefail
 
@@ -30,6 +31,7 @@ do_clean=0
 do_linux=1
 do_windows=1
 flavor="debug"
+check_deps_only=0
 for arg in "$@"; do
     case "${arg}" in
         --tests) do_tests=1 ;;
@@ -42,8 +44,9 @@ for arg in "$@"; do
         --release) flavor="release" ;;
         --linux-only) do_windows=0 ;;
         --windows-only) do_linux=0 ;;
+        --check-deps) check_deps_only=1 ;;
         -h | --help)
-            sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -102,11 +105,28 @@ require_vs() { # only the Windows build and lint need VS; --linux-only must not 
 }
 
 have_windows_interop() { command -v cmd.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; }
+windows_interop_executes() { cmd.exe /d /c ver </dev/null >/dev/null 2>&1; }
+
+windows_interop_guidance() {
+    cat >&2 <<'EOF'
+
+Windows dependency preflight FAILED: WSL cannot execute Windows programs.
+cmd.exe is on PATH, but its execution failed (the cause of "cannot execute binary file:
+Exec format error").
+
+Restart WSL completely from Windows PowerShell or Command Prompt:
+  wsl --shutdown
+
+Then reopen this distribution and retry the command.
+
+More detail: docs/troubleshooting.md#daemon-auto-start-fails-windows-interop-broken
+EOF
+}
 
 # --- Windows-env wrapper: a tiny batch that enters the VS toolchain, then runs one mode ------------
 # Written into build/ (gitignored) and removed on exit. Static content (quoted heredoc); the repo
-# dir, preset, mode, and VS root ride in as %1/%2/%3/%4 so there is no shell/backslash
-# interpolation to mangle.
+# dir, preset, mode, VS root, and probe switches ride in as arguments so there is no
+# shell/backslash interpolation to mangle.
 wrapper_bat=""
 cleanup() { [[ -n "${wrapper_bat}" && -f "${wrapper_bat}" ]] && rm -f "${wrapper_bat}"; }
 trap cleanup EXIT
@@ -118,13 +138,84 @@ write_wrapper() {
 @echo off
 setlocal
 set "VS=%~4"
-call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
+if errorlevel 1 (
+    echo   - Could not initialize the VS x64 C++ environment from "%VS%". 1>&2
+    exit /b 1
+)
 set "PATH=%VS%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%VS%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%VS%\VC\Tools\Llvm\x64\bin;%PATH%"
 cd /d "%~1" || exit /b 1
 if "%~3"=="build" goto :build
 if "%~3"=="test" goto :test
+if "%~3"=="probe" goto :probe
 echo rebuild_all wrapper: unknown mode "%~3" 1>&2
 exit /b 2
+:probe
+set "FAILED="
+if "%~5"=="1" (
+    where cl.exe >nul 2>&1 || (
+        echo   - MSVC x64/x86 compiler not found. 1>&2
+        echo     Visual Studio Installer -^> Modify -^> Individual components: 1>&2
+        echo       "MSVC Build Tools for x64/x86 (Latest)" 1>&2
+        set "FAILED=1"
+    )
+    if not exist "%VS%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" (
+        echo   - VS-bundled CMake not found. 1>&2
+        echo     Visual Studio Installer -^> Modify -^> Individual components: 1>&2
+        echo       "C++ CMake tools for Windows" 1>&2
+        set "FAILED=1"
+    )
+    if not exist "%VS%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" (
+        echo   - VS-bundled Ninja not found. 1>&2
+        echo     Visual Studio Installer -^> Modify -^> Individual components: 1>&2
+        echo       "C++ CMake tools for Windows" 1>&2
+        set "FAILED=1"
+    )
+    if not defined WindowsSdkDir (
+        echo   - Windows SDK environment not found. 1>&2
+        echo     Visual Studio Installer -^> Modify -^> Individual components: "Windows 11 SDK" 1>&2
+        set "FAILED=1"
+    ) else (
+        if not exist "%WindowsSdkDir%Include\%WindowsSDKVersion%um\Windows.h" (
+            echo   - Windows SDK headers not found. 1>&2
+            echo     Repair/install "Windows 11 SDK" in Visual Studio Installer. 1>&2
+            set "FAILED=1"
+        )
+        if not exist "%WindowsSdkDir%Lib\%WindowsSDKVersion%um\x64\Shcore.lib" (
+            echo   - Windows SDK x64 libraries not found. 1>&2
+            echo     Repair/install "Windows 11 SDK" in Visual Studio Installer. 1>&2
+            set "FAILED=1"
+        )
+    )
+    if not defined VULKAN_SDK (
+        echo   - VULKAN_SDK is not visible. 1>&2
+        echo     Install the LunarG Vulkan SDK for Windows x64 with Core only. 1>&2
+        echo     On "Select Components", click "None"; Core remains installed automatically. 1>&2
+        echo     Default location: C:\VulkanSDK\[version]. Restart Windows after installation. 1>&2
+        set "FAILED=1"
+    ) else (
+        if not exist "%VULKAN_SDK%\Include\vulkan\vulkan.h" (
+            echo   - Vulkan headers missing at %VULKAN_SDK%\Include\vulkan\vulkan.h. 1>&2
+            echo     Repair/install the LunarG Vulkan SDK for Windows x64 with Core only. 1>&2
+            echo     On "Select Components", click "None"; Core remains installed automatically. 1>&2
+            set "FAILED=1"
+        )
+        if not exist "%VULKAN_SDK%\Lib\vulkan-1.lib" (
+            echo   - Vulkan loader import library missing at %VULKAN_SDK%\Lib\vulkan-1.lib. 1>&2
+            echo     Repair/install the LunarG Vulkan SDK for Windows x64 with Core only. 1>&2
+            echo     On "Select Components", click "None"; Core remains installed automatically. 1>&2
+            set "FAILED=1"
+        )
+    )
+)
+if "%~6"=="1" if not exist "%VS%\VC\Tools\Llvm\x64\bin\clang-format.exe" (
+    echo   - clang-format not found. 1>&2
+    echo     Visual Studio Installer -^> Modify -^> Individual components: 1>&2
+    echo       "C++ Clang tools for Windows" 1>&2
+    set "FAILED=1"
+)
+if defined FAILED exit /b 1
+exit /b 0
 :build
 rem Free the worker/supervisor .exe locks so linking can overwrite them (best-effort).
 taskkill /F /IM vkrelay2-worker.exe >nul 2>&1
@@ -138,15 +229,141 @@ exit /b 0
 BATEOF
 }
 
-run_windows() { # <mode> <preset>
-    local mode="$1" preset="$2"
+run_windows() { # <mode> <preset> [extra1] [extra2]
+    local mode="$1" preset="$2" extra1="${3:-}" extra2="${4:-}"
     require_vs
     [[ -n "${wrapper_bat}" ]] || write_wrapper
     local repo_win bat_win
     repo_win="$(wslpath -w "${repo_root}")"
     bat_win="$(wslpath -w "${wrapper_bat}")"
-    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' cmd.exe /c "${bat_win}" "${repo_win}" "${preset}" "${mode}" "${VS}"
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' cmd.exe /c "${bat_win}" "${repo_win}" "${preset}" "${mode}" "${VS}" "${extra1}" "${extra2}"
 }
+
+# --- dependency preflight ---------------------------------------------------
+# CMake deliberately permits reduced builds when optional libraries are absent. This entry point is
+# the complete two-platform gate, so fail before cleaning/configuring if either product would be
+# incomplete. Keep the install recipe beside the checks so a fresh machine gets one useful answer.
+linux_dependency_preflight() {
+    local missing=() cmd spec module label
+    for spec in \
+        "cmake:CMake" \
+        "ninja:Ninja" \
+        "g++:the GNU C++ compiler" \
+        "pkg-config:pkg-config"; do
+        cmd="${spec%%:*}"
+        label="${spec#*:}"
+        command -v "${cmd}" >/dev/null 2>&1 || missing+=("${label} (command: ${cmd})")
+    done
+    if ((do_lint)) && ! command -v git >/dev/null 2>&1; then
+        missing+=("Git (command: git; required by --lint/--all)")
+    fi
+
+    if command -v pkg-config >/dev/null 2>&1; then
+        for spec in \
+            "vulkan:Vulkan headers and loader" \
+            "xcb:core XCB" \
+            "xcb-composite:XCB Composite" \
+            "xcb-shape:XCB Shape" \
+            "xcb-xtest:XCB XTest" \
+            "xcb-xfixes:XCB XFixes" \
+            "gl:OpenGL development files" \
+            "x11:Xlib development files"; do
+            module="${spec%%:*}"
+            label="${spec#*:}"
+            pkg-config --exists "${module}" || missing+=("${label} (pkg-config: ${module})")
+        done
+    fi
+
+    if ((${#missing[@]} == 0)); then
+        ((check_deps_only)) || ok "Linux/WSL build dependencies found"
+        return 0
+    fi
+
+    printf '\nLinux/WSL dependency preflight FAILED. Missing:\n' >&2
+    printf '  - %s\n' "${missing[@]}" >&2
+    cat >&2 <<'EOF'
+
+Install the complete Ubuntu build set inside WSL:
+  sudo apt update
+  sudo apt install build-essential cmake ninja-build pkg-config git \
+      libvulkan-dev libxcb1-dev libxcb-composite0-dev libxcb-shape0-dev \
+      libxcb-xtest0-dev libxcb-xfixes0-dev libgl-dev libx11-dev
+
+Runtime/session packages (Weston, private Xwayland prerequisites, Mesa/Zink, and tools) are listed in:
+  docs/building.md#wsl-dependencies
+EOF
+    return 1
+}
+
+visual_studio_install_guidance() {
+    cat >&2 <<'EOF'
+
+Install Visual Studio 2026 through Visual Studio Installer. It is normally detected under:
+  C:\Program Files\Microsoft Visual Studio\18\<Edition>
+For a custom install root, set VKRELAY2_VS_DIR to its Windows path.
+EOF
+    if ((do_windows)); then
+        cat >&2 <<'EOF'
+Select the "Desktop development with C++" workload and these individual components:
+  - MSVC Build Tools for x64/x86 (Latest)
+  - C++ CMake tools for Windows
+  - Windows 11 SDK
+EOF
+    fi
+    if ((do_lint)); then
+        printf '%s\n' '  - C++ Clang tools for Windows (--lint/--all)' >&2
+    fi
+}
+
+windows_dependency_preflight() {
+    if ! have_windows_interop; then
+        printf '\nWindows dependency preflight FAILED: cmd.exe/wslpath interop is unavailable.\n' >&2
+        printf 'Run this script from WSL2, or select only the Linux lane with --linux-only.\n' >&2
+        return 1
+    fi
+    if ! windows_interop_executes; then
+        windows_interop_guidance
+        return 1
+    fi
+    if [[ -z "${VS}" ]]; then
+        printf '\nWindows dependency preflight FAILED: Visual Studio 2026 was not found.\n' >&2
+        visual_studio_install_guidance
+        return 1
+    fi
+    if ((do_lint)) && [[ -z "${VS_UNIX}" ]]; then
+        printf '\nWindows dependency preflight FAILED: cannot resolve %s inside WSL.\n' "${VS}" >&2
+        printf 'Set VKRELAY2_VS_DIR to the Visual Studio install root as a Windows path.\n' >&2
+        return 1
+    fi
+
+    if run_windows probe "${windows_preset}" "${do_windows}" "${do_lint}"; then
+        ((check_deps_only)) || ok "Windows/VS dependencies found (${VS})"
+        return 0
+    fi
+
+    printf '\nWindows dependency preflight FAILED. Missing items are listed above.\n' >&2
+    printf 'Additional detail: docs/building.md#windows-dependencies\n' >&2
+    return 1
+}
+
+dependency_preflight() {
+    local failed=0
+    step "dependency preflight"
+    if ((do_linux)); then
+        linux_dependency_preflight || failed=1
+    fi
+    if ((do_windows || do_lint)); then
+        windows_dependency_preflight || failed=1
+    fi
+    ((failed == 0)) || die "dependency preflight failed; install the items above and retry"
+}
+
+dependency_preflight
+if ((check_deps_only)); then
+    step "DONE"
+    ok "dependency preflight passed (no build requested)"
+    exit 0
+fi
 
 # --- clean ------------------------------------------------------------------
 if ((do_clean)); then

@@ -11,6 +11,9 @@ between minor releases.
 - `scripts/dev/rebuild_all.sh` no longer requires Visual Studio Community: it auto-detects the
   installed edition (Community, Professional, Enterprise, or BuildTools) and honors a
   `VKRELAY2_VS_DIR` override for non-standard install roots.
+- `scripts/dev/rebuild_all.sh` now preflights the complete Linux and Windows build dependencies
+  before touching build trees, reports actionable Ubuntu/Visual Studio/Vulkan SDK installation
+  guidance, and supports a preflight-only `--check-deps` mode.
 
 ## 0.1.0 — 2026-07-16
 

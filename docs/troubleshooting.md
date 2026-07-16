@@ -62,23 +62,18 @@ Allow the supervisor through Windows Firewall only on the intended network profi
 
 If the launcher reports that it cannot execute Windows binaries from WSL (or a manual
 `powershell.exe` in WSL fails with `cannot execute binary file: Exec format error`), the
-`WSLInterop` binfmt registration is missing — every Windows `.exe` launch from WSL fails, so the
-daemon can never be auto-started. This registration can be lost on systemd-enabled distributions.
+WSL interop state is broken — every Windows `.exe` launch from WSL fails, so the daemon cannot be
+auto-started and the Windows build lane cannot run.
 
-Re-register it (as root inside the distribution):
+Close the affected distribution, then restart WSL completely from Windows PowerShell or Command
+Prompt:
 
-```bash
-echo ':WSLInterop:M::MZ::/init:PF' > /proc/sys/fs/binfmt_misc/register
+```powershell
+wsl --shutdown
 ```
 
-Make it survive restarts via `/etc/wsl.conf`:
-
-```ini
-[boot]
-command = /bin/sh -c "[ -e /proc/sys/fs/binfmt_misc/WSLInterop ] || echo :WSLInterop:M::MZ::/init:PF > /proc/sys/fs/binfmt_misc/register"
-```
-
-The launcher preflights this before starting a daemon and prints the same remedy.
+Reopen the distribution and retry. The launcher and `rebuild_all.sh` preflight actual Windows
+executable launch and print this remedy before attempting further Windows work.
 
 ## --list-gpus Refuses To Print An Adapter List
 
