@@ -8,13 +8,22 @@ Xwayland build for one specific Ubuntu release — **22.04 (jammy)**, **24.04 (n
 distro-specific, install the package built for the Ubuntu release you run (the installer
 fail-closes on a mismatch).
 
+Package users do **not** build Xwayland: the guarded executable is already included. The source recipe
+is a maintainer/developer step needed when creating that bundled artifact, not an installation
+prerequisite.
+
 ## Producing a package (maintainers)
 
 From WSL, with both release halves and the private Xwayland built:
 
 ```bash
-./scripts/dev/package_release.sh            # or --build to rebuild first
+./scripts/dev/package_release.sh            # add --build to rebuild the vkrelay2 halves first
 ```
+
+Here `--build` rebuilds the Linux and Windows vkrelay2 release products only. It does not rebuild the
+private Xwayland stage; build that stage separately with
+`src_ext/xwayland/build_private_xwayland.sh` when it is missing, no longer matches the installed
+`xwayland` package, or targets a different Ubuntu release.
 
 This writes `dist/vkrelay2-<version>-<codename>-<arch>.tar.gz`, where the codename/arch are
 read from the bundled private Xwayland's provenance (so the package name always matches the

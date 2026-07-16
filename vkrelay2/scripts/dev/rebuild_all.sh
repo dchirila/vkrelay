@@ -22,6 +22,9 @@
 #   scripts/dev/rebuild_all.sh --windows-only  # skip the Linux half
 #   scripts/dev/rebuild_all.sh --check-deps    # preflight only; do not clean/build/test/lint
 # Flags combine, e.g.  scripts/dev/rebuild_all.sh --clean --all
+# This script never builds the separate private-Xwayland stage, but its Linux preflight requires a
+# compatible stage so a green rebuild is ready for app runs/release packaging. --windows-only skips
+# that Linux runtime-readiness gate; see docs/building.md#private-xwayland.
 set -euo pipefail
 
 # --- options ----------------------------------------------------------------
@@ -128,7 +131,10 @@ EOF
 # dir, preset, mode, VS root, and probe switches ride in as arguments so there is no
 # shell/backslash interpolation to mangle.
 wrapper_bat=""
-cleanup() { [[ -n "${wrapper_bat}" && -f "${wrapper_bat}" ]] && rm -f "${wrapper_bat}"; }
+cleanup() {
+    [[ -n "${wrapper_bat}" && -f "${wrapper_bat}" ]] && rm -f "${wrapper_bat}"
+    return 0
+}
 trap cleanup EXIT
 
 write_wrapper() {
@@ -295,6 +301,79 @@ EOF
     return 1
 }
 
+# Runtime-readiness gate: rebuilding vkrelay2 does not compile Xwayland, but a successful Linux lane
+# must leave the checkout able to launch applications. Reuse the launcher's exact admission helpers
+# so preflight and app-run cannot disagree about an explicit server or checkout-local stage.
+# shellcheck source=../../linux/launcher/lib_private_session.sh
+. "${repo_root}/linux/launcher/lib_private_session.sh"
+
+private_xwayland_preflight() {
+    local override="${VKRELAY2_XWAYLAND_BIN:-}"
+    if [[ -n "${override}" ]]; then
+        if [[ -x "${override}" ]]; then
+            ((check_deps_only)) || ok "Explicit tested Xwayland found (${override})"
+            return 0
+        fi
+        printf '\nPrivate Xwayland preflight FAILED.\n' >&2
+        printf '  - VKRELAY2_XWAYLAND_BIN is not executable: %s\n' "${override}" >&2
+        printf 'Fix or unset the override, then retry.\n' >&2
+        return 1
+    fi
+
+    local codename="" arch="" installed="" resolved=""
+    [[ -r /etc/os-release ]] && codename="$(. /etc/os-release; printf '%s' "${VERSION_CODENAME:-}")"
+    command -v dpkg >/dev/null 2>&1 && arch="$(dpkg --print-architecture 2>/dev/null || true)"
+    command -v dpkg-query >/dev/null 2>&1 \
+        && installed="$(dpkg-query -W -f='${Version}' xwayland 2>/dev/null || true)"
+
+    # Match launcher policy: only the empirically known-unsafe distro/arch set requires the guarded
+    # stage. An untested host may use its system server; --windows-only never calls this function.
+    if ! vkr_stock_xwayland_known_unsafe "${codename}" "${arch}" "${installed}" ""; then
+        ((check_deps_only)) || ok "Private Xwayland stage not required for ${codename:-unknown}/${arch:-unknown}"
+        return 0
+    fi
+
+    if resolved="$(vkr_find_compatible_private_xwayland)"; then
+        ((check_deps_only)) || ok "Compatible private Xwayland stage found (${resolved})"
+        return 0
+    fi
+
+    local candidate="${repo_root}/build/src_ext/xwayland/stage/Xwayland"
+    local provenance="${repo_root}/build/src_ext/xwayland/stage/PROVENANCE.txt"
+    printf '\nPrivate Xwayland preflight FAILED. Missing requirement:\n' >&2
+    printf '  - A compatible guarded Xwayland stage for %s/%s (installed package: %s).\n' \
+        "${codename:-unknown}" "${arch:-unknown}" "${installed:-not installed}" >&2
+    if [[ ! -x "${candidate}" ]]; then
+        printf '    No executable stage exists at %s.\n' "${candidate}" >&2
+    elif [[ ! -r "${provenance}" ]]; then
+        printf '    The stage exists, but %s is missing or unreadable.\n' "${provenance}" >&2
+    elif ! command -v readelf >/dev/null 2>&1; then
+        printf '    The stage cannot be verified because readelf is unavailable (install binutils).\n' >&2
+    else
+        local stage_target stage_source stage_freshness
+        stage_target="$(awk '$1 == "target:" { print $2; exit }' "${provenance}")"
+        stage_source="$(awk '$1 == "source_package:" { print $2; exit }' "${provenance}")"
+        stage_freshness="$(awk '$1 == "freshness_verified:" { print $2; exit }' "${provenance}")"
+        printf '    Existing stage metadata: target=%s, source=%s, freshness=%s.\n' \
+            "${stage_target:-unknown}" "${stage_source:-unknown}" "${stage_freshness:-unknown}" >&2
+        printf '    Rebuild it because its host/package provenance or ELF build ID no longer matches.\n' >&2
+    fi
+    cat >&2 <<EOF
+
+Build or refresh the one-time stage (this is separate from rebuild_all.sh):
+  sudo apt update
+  sudo apt install dpkg-dev quilt curl util-linux devscripts equivs xwayland
+  VKRELAY2_XWL_INSTALL_DEPS=1 \\
+      bash ${repo_root}/src_ext/xwayland/build_private_xwayland.sh
+
+Binary-package users already receive this stage. To test another known-good server instead:
+  VKRELAY2_XWAYLAND_BIN=/absolute/path/to/Xwayland ./scripts/dev/rebuild_all.sh
+
+Additional detail: docs/building.md#when-the-private-build-is-needed
+EOF
+    return 1
+}
+
 visual_studio_install_guidance() {
     cat >&2 <<'EOF'
 
@@ -351,11 +430,12 @@ dependency_preflight() {
     step "dependency preflight"
     if ((do_linux)); then
         linux_dependency_preflight || failed=1
+        private_xwayland_preflight || failed=1
     fi
     if ((do_windows || do_lint)); then
         windows_dependency_preflight || failed=1
     fi
-    ((failed == 0)) || die "dependency preflight failed; install the items above and retry"
+    ((failed == 0)) || die "dependency preflight failed; resolve the items above and retry"
 }
 
 dependency_preflight

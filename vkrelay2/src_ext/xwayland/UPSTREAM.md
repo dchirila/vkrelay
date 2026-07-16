@@ -108,7 +108,8 @@ the selected private binary.
 ## Building
 
 Build dependencies (the source package's `Build-Depends`; the set below is jammy's, and is a close
-superset on noble/resolute — `VKRELAY2_XWL_INSTALL_DEPS=1` runs `apt-get build-dep` for the exact set):
+superset on noble/resolute — `VKRELAY2_XWL_INSTALL_DEPS=1` runs `mk-build-deps` on the extracted
+`debian/control` for the exact set):
 
 ```
 dpkg-dev quilt debhelper meson pkg-config
@@ -137,7 +138,9 @@ bash build_private_xwayland.sh
 #   VKRELAY2_XWAYLAND_BIN=<abs-path-to-staged-Xwayland>
 #
 # One-time (needs real root; do it BEFORE a test-enabled build):
-#   sudo apt-get build-dep -y <build_root>/xwayland_<ver>.dsc   (or VKRELAY2_XWL_INSTALL_DEPS=1)
+#   VKRELAY2_XWL_INSTALL_DEPS=1 bash build_private_xwayland.sh
+# This bootstraps devscripts/equivs and uses mk-build-deps; Jammy apt rejects local control/.dsc
+# paths passed to apt-get build-dep.
 ```
 
 Environment knobs:
@@ -150,8 +153,9 @@ Environment knobs:
 | `VKRELAY2_XWL_ALLOW_STALE_BASELINE=1` | build despite an empty/newer distro candidate or a stale apt index (recorded as an override in the manifest) |
 | `VKRELAY2_XWL_APT_MAX_AGE_DAYS` | max age of the apt package index for freshness to count as verified (default 7) |
 | `VKRELAY2_XWL_ALLOWED_TEST_FAILURES` | `;`-separated **exact** meson test names allowed to fail (default `xwayland / sync;xwayland:xvfb / triangles`) |
+| `VKRELAY2_XWL_TEST_GALLIUM_DRIVER` | override the Gallium driver used by package tests; WSL defaults to deterministic `llvmpipe`, while native Linux inherits the host default |
 | `VKRELAY2_XWL_BUILD_ROOT` / `VKRELAY2_XWL_WORK_ROOT` | override the staged-output root / the native build work dir |
-| `VKRELAY2_XWL_INSTALL_DEPS=1` | run `apt-get build-dep` (host root), then auto re-exec into the normal namespace/test path |
+| `VKRELAY2_XWL_INSTALL_DEPS=1` | install the exact extracted `debian/control` requirements with `mk-build-deps` (host root), then auto re-exec into the normal namespace/test path |
 
 Then select it at launch (the launcher logs the resolved path + version + build ID before launch):
 
@@ -196,7 +200,9 @@ Notes:
 - **Tests:** the package suite runs by default, under a hard `timeout` (`VKRELAY2_XWL_TEST_TIMEOUT`,
   default 420s) so an environment-hung test can never wall-clock the build. On WSLg the recipe re-execs
   inside an unprivileged user+mount namespace (the same trick the launcher uses) so the tests' Xvfb can
-  create its socket in a writable `/tmp/.X11-unix`. On **jammy** the suite is gated: the default allowlist
+  create its socket in a writable `/tmp/.X11-unix`. WSL test runs force Mesa's `llvmpipe` so Xvfb's
+  package tests do not accidentally test, or crash inside, the WSLg D3D12/vendor-driver path; the selected
+  test renderer is recorded in provenance. On **jammy** the suite is gated: the default allowlist
   covers `sync` (Xvfb socket-listener contention) and `triangles` (rendercheck vs software Render) — both
   run against **Xvfb, not Xwayland**, so they are unaffected by the guard; any failure outside the
   allowlist is fatal. **Off-jammy** the jammy-tuned allowlist does not generalize, so the suite is run and

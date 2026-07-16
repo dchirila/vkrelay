@@ -30,11 +30,10 @@
 # CVE series. That was a security regression. This recipe builds from the distro source package;
 # do not revert it to a pristine-upstream tarball build.
 #
-# Build dependencies come from the source package's Build-Depends. Install them once, on the host
-# (needs real root):
-#   sudo apt-get build-dep -y <build_root>/xwayland-<ver>/debian/control   # after extraction
-#   # or, before any build:  sudo apt-get build-dep -y xwayland
-# (or run this script once with VKRELAY2_XWL_INSTALL_DEPS=1). Do this BEFORE a test-enabled build,
+# Build dependencies come from the extracted source package's Build-Depends. Install them once on
+# the host by running this script with VKRELAY2_XWL_INSTALL_DEPS=1. The install path uses
+# mk-build-deps (devscripts + equivs) against debian/control; Jammy's apt-get build-dep accepts a
+# source PACKAGE name but rejects local control/.dsc paths. Do this BEFORE a test-enabled build,
 # since the package tests run inside an unprivileged namespace that cannot install packages.
 #
 # Usage:   bash build_private_xwayland.sh
@@ -321,22 +320,37 @@ fi
 
 # --- 2. (optional) install build-deps -------------------------------------------------------
 if [ "${VKRELAY2_XWL_INSTALL_DEPS:-0}" = "1" ]; then
-    log "installing build-deps via apt-get build-dep (sudo)"
-    ${apt_sudo} apt-get build-dep -y "${srcdir}/debian/control" >&2 || die "apt-get build-dep failed"
+    # apt-get build-dep on Ubuntu 22.04 accepts a source package NAME, not a local debian/control or
+    # .dsc path (both fail as "Unsupported file"). mk-build-deps is the Debian tool for consuming an
+    # extracted control file: it resolves alternatives/version/arch qualifiers into a temporary
+    # dependency package and asks apt to install it. Bootstrap the two tools here because the caller
+    # explicitly authorized host dependency installation with INSTALL_DEPS=1.
+    if ! command -v mk-build-deps >/dev/null 2>&1 || ! command -v equivs-build >/dev/null 2>&1; then
+        log "installing build-dependency resolver (devscripts + equivs)"
+        ${apt_sudo} apt-get install -y devscripts equivs >&2 \
+            || die "could not install devscripts/equivs (required by VKRELAY2_XWL_INSTALL_DEPS=1)"
+    fi
+    mk_root=()
+    [ -z "${apt_sudo}" ] || mk_root=(--root-cmd "${apt_sudo}")
+    log "installing exact source Build-Depends via mk-build-deps"
+    ( cd "${srcdir}" && mk-build-deps --install --remove "${mk_root[@]}" \
+        --tool "apt-get -y --no-install-recommends" debian/control ) >&2 \
+        || die "mk-build-deps failed for ${srcdir}/debian/control"
     log "build-deps installed; re-running without INSTALL_DEPS for the normal namespace/test path"
     export VKRELAY2_XWL_INSTALL_DEPS=0
     exec bash "$0" "$@"
 fi
 # Preflight a representative slice of the build-deps; fail with an actionable message rather than
-# deep inside meson. (Not exhaustive -- apt-get build-dep is the source of truth for the full set.)
+# deep inside meson. (Not exhaustive -- debian/control, consumed above by mk-build-deps, is the
+# source of truth for the full set.)
 missing_dep=""
 for d in libxcvt-dev libepoxy-dev libgbm-dev libxfont-dev meson; do
     dpkg -s "${d}" >/dev/null 2>&1 || missing_dep="${missing_dep} ${d}"
 done
 if [ -n "${missing_dep}" ]; then
     die "build-deps missing:${missing_dep}
-       Run: sudo apt-get build-dep -y ${srcdir}/debian/control
-       (or re-run this script with VKRELAY2_XWL_INSTALL_DEPS=1). Full list is in this script's header."
+       Re-run this script with VKRELAY2_XWL_INSTALL_DEPS=1 so mk-build-deps installs the exact
+       debian/control requirements. Full list is in this script's header."
 fi
 
 # --- 3. prove the distro security series is APPLIED (not merely listed) ------------------------
@@ -425,6 +439,7 @@ deb="$(ls -1 "${work}"/xwayland_*_"${deb_arch}".deb 2>/dev/null | grep -v -- '-d
 # the same namespace (identical failure set). Any OTHER failure is fatal. Override the exact set with a
 # ';'-separated VKRELAY2_XWL_ALLOWED_TEST_FAILURES (a broad override is a deliberate, recorded choice).
 tests_result="skipped (VKRELAY2_XWL_SKIP_TESTS=1)"
+test_render_driver="not run"
 if [ "${run_tests}" = "1" ]; then
     objdir="$(ls -d "${srcdir}"/obj-* 2>/dev/null | head -1)"
     [ -n "${objdir}" ] || die "no meson build dir found to run the test suite"
@@ -446,9 +461,25 @@ if [ "${run_tests}" = "1" ]; then
     test_gate="record"
     [ "${acquire}" = "hashpin" ] && test_gate="strict"
     test_timeout="${VKRELAY2_XWL_TEST_TIMEOUT:-420}"
-    log "running Xwayland's package test suite (meson test, gate=${test_gate}, timeout=${test_timeout}s)"
+    test_env=()
+    test_render_driver="host/default"
+    if [ "${VKRELAY2_XWL_TEST_GALLIUM_DRIVER+x}" = "x" ]; then
+        test_gallium_driver="${VKRELAY2_XWL_TEST_GALLIUM_DRIVER}"
+    elif grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+        # Xvfb's rendercheck tests are package tests, not WSL GPU-driver integration tests. WSLg's
+        # Mesa loader can otherwise select d3d12 and enter the host vendor driver; a driver crash then
+        # appears as an Xserver regression. Use Mesa's deterministic software renderer on WSL.
+        test_gallium_driver="llvmpipe"
+    else
+        test_gallium_driver=""
+    fi
+    if [ -n "${test_gallium_driver}" ]; then
+        test_env=(env "GALLIUM_DRIVER=${test_gallium_driver}")
+        test_render_driver="GALLIUM_DRIVER=${test_gallium_driver}"
+    fi
+    log "running Xwayland's package test suite (meson test, gate=${test_gate}, timeout=${test_timeout}s, render=${test_render_driver})"
     meson_rc=0
-    timeout "${test_timeout}" meson test -C "${objdir}" >"${test_log}" 2>&1 || meson_rc=$?
+    timeout "${test_timeout}" "${test_env[@]}" meson test -C "${objdir}" >"${test_log}" 2>&1 || meson_rc=$?
     [ "${meson_rc}" = "124" ] && log "note: meson test hit the ${test_timeout}s timeout (recorded)"
     # Exact failing test names from the meson console log.
     mapfile -t failed_arr < <(grep -E '[[:space:]](FAIL|TIMEOUT|ERROR)[[:space:]]' "${test_log}" \
@@ -458,7 +489,7 @@ if [ "${run_tests}" = "1" ]; then
         [ "${meson_rc}" = "0" ] || [ "${#failed_arr[@]}" -gt 0 ] \
             || die "meson test exited ${meson_rc} but no failing tests were parsed; see ${test_log}"
         unexpected=""
-        for t in ${failed_arr[@]+"${failed_arr[@]}"}; do
+        for t in "${failed_arr[@]}"; do
             [ -n "${t}" ] || continue
             hit=0
             for a in "${allowed_tests[@]}"; do [ "${t}" = "${a}" ] && hit=1; done
@@ -481,7 +512,7 @@ if [ "${run_tests}" = "1" ]; then
         tests_result="${n_ok:-?} passed, meson rc=${meson_rc}${gate_note}"
         log "package test suite: ${tests_result}"
     else
-        failed_oneline="$(printf '%s; ' ${failed_arr[@]+"${failed_arr[@]}"} | sed 's/; $//')"
+        failed_oneline="$(printf '%s; ' "${failed_arr[@]}" | sed 's/; $//')"
         tests_result="${n_ok:-?} passed, ${n_fail} failed (${failed_oneline})${gate_note}"
         log "package test suite: ${tests_result}"
     fi
@@ -557,6 +588,7 @@ manifest="${stage_new}/PROVENANCE.txt"
     done
     echo "applied_cve_count:  ${cve_count:-0}"
     echo "tests_run:          $([ "${run_tests}" = "1" ] && echo yes || echo no)"
+    echo "test_render_driver: ${test_render_driver}"
     echo "tests_result:       ${tests_result}"
     echo "distro_candidate:   ${distro_candidate:-unknown}"
     echo "freshness_verified: ${freshness_verified:-no (not checked)}"

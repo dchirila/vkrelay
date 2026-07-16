@@ -37,18 +37,20 @@ sudo apt install \
     libgl-dev libx11-dev
 ```
 
-Install the runtime, diagnostic, and private-Xwayland recipe dependencies with:
+Install the runtime and diagnostic dependencies with:
 
 ```bash
 sudo apt update
 sudo apt install \
     vulkan-tools libgl1-mesa-dri mesa-utils \
-    weston xwayland quilt
+    weston xwayland
 ```
 
-`quilt` is used by the private-Xwayland build recipe (see below), which is required for the normal
-application path on all validated distributions: the launcher refuses the distro's stock `xwayland`
-package as known-crashing, so `apt`'s `xwayland` alone is not sufficient to run applications.
+The `xwayland` package remains a runtime/baseline dependency even when the launcher uses a guarded
+private binary. The private-Xwayland recipe has a separate, much larger build-dependency set; install
+it only when the [decision table below](#when-the-private-build-is-needed) says that you must run that
+recipe. `rebuild_all.sh` does not install or build those packages, but its Linux readiness preflight
+does require the resulting compatible stage; `--check-deps` reports how to create or refresh it.
 
 The important runtime capabilities are:
 
@@ -132,7 +134,8 @@ cd vkrelay2
 
 The script builds Linux natively in WSL and invokes the Visual Studio toolchain through Windows
 interop. Before cleaning or configuring, it reports all missing Linux build dependencies and checks
-the selected Visual Studio environment, Windows SDK, and Vulkan SDK. To run only that preflight:
+for a compatible private-Xwayland stage when the Linux lane is selected. It also checks the selected
+Visual Studio environment, Windows SDK, and Vulkan SDK. To run only that preflight:
 
 ```bash
 ./scripts/dev/rebuild_all.sh --check-deps
@@ -227,13 +230,52 @@ not replace the system executable. The recipe is distro-adaptive across **22.04 
 from the Xwayland upstream version (the pointer-warp guard on all versions; the damage-report guard
 from 24.1).
 
-Refresh the apt package index, then build it once on the host you are packaging for:
+### When the private build is needed
+
+Every current `vkrun` **application launch** creates a private Weston + rootless Xwayland session,
+including native-Vulkan or headless targets. That does not mean every developer must rebuild
+Xwayland, or rebuild it after every vkrelay2 change. The launcher only needs a compatible guarded or
+otherwise tested Xwayland executable.
+
+| Operation | Guarded/tested Xwayland needed? | Run `build_private_xwayland.sh`? |
+|---|---:|---:|
+| `rebuild_all.sh`, including `--tests`, `--all`, `--release`, or `--check-deps` | Yes, as a Linux readiness gate | No; it reports the separate command when absent/stale |
+| `rebuild_all.sh --windows-only` (including `--check-deps`) | No | No |
+| Direct CMake builds, `ctest`, unit/integration tests, or lint | No | No |
+| `vkrun --list-gpus`, `--help`, or descriptor-only commands | No | No |
+| Any source-checkout app run (`vkrun -- app`, `--run`, or `--run-descriptor`) | Yes | Once, unless a compatible stage or explicitly selected tested server already exists |
+| Private-display/application smoke scripts that start the same Weston/Xwayland stack | Yes | Same rule as an app run |
+| Install and use a vkrelay2 binary package | Yes, bundled in the package | No |
+| Produce a binary release package | Yes, and it must be release-ready for the target distro | Yes, once per current distro/package baseline |
+
+On the validated Ubuntu releases, the launcher currently rejects the unmodified distro Xwayland for
+an app run. It first auto-selects a compatible checkout-local stage. A binary package already contains
+that stage, so package users need no compiler, SDK, `quilt`, or Xwayland source build.
+
+Do not rebuild the private stage merely because vkrelay2 itself changed. Rebuild it when it is absent,
+when the installed `xwayland` package version changed and the provenance no longer matches, when
+building for another distro/architecture, or when producing a new release-ready package. A developer
+testing an independently fixed server can instead set `VKRELAY2_XWAYLAND_BIN` explicitly; after a
+distro package carries the guards and passes the private-display smoke tests, the private recipe is no
+longer technically necessary for that package, although the launcher's stock-package admission rule
+must also be updated (or explicitly overridden for testing).
+
+Only when the table requires the recipe, refresh the apt package index and build it once on the target
+host:
 
 ```bash
 sudo apt update
+sudo apt install dpkg-dev quilt curl util-linux devscripts equivs
 VKRELAY2_XWL_INSTALL_DEPS=1 \
     bash src_ext/xwayland/build_private_xwayland.sh
 ```
+
+The first install line is only the recipe's bootstrap tooling (`devscripts` supplies
+`mk-build-deps`; `equivs` creates its temporary dependency package). `VKRELAY2_XWL_INSTALL_DEPS=1`
+then installs the source package's exact `debian/control` dependencies before building it;
+`rebuild_all.sh --check-deps` verifies the finished stage rather than installing these source-build
+packages itself. Do not substitute `apt-get build-dep <path>`: Ubuntu 22.04 APT rejects local
+`debian/control` and `.dsc` paths.
 
 The script uses one of two acquisition models, recorded in the stage's `PROVENANCE.txt`:
 
