@@ -23,6 +23,8 @@ between minor releases.
   `debian/control` through `mk-build-deps`; Jammy APT rejects the previously used local control path.
 - Isolated private-Xwayland package tests from WSLg's host GPU stack by selecting Mesa `llvmpipe` on
   WSL, and fixed strict-gate reporting so full Meson test names remain intact.
+- Binary release packages now use stable, distro-specific GitHub asset names and include SHA-256
+  checksum files, enabling version-independent latest-release download instructions.
 
 ## 0.1.0 — 2026-07-16
 

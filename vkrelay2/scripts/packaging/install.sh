@@ -12,7 +12,7 @@
 #   5. checks Windows interop + networking mode (the two host capabilities that fail
 #      confusingly when broken) and prints the quickstart commands.
 #
-# Usage:  sudo ./install.sh          (sudo needed for apt; everything else is user-local)
+# Usage:  ./install.sh               (the script uses sudo only for APT when needed)
 set -euo pipefail
 
 pkg_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

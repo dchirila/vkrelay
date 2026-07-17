@@ -12,7 +12,10 @@
 #   scripts/dev/package_release.sh --build    # rebuild vkrelay2 release halves first (not Xwayland)
 # The private-Xwayland stage is a separate, one-time-per-baseline input; --build does not create it.
 #
-# Output: dist/vkrelay2-<version>-<codename>-<arch>.tar.gz. A RELEASE package fails closed unless it
+# Output: dist/vkrelay2-<codename>-<arch>.tar.gz (+ .sha256). The archive has a versioned root
+#         directory and VERSION marker; the stable asset name makes GitHub's
+#         /releases/latest/download URL usable without teaching installers which release is current.
+#         A RELEASE package fails closed unless it
 #         comes from an exact, clean version tag AND a private Xwayland stage the recipe stamped
 #         `release_ready: yes`; VKRELAY2_ALLOW_UNRELEASED=1 relaxes both for a dev build. The
 #         codename/arch are read from the bundled private Xwayland's PROVENANCE, so the package name and
@@ -101,8 +104,17 @@ case "${pkg_release_ready}" in
   VKRELAY2_ALLOW_UNRELEASED=1 to package it anyway as a dev build." ;;
 esac
 name="vkrelay2-${version}-${pkg_codename}-${pkg_arch}"
+asset="vkrelay2-${pkg_codename}-${pkg_arch}.tar.gz"
 stage_dir="$(mktemp -d)/${name}"
-trap 'rm -rf "$(dirname "${stage_dir}")"' EXIT
+archive_tmp=""
+checksum_tmp=""
+cleanup() {
+    rm -rf "$(dirname "${stage_dir}")" || true
+    [[ -z "${archive_tmp}" ]] || rm -f "${archive_tmp}" || true
+    [[ -z "${checksum_tmp}" ]] || rm -f "${checksum_tmp}" || true
+    return 0
+}
+trap cleanup EXIT
 mkdir -p "${stage_dir}"
 
 # --- assemble the mirror layout ----------------------------------------------------------
@@ -134,6 +146,14 @@ printf '%s\n' "${version}" > "${stage_dir}/VERSION"
 printf '%s/%s\n' "${pkg_codename}" "${pkg_arch}" > "${stage_dir}/DISTRO"
 
 mkdir -p dist
-tar -C "$(dirname "${stage_dir}")" -czf "dist/${name}.tar.gz" "${name}"
-echo "package_release.sh: wrote dist/${name}.tar.gz"
-tar -tzf "dist/${name}.tar.gz" | sed 's/^/  /'
+archive_tmp="dist/.${asset}.tmp.$$"
+checksum_tmp="dist/.${asset}.sha256.tmp.$$"
+tar -C "$(dirname "${stage_dir}")" -czf "${archive_tmp}" "${name}"
+tar -tzf "${archive_tmp}" | sed 's/^/  /'
+mv -f "${archive_tmp}" "dist/${asset}"
+archive_tmp=""
+( cd dist && sha256sum "${asset}" ) > "${checksum_tmp}"
+mv -f "${checksum_tmp}" "dist/${asset}.sha256"
+checksum_tmp=""
+echo "package_release.sh: wrote dist/${asset}"
+echo "package_release.sh: wrote dist/${asset}.sha256"

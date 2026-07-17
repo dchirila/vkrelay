@@ -31,10 +31,11 @@ Extract the package **somewhere under `/mnt/c`** (Windows must be able to reach 
 bundled `.exe` files), then run the installer:
 
 ```bash
-# <codename> is the release this package was built for: jammy, noble, or resolute.
-tar -xzf vkrelay2-<version>-<codename>-amd64.tar.gz -C /mnt/c/Users/<you>/
+# <codename> is this WSL distribution: jammy, noble, or resolute.
+sha256sum -c vkrelay2-<codename>-amd64.tar.gz.sha256
+tar -xzf vkrelay2-<codename>-amd64.tar.gz -C /mnt/c/Users/<you>/
 cd /mnt/c/Users/<you>/vkrelay2-<version>-<codename>-amd64
-sudo ./install.sh
+./install.sh
 ```
 
 The installer only installs runtime apt packages (weston, xwayland, Mesa, the Vulkan

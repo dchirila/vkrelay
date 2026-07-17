@@ -42,9 +42,11 @@ See [Architecture](docs/architecture.md) for the process and data-flow model and
 
 ### From a binary package (no build tools needed)
 
-Extract a `vkrelay2-<version>-<codename>-amd64.tar.gz` (codename is your Ubuntu release —
-jammy, noble, or resolute) under `/mnt/c`, run `sudo ./install.sh` inside WSL (it installs only
-runtime packages), and launch — three steps, both sides covered. See [Installing](docs/install.md).
+Download the package for your WSL Ubuntu release (`jammy`, `noble`, or `resolute`) from the
+[latest GitHub Release](https://github.com/dchirila/vkrelay/releases/latest), verify its checksum,
+extract it under `/mnt/c`, and run `./install.sh` inside WSL. It installs runtime packages only;
+compilers, Visual Studio, and the Vulkan SDK are not required. See [Installing](docs/install.md) for
+copy-paste commands.
 
 ### From source
 
