@@ -257,11 +257,16 @@ vkr_start_private_display() {
             "${host_codename}" "${host_arch}" "${host_xwl_version}" "${host_xwl_build_id}"; then
             echo "vkrelay2: refusing known-crashing stock Xwayland ${host_xwl_version}" >&2
             echo "  A guarded/tested Xwayland is required for application runs." >&2
-            echo "  Build the guarded dependency with:" >&2
-            echo "    bash ${VKR_PRIVATE_SESSION_LIB_DIR}/../../src_ext/xwayland/build_private_xwayland.sh" >&2
-            echo "  This is a one-time stage, not part of each vkrelay2 rebuild." >&2
-            echo "  Binary packages bundle it; developers may instead explicitly set" >&2
-            echo "  VKRELAY2_XWAYLAND_BIN to a tested server." >&2
+            if [ -r "${VKR_PRIVATE_SESSION_LIB_DIR}/../windows-payload/VERSION" ]; then
+                echo "  This installed package's guarded Xwayland no longer matches the host" >&2
+                echo "  xwayland security package. Install a refreshed vkrelay2 .deb for this" >&2
+                echo "  Ubuntu release, then retry." >&2
+            else
+                echo "  Build the guarded dependency with:" >&2
+                echo "    bash ${VKR_PRIVATE_SESSION_LIB_DIR}/../../src_ext/xwayland/build_private_xwayland.sh" >&2
+                echo "  This is a one-time stage, not part of each vkrelay2 rebuild." >&2
+            fi
+            echo "  Developers may instead explicitly set VKRELAY2_XWAYLAND_BIN to a tested server." >&2
             return 1
         fi
     fi

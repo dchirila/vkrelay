@@ -32,7 +32,7 @@ required=(
     "${lin}/vkrelay2-launch" "${lin}/vkrelay2-sidecar" "${lin}/libvulkan_vkrelay2.so"
     "${win}/vkrelay2-supervisor.exe" "${win}/vkrelay2-worker.exe" "${win}/CMakeCache.txt"
     "${xwl}/Xwayland" "${xwl}/PROVENANCE.txt"
-    scripts/packaging/remove_windows_payload.sh
+    scripts/packaging/remove_windows_payload.sh scripts/packaging/windows_cache_root.sh
     "${top}/LICENSE" "${top}/NOTICE" "${top}/docs/install.md" src_ext/xwayland/LICENSE
 )
 for f in "${required[@]}"; do
@@ -59,7 +59,16 @@ elif [[ "${allow_unreleased}" == "1" ]]; then
     display_version="${upstream_version}-dirty"
     echo "package_release.sh: WARNING: building an UNRELEASED development .deb" >&2
 else
-    fail "HEAD must be an exact clean version tag; tag it or set VKRELAY2_ALLOW_UNRELEASED=1 for testing"
+    if [[ -z "${exact_tag}" ]]; then
+        echo "package_release.sh: release gate: HEAD is not an exact version tag" >&2
+    fi
+    if [[ -n "${git_dirty}" ]]; then
+        echo "package_release.sh: release gate: working tree is not clean:" >&2
+        while IFS= read -r status_line; do
+            echo "  ${status_line}" >&2
+        done <<< "${git_dirty}"
+    fi
+    fail "release packages require an exact clean tag (or set VKRELAY2_ALLOW_UNRELEASED=1 for testing)"
 fi
 
 # The Xwayland provenance is authoritative for distro/architecture and release readiness.
@@ -115,6 +124,8 @@ install -D -m 0755 "${win}/vkrelay2-worker.exe" \
     "${root}/usr/libexec/vkrelay2/windows-payload/vkrelay2-worker.exe"
 install -D -m 0755 scripts/packaging/remove_windows_payload.sh \
     "${root}/usr/libexec/vkrelay2/remove-windows-payload"
+install -D -m 0755 scripts/packaging/windows_cache_root.sh \
+    "${root}/usr/libexec/vkrelay2/windows-cache-root"
 
 mkdir -p "${root}/usr/bin"
 cat > "${root}/usr/bin/vkrun" <<'EOF'
@@ -175,6 +186,21 @@ chmod 0755 "${root}/DEBIAN/preinst"
 cat > "${root}/DEBIAN/postinst" <<EOF
 #!/bin/sh
 set -e
+cache_root=""
+attempt=0
+while [ -z "\${cache_root}" ] && [ "\${attempt}" -lt 5 ]; do
+    cache_root="\$(/usr/libexec/vkrelay2/windows-cache-root 2>/dev/null || true)"
+    attempt=\$((attempt + 1))
+    [ -n "\${cache_root}" ] || sleep 0.2
+done
+if [ -n "\${cache_root}" ]; then
+    install -d -m 0755 /var/lib/vkrelay2
+    printf '%s\n' "\${cache_root}" > /var/lib/vkrelay2/windows-cache-root.tmp
+    mv -f /var/lib/vkrelay2/windows-cache-root.tmp /var/lib/vkrelay2/windows-cache-root
+else
+    echo "vkrelay2: WARNING: Windows LocalAppData could not be recorded during installation." >&2
+    echo "vkrelay2: vkrun and package removal will retry discovery when they run." >&2
+fi
 want="\$(awk '\$1 == "source_package:" { print \$2; exit }' /usr/libexec/vkrelay2/xwayland/PROVENANCE.txt)"
 have="\$(dpkg-query -W -f='\${Version}' xwayland 2>/dev/null || true)"
 if [ "\${want}" != "\${have}" ]; then

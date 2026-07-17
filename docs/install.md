@@ -80,8 +80,13 @@ sudo apt remove vkrelay2
 ```
 
 Removal stops supervisor/worker processes running from that package version, deletes its versioned
-Windows executable cache from `%LOCALAPPDATA%`, and removes the Linux files. It deliberately refuses
-to recursively delete an unexpected or unmarked Windows directory.
+Windows executable cache from `%LOCALAPPDATA%`, and removes the Linux files. It can recover a known
+incomplete first-launch cache, but refuses to recursively delete an unmarked directory containing
+unexpected files.
+
+If WSL interop breaks while Windows still has a cached executable open, removal fails closed instead
+of claiming the Windows payload was deleted. Run `wsl --shutdown` from Windows, reopen the
+distribution, and retry `sudo apt remove vkrelay2`.
 
 ## Build the release assets (maintainers)
 
