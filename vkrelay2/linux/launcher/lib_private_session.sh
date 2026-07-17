@@ -54,12 +54,9 @@ vkr_stock_xwayland_known_unsafe() { # <codename> <arch> <installed-version> <bui
     return 1
 }
 
-# Print the compatible checkout-local private Xwayland, or nothing. Explicit
+# Print the compatible package-installed or checkout-local private Xwayland, or nothing. Explicit
 # VKRELAY2_XWAYLAND_BIN remains authoritative; this is only the no-override convenience path.
 vkr_find_compatible_private_xwayland() {
-    local candidate="${VKR_PRIVATE_SESSION_LIB_DIR}/../../build/src_ext/xwayland/stage/Xwayland"
-    local provenance="$(dirname "${candidate}")/PROVENANCE.txt"
-    [ -x "${candidate}" ] && [ -r "${provenance}" ] || return 1
     command -v readelf >/dev/null 2>&1 || return 1
 
     local codename="" arch="" installed="" actual_build_id=""
@@ -72,12 +69,22 @@ vkr_find_compatible_private_xwayland() {
     if command -v dpkg-query >/dev/null 2>&1; then
         installed="$(dpkg-query -W -f='${Version}' xwayland 2>/dev/null || true)"
     fi
-    actual_build_id="$(readelf -n "${candidate}" 2>/dev/null \
-        | awk '/Build ID:/ { print $3; exit }')"
-    vkr_private_xwayland_metadata_compatible \
-        "${provenance}" "${codename}" "${arch}" "${installed}" "${actual_build_id}" \
-        || return 1
-    readlink -f "${candidate}"
+
+    local candidate provenance
+    for candidate in \
+        "${VKR_PRIVATE_SESSION_LIB_DIR}/../xwayland/Xwayland" \
+        "${VKR_PRIVATE_SESSION_LIB_DIR}/../../build/src_ext/xwayland/stage/Xwayland"; do
+        provenance="$(dirname "${candidate}")/PROVENANCE.txt"
+        [ -x "${candidate}" ] && [ -r "${provenance}" ] || continue
+        actual_build_id="$(readelf -n "${candidate}" 2>/dev/null \
+            | awk '/Build ID:/ { print $3; exit }')"
+        if vkr_private_xwayland_metadata_compatible \
+            "${provenance}" "${codename}" "${arch}" "${installed}" "${actual_build_id}"; then
+            readlink -f "${candidate}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # --- WSLg read-only /tmp/.X11-unix workaround (transparent, no sudo, no global change) ----------

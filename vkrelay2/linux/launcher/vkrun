@@ -30,6 +30,8 @@
 # Env overrides (rarely needed):
 #   VKRELAY2_LAUNCH        path to the Linux vkrelay2-launch binary
 #   VKRELAY2_WIN_BUILD     dir holding vkrelay2-supervisor.exe + vkrelay2-worker.exe
+#   VKRELAY2_WINDOWS_CACHE_ROOT  test/admin override for the WSL path corresponding to the
+#                          Windows per-user cache root (installed .deb only; normally LocalAppData)
 #   VKRELAY2_DAEMON_HOST   force the host to reach the daemon at (skips auto-detect)
 #   VKRELAY2_DAEMON_PORT   control-plane port (default 13579)
 #   VKRELAY2_BIND          daemon bind address when auto-launching (default 127.0.0.1,
@@ -172,6 +174,65 @@ daemon_healthy() {
     return 1
 }
 
+# A Debian package stores its Windows binaries as an inert payload under /usr. Windows cannot
+# reliably execute that Linux-filesystem path, and package installation runs as root (which must not
+# guess a Windows user). Materialize the payload lazily, as the invoking user, below
+# %LOCALAPPDATA%/vkrelay2/<package-id>. The versioned directory avoids replacing an in-use .exe;
+# package prerm owns deletion of these marked directories on upgrade/removal.
+materialize_installed_windows_payload() {
+    local payload="${script_dir}/../windows-payload"
+    [[ -r "${payload}/VERSION" && -r "${payload}/SHA256SUMS" ]] || return 1
+    [[ -r "${payload}/vkrelay2-supervisor.exe" && -r "${payload}/vkrelay2-worker.exe" ]] \
+        || return 1
+
+    local package_id cache_root win_local cache marker file tmp
+    package_id="$(tr -d '\r\n' < "${payload}/VERSION")"
+    [[ "${package_id}" =~ ^[A-Za-z0-9.+~_-]+$ ]] || {
+        echo "vkrun: installed Windows payload has an unsafe VERSION marker" >&2
+        return 1
+    }
+    if [[ -n "${VKRELAY2_WINDOWS_CACHE_ROOT:-}" ]]; then
+        cache_root="${VKRELAY2_WINDOWS_CACHE_ROOT}"
+    else
+        command -v cmd.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1 || return 1
+        win_local="$(cmd.exe /d /c echo %LOCALAPPDATA% </dev/null 2>/dev/null \
+            | tr -d '\r' | tail -n 1)"
+        [[ -n "${win_local}" && "${win_local}" != "%LOCALAPPDATA%" ]] || return 1
+        cache_root="$(wslpath -u "${win_local}" 2>/dev/null)"
+        [[ -n "${cache_root}" ]] || return 1
+    fi
+    cache="${cache_root}/vkrelay2/${package_id}"
+    marker="${cache}/.vkrelay2-package"
+    mkdir -p "${cache}"
+
+    # Serialize two first launches and validate the packaged payload before publishing either exe.
+    exec 8>"${cache}/.install.lock"
+    flock 8
+    ( cd "${payload}" && sha256sum -c SHA256SUMS >/dev/null ) || {
+        echo "vkrun: installed Windows payload failed its packaged SHA-256 check" >&2
+        return 1
+    }
+    for file in vkrelay2-supervisor.exe vkrelay2-worker.exe; do
+        if [[ -r "${cache}/${file}" ]] \
+            && [[ "$(sha256sum "${cache}/${file}" | awk '{print $1}')" \
+                  = "$(awk -v f="${file}" '$2 == f {print $1; exit}' "${payload}/SHA256SUMS")" ]]; then
+            continue
+        fi
+        tmp="${cache}/.${file}.tmp.$$"
+        cp -f "${payload}/${file}" "${tmp}"
+        chmod +x "${tmp}" 2>/dev/null || true
+        mv -f "${tmp}" "${cache}/${file}"
+    done
+    cp -f "${payload}/SHA256SUMS" "${cache}/SHA256SUMS"
+    printf '%s\n' "${package_id}" > "${marker}.tmp.$$"
+    mv -f "${marker}.tmp.$$" "${marker}"
+    ( cd "${cache}" && sha256sum -c SHA256SUMS >/dev/null ) || {
+        echo "vkrun: cached Windows payload failed SHA-256 verification" >&2
+        return 1
+    }
+    printf '%s\n' "${cache}"
+}
+
 # Resolves the dir holding the Windows daemon + worker (.exe). Empty on a host
 # with no Windows build (e.g. native Linux).
 resolve_win_build() {
@@ -179,13 +240,19 @@ resolve_win_build() {
     [[ -n "${VKRELAY2_WIN_BUILD:-}" ]] && dirs+=("${VKRELAY2_WIN_BUILD}")
     # release before debug (same rationale as the launch_bin candidates above).
     dirs+=("${script_dir}/../../build/windows-release" "${script_dir}/../../build/windows-debug")
-    local d
+    local installed_cache="" d
     for d in "${dirs[@]}"; do
         if [[ -x "${d}/vkrelay2-supervisor.exe" && -x "${d}/vkrelay2-worker.exe" ]]; then
             printf '%s\n' "${d}"
             return 0
         fi
     done
+    if installed_cache="$(materialize_installed_windows_payload)" \
+        && [[ -x "${installed_cache}/vkrelay2-supervisor.exe" \
+              && -x "${installed_cache}/vkrelay2-worker.exe" ]]; then
+        printf '%s\n' "${installed_cache}"
+        return 0
+    fi
     return 1
 }
 

@@ -23,8 +23,10 @@ between minor releases.
   `debian/control` through `mk-build-deps`; Jammy APT rejects the previously used local control path.
 - Isolated private-Xwayland package tests from WSLg's host GPU stack by selecting Mesa `llvmpipe` on
   WSL, and fixed strict-gate reporting so full Meson test names remain intact.
-- Binary release packages now use stable, distro-specific GitHub asset names and include SHA-256
-  checksum files, enabling version-independent latest-release download instructions.
+- Binary releases are distro-specific `.deb` packages with stable GitHub asset names and SHA-256
+  checksum files. They install Linux components under `/usr`, materialize verified Windows
+  executables under the invoking user's `%LOCALAPPDATA%` on first launch, and remove that Windows
+  payload when APT uninstalls or upgrades the package.
 
 ## 0.1.0 — 2026-07-16
 

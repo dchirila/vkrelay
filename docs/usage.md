@@ -216,6 +216,6 @@ The following are properties of the current implementation, not configuration er
   application launch, but not for `--list-gpus`, building vkrelay2, or running its normal `ctest`
   suite; binary packages already include it. See [When the private build is
   needed](building.md#when-the-private-build-is-needed).
-- There is no OS-level installer, service registration, or stable configuration file. A supported
-  binary tar package is available (see [Installing](install.md)); a source checkout runs from
-  build-tree paths.
+- Distro-specific Debian packages are available (see [Installing](install.md)); a source checkout
+  runs from build-tree paths. There is no Windows service registration or stable configuration
+  file.
