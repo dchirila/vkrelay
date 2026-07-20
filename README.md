@@ -29,9 +29,9 @@ The current implementation targets:
 - one physical-pixel canvas spanning mixed-resolution/DPI, negative-origin, and portrait Windows
   monitor layouts, with snapshot-driven per-monitor placement and maximize behavior.
 
-The project can be run from a source checkout or from a binary package produced by
-`scripts/dev/package_release.sh` (see [Installing](docs/install.md)); there is no OS-level
-installer yet. The ICD exposes only functionality backed by the relay and rejects unsupported
+The project can be run from a source checkout or from a distro-specific Debian package produced by
+`scripts/dev/package_release.sh` (see [Installing](docs/install.md)). The ICD exposes only
+functionality backed by the relay and rejects unsupported
 extensions, features, pipeline shapes, and commands. It is not presented as a Vulkan conformant
 implementation.
 
@@ -42,9 +42,11 @@ See [Architecture](docs/architecture.md) for the process and data-flow model and
 
 ### From a binary package (no build tools needed)
 
-Extract a `vkrelay2-<version>-<codename>-amd64.tar.gz` (codename is your Ubuntu release —
-jammy, noble, or resolute) under `/mnt/c`, run `sudo ./install.sh` inside WSL (it installs only
-runtime packages), and launch — three steps, both sides covered. See [Installing](docs/install.md).
+Download the package for your WSL Ubuntu release (`jammy`, `noble`, or `resolute`) from the
+[latest GitHub Release](https://github.com/dchirila/vkrelay/releases/latest), verify its checksum,
+and install it with `sudo apt install ./vkrelay2-<codename>-amd64.deb`. APT installs runtime
+dependencies only; compilers, Visual Studio, and the Vulkan SDK are not required. See
+[Installing](docs/install.md) for copy-paste commands and uninstall behavior.
 
 ### From source
 
@@ -91,7 +93,7 @@ a diagnostic bundle under `/tmp/vkrelay2-logs-<pid>` and prints the exact path.
 
 ## Documentation
 
-- [Installing](docs/install.md): binary packages — producing one, and the minimal install steps
+- [Installing](docs/install.md): binary packages — producing one, installation, and clean removal
 - [Usage](docs/usage.md): frontends, GPU selection, application launch, networking, and runtime
   configuration
 - [Building](docs/building.md): prerequisites, Windows and WSL builds, private Xwayland, tests, and

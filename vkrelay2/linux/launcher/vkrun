@@ -30,6 +30,8 @@
 # Env overrides (rarely needed):
 #   VKRELAY2_LAUNCH        path to the Linux vkrelay2-launch binary
 #   VKRELAY2_WIN_BUILD     dir holding vkrelay2-supervisor.exe + vkrelay2-worker.exe
+#   VKRELAY2_WINDOWS_CACHE_ROOT  test-only override for the WSL path corresponding to the Windows
+#                          per-user cache root (installed .deb only; normally LocalAppData)
 #   VKRELAY2_DAEMON_HOST   force the host to reach the daemon at (skips auto-detect)
 #   VKRELAY2_DAEMON_PORT   control-plane port (default 13579)
 #   VKRELAY2_BIND          daemon bind address when auto-launching (default 127.0.0.1,
@@ -172,6 +174,144 @@ daemon_healthy() {
     return 1
 }
 
+# A Debian package stores its Windows binaries as an inert payload under /usr. Windows cannot
+# reliably execute that Linux-filesystem path, and package installation runs as root (which must not
+# guess a Windows user). Materialize the payload lazily, as the invoking user, below
+# %LOCALAPPDATA%/vkrelay2/<package-id>. The versioned directory avoids replacing an in-use .exe;
+# package prerm owns deletion of these marked directories on upgrade/removal.
+materialize_installed_windows_payload() {
+    local payload="${script_dir}/../windows-payload"
+    local cache_root_helper="${script_dir}/../windows-cache-root"
+    [[ -r "${payload}/VERSION" && -r "${payload}/SHA256SUMS" ]] || return 1
+    [[ -r "${payload}/vkrelay2-supervisor.exe" && -r "${payload}/vkrelay2-worker.exe" ]] \
+        || return 1
+
+    local package_id cache_root cache parent owner_marker legacy_marker ready_marker
+    local manifest_hash ready_value file expected actual tmp
+    package_id="$(tr -d '\r\n' < "${payload}/VERSION")"
+    [[ "${package_id}" =~ ^[A-Za-z0-9.+~_-]+$ ]] || {
+        echo "vkrun: installed Windows payload has an unsafe VERSION marker" >&2
+        return 1
+    }
+    if [[ -n "${VKRELAY2_WINDOWS_CACHE_ROOT:-}" ]]; then
+        cache_root="${VKRELAY2_WINDOWS_CACHE_ROOT}"
+    elif [[ -r /var/lib/vkrelay2/windows-cache-root ]]; then
+        cache_root="$(tr -d '\r\n' < /var/lib/vkrelay2/windows-cache-root)"
+    else
+        [[ -x "${cache_root_helper}" ]] || return 1
+        cache_root="$("${cache_root_helper}")" || return 1
+    fi
+    [[ "${cache_root}" == /* ]] || return 1
+    cache="${cache_root}/vkrelay2/${package_id}"
+    parent="$(dirname "${cache}")"
+    owner_marker="${cache}.vkrelay2-package"
+    legacy_marker="${cache}/.vkrelay2-package"
+    ready_marker="${cache}/.vkrelay2-ready"
+    manifest_hash="$(sha256sum "${payload}/SHA256SUMS" | awk '{ print $1 }')" || return 1
+    [[ -n "${manifest_hash}" ]] || return 1
+    ready_value="${package_id} ${manifest_hash}"
+
+    # A completion stamp is the normal fast path. The executable hashes were verified immediately
+    # before this stamp was atomically published; vkrelay2 does not mutate that ready cache later.
+    if [[ -r "${owner_marker}" \
+          && "$(tr -d '\r\n' < "${owner_marker}")" == "${package_id}" \
+          && -r "${ready_marker}" \
+          && "$(tr -d '\r\n' < "${ready_marker}")" == "${ready_value}" \
+          && -x "${cache}/vkrelay2-supervisor.exe" \
+          && -x "${cache}/vkrelay2-worker.exe" \
+          && -r "${cache}/SHA256SUMS" ]] \
+        && cmp -s "${payload}/SHA256SUMS" "${cache}/SHA256SUMS"; then
+        printf '%s\n' "${cache}"
+        return 0
+    fi
+
+    if [[ -e "${owner_marker}" \
+          && ( ! -r "${owner_marker}" \
+               || "$(tr -d '\r\n' < "${owner_marker}")" != "${package_id}" ) ]]; then
+        echo "vkrun: refusing invalid Windows cache ownership marker ${owner_marker}" >&2
+        return 1
+    fi
+    if [[ -e "${cache}" && ! -d "${cache}" ]] || [[ -L "${cache}" ]]; then
+        echo "vkrun: refusing unexpected Windows cache path ${cache}" >&2
+        return 1
+    fi
+    if [[ -d "${cache}" && ! -r "${owner_marker}" ]]; then
+        # Migrate the first .deb implementation, whose ownership marker lived inside the cache.
+        if [[ ! -r "${legacy_marker}" \
+              || "$(tr -d '\r\n' < "${legacy_marker}")" != "${package_id}" ]]; then
+            echo "vkrun: refusing unmarked Windows cache ${cache}" >&2
+            echo "  Remove that unexpected directory, then retry." >&2
+            return 1
+        fi
+    fi
+
+    mkdir -p "${parent}" || return 1
+    tmp="${owner_marker}.tmp.$$"
+    printf '%s\n' "${package_id}" > "${tmp}" || return 1
+    if ! mv -f "${tmp}" "${owner_marker}"; then
+        rm -f "${tmp}" 2>/dev/null || true
+        return 1
+    fi
+    mkdir -p "${cache}" || return 1
+
+    # Serialize two first launches and validate the packaged payload before publishing either exe.
+    if ! { exec 8>"${cache}/.install.lock"; }; then
+        echo "vkrun: cannot open the installed Windows-payload lock" >&2
+        return 1
+    fi
+    if ! flock 8; then
+        echo "vkrun: cannot lock the installed Windows payload; refusing an unsafe concurrent copy" >&2
+        return 1
+    fi
+    # Another launcher may have completed while this one waited for the lock.
+    if [[ -r "${ready_marker}" \
+          && "$(tr -d '\r\n' < "${ready_marker}")" == "${ready_value}" \
+          && -x "${cache}/vkrelay2-supervisor.exe" \
+          && -x "${cache}/vkrelay2-worker.exe" \
+          && -r "${cache}/SHA256SUMS" ]] \
+        && cmp -s "${payload}/SHA256SUMS" "${cache}/SHA256SUMS"; then
+        printf '%s\n' "${cache}"
+        return 0
+    fi
+    ( cd "${payload}" && sha256sum -c SHA256SUMS >/dev/null ) || {
+        echo "vkrun: installed Windows payload failed its packaged SHA-256 check" >&2
+        return 1
+    }
+    for file in vkrelay2-supervisor.exe vkrelay2-worker.exe; do
+        expected="$(awk -v f="${file}" '$2 == f { print $1; exit }' \
+            "${payload}/SHA256SUMS")"
+        [[ -n "${expected}" ]] || return 1
+        actual=""
+        [[ ! -r "${cache}/${file}" ]] \
+            || actual="$(sha256sum "${cache}/${file}" | awk '{ print $1 }')"
+        if [[ "${actual}" == "${expected}" ]]; then
+            continue
+        fi
+        tmp="${cache}/.${file}.tmp.$$"
+        if ! cp -f "${payload}/${file}" "${tmp}"; then
+            rm -f "${tmp}" 2>/dev/null || true
+            return 1
+        fi
+        chmod +x "${tmp}" 2>/dev/null || true
+        if ! mv -f "${tmp}" "${cache}/${file}"; then
+            rm -f "${tmp}" 2>/dev/null || true
+            return 1
+        fi
+    done
+    tmp="${cache}/.SHA256SUMS.tmp.$$"
+    cp -f "${payload}/SHA256SUMS" "${tmp}" || return 1
+    mv -f "${tmp}" "${cache}/SHA256SUMS" || return 1
+    ( cd "${cache}" && sha256sum -c SHA256SUMS >/dev/null ) || {
+        echo "vkrun: cached Windows payload failed SHA-256 verification" >&2
+        return 1
+    }
+    tmp="${ready_marker}.tmp.$$"
+    printf '%s\n' "${ready_value}" > "${tmp}" || return 1
+    mv -f "${tmp}" "${ready_marker}" || return 1
+    rm -f "${legacy_marker}" 2>/dev/null || true
+    printf '%s\n' "${cache}"
+}
+
 # Resolves the dir holding the Windows daemon + worker (.exe). Empty on a host
 # with no Windows build (e.g. native Linux).
 resolve_win_build() {
@@ -179,13 +319,19 @@ resolve_win_build() {
     [[ -n "${VKRELAY2_WIN_BUILD:-}" ]] && dirs+=("${VKRELAY2_WIN_BUILD}")
     # release before debug (same rationale as the launch_bin candidates above).
     dirs+=("${script_dir}/../../build/windows-release" "${script_dir}/../../build/windows-debug")
-    local d
+    local installed_cache="" d
     for d in "${dirs[@]}"; do
         if [[ -x "${d}/vkrelay2-supervisor.exe" && -x "${d}/vkrelay2-worker.exe" ]]; then
             printf '%s\n' "${d}"
             return 0
         fi
     done
+    if installed_cache="$(materialize_installed_windows_payload)" \
+        && [[ -x "${installed_cache}/vkrelay2-supervisor.exe" \
+              && -x "${installed_cache}/vkrelay2-worker.exe" ]]; then
+        printf '%s\n' "${installed_cache}"
+        return 0
+    fi
     return 1
 }
 
@@ -194,15 +340,6 @@ resolve_win_build() {
 # side (Start-Process) so later runs reuse it. Best-effort: on failure the
 # launcher still falls back to its local mock list.
 ensure_daemon() {
-    # Deterministic worker-log path (beside the worker exe) so the failure bundle can fold in the
-    # daemon/worker stderr whether we START the daemon (redirected below) or REUSE one a prior run
-    # started with the same redirect. Best-effort: unset if there is no Windows build.
-    if command -v wslpath >/dev/null 2>&1; then
-        local _wb
-        if _wb="$(resolve_win_build)"; then
-            export VKR_WORKER_LOG_WSL="${VKRELAY2_WORKER_LOG:-${_wb}/vkrelay2-worker-daemon.log}"
-        fi
-    fi
     local host
     # Reuse only a HEALTHY daemon -- one that answers a real handshake, not merely a port that accepts
     # (a wedged daemon still accepts, and reusing it is exactly what produced the hang).
@@ -221,11 +358,20 @@ ensure_daemon() {
         return 1
     fi
 
+    # Only an auto-start needs to locate/materialize the Windows payload. A healthy reused daemon
+    # must remain a genuinely cheap path: no Windows interop process and no executable hash passes.
+    # The worker log is deterministic beside the selected payload for daemons started here.
+    local win_build=""
+    if command -v wslpath >/dev/null 2>&1; then
+        if win_build="$(resolve_win_build)"; then
+            export VKR_WORKER_LOG_WSL="${VKRELAY2_WORKER_LOG:-${win_build}/vkrelay2-worker-daemon.log}"
+        fi
+    fi
+
     if ! command -v powershell.exe >/dev/null 2>&1 || ! command -v wslpath >/dev/null 2>&1; then
         return 1 # not a WSL host bridging to Windows; nothing to launch
     fi
-    local win_build
-    if ! win_build="$(resolve_win_build)"; then
+    if [[ -z "${win_build}" ]]; then
         echo "vkrun: no daemon reachable and no Windows build found" \
              "(set VKRELAY2_WIN_BUILD to the dir holding vkrelay2-supervisor.exe)" >&2
         return 1

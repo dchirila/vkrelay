@@ -54,12 +54,9 @@ vkr_stock_xwayland_known_unsafe() { # <codename> <arch> <installed-version> <bui
     return 1
 }
 
-# Print the compatible checkout-local private Xwayland, or nothing. Explicit
+# Print the compatible package-installed or checkout-local private Xwayland, or nothing. Explicit
 # VKRELAY2_XWAYLAND_BIN remains authoritative; this is only the no-override convenience path.
 vkr_find_compatible_private_xwayland() {
-    local candidate="${VKR_PRIVATE_SESSION_LIB_DIR}/../../build/src_ext/xwayland/stage/Xwayland"
-    local provenance="$(dirname "${candidate}")/PROVENANCE.txt"
-    [ -x "${candidate}" ] && [ -r "${provenance}" ] || return 1
     command -v readelf >/dev/null 2>&1 || return 1
 
     local codename="" arch="" installed="" actual_build_id=""
@@ -72,12 +69,22 @@ vkr_find_compatible_private_xwayland() {
     if command -v dpkg-query >/dev/null 2>&1; then
         installed="$(dpkg-query -W -f='${Version}' xwayland 2>/dev/null || true)"
     fi
-    actual_build_id="$(readelf -n "${candidate}" 2>/dev/null \
-        | awk '/Build ID:/ { print $3; exit }')"
-    vkr_private_xwayland_metadata_compatible \
-        "${provenance}" "${codename}" "${arch}" "${installed}" "${actual_build_id}" \
-        || return 1
-    readlink -f "${candidate}"
+
+    local candidate provenance
+    for candidate in \
+        "${VKR_PRIVATE_SESSION_LIB_DIR}/../xwayland/Xwayland" \
+        "${VKR_PRIVATE_SESSION_LIB_DIR}/../../build/src_ext/xwayland/stage/Xwayland"; do
+        provenance="$(dirname "${candidate}")/PROVENANCE.txt"
+        [ -x "${candidate}" ] && [ -r "${provenance}" ] || continue
+        actual_build_id="$(readelf -n "${candidate}" 2>/dev/null \
+            | awk '/Build ID:/ { print $3; exit }')"
+        if vkr_private_xwayland_metadata_compatible \
+            "${provenance}" "${codename}" "${arch}" "${installed}" "${actual_build_id}"; then
+            readlink -f "${candidate}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # --- WSLg read-only /tmp/.X11-unix workaround (transparent, no sudo, no global change) ----------
@@ -250,11 +257,16 @@ vkr_start_private_display() {
             "${host_codename}" "${host_arch}" "${host_xwl_version}" "${host_xwl_build_id}"; then
             echo "vkrelay2: refusing known-crashing stock Xwayland ${host_xwl_version}" >&2
             echo "  A guarded/tested Xwayland is required for application runs." >&2
-            echo "  Build the guarded dependency with:" >&2
-            echo "    bash ${VKR_PRIVATE_SESSION_LIB_DIR}/../../src_ext/xwayland/build_private_xwayland.sh" >&2
-            echo "  This is a one-time stage, not part of each vkrelay2 rebuild." >&2
-            echo "  Binary packages bundle it; developers may instead explicitly set" >&2
-            echo "  VKRELAY2_XWAYLAND_BIN to a tested server." >&2
+            if [ -r "${VKR_PRIVATE_SESSION_LIB_DIR}/../windows-payload/VERSION" ]; then
+                echo "  This installed package's guarded Xwayland no longer matches the host" >&2
+                echo "  xwayland security package. Install a refreshed vkrelay2 .deb for this" >&2
+                echo "  Ubuntu release, then retry." >&2
+            else
+                echo "  Build the guarded dependency with:" >&2
+                echo "    bash ${VKR_PRIVATE_SESSION_LIB_DIR}/../../src_ext/xwayland/build_private_xwayland.sh" >&2
+                echo "  This is a one-time stage, not part of each vkrelay2 rebuild." >&2
+            fi
+            echo "  Developers may instead explicitly set VKRELAY2_XWAYLAND_BIN to a tested server." >&2
             return 1
         fi
     fi
