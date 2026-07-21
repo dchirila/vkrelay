@@ -18,6 +18,7 @@
 #include "windows/worker/real_vulkan_backend.hpp"
 
 #include "common/vkrpc/vulkan_session.hpp"
+#include "tests/real_backend_test_utils.hpp"
 #include "tests/test_assert.hpp"
 #include "tests/vbo_spv.h"
 
@@ -32,38 +33,26 @@ using namespace vkr;
 
 int main() {
     worker::RealVulkanBackend backend("", "", false);
-
-    const vkrpc::CreateInstanceResponse ci = backend.create_instance({});
-    if (!ci.ok) {
-        std::fprintf(stderr, "integration_real_vbo: skipped (no instance: %s)\n",
-                     ci.reason.c_str());
+    test::RealDeviceFixture fixture(backend);
+    std::string fixture_reason;
+    if (!fixture.discover(fixture_reason)) {
+        std::fprintf(stderr, "integration_real_vbo: skipped (%s)\n", fixture_reason.c_str());
         return vkr::test::finish("integration_real_vbo");
     }
-    vkrpc::EnumeratePhysicalDevicesRequest er;
-    er.instance = ci.instance;
-    const vkrpc::EnumeratePhysicalDevicesResponse en = backend.enumerate_physical_devices(er);
-    if (!en.ok || en.devices.empty()) {
-        std::fprintf(stderr, "integration_real_vbo: skipped (no physical device)\n");
-        return vkr::test::finish("integration_real_vbo");
-    }
-    const std::uint64_t phys = en.devices.front().handle;
     vkrpc::CreateDeviceRequest cdr;
-    cdr.instance = ci.instance;
-    cdr.physical_device = phys;
-    const vkrpc::CreateDeviceResponse cd = backend.create_device(cdr);
-    VKR_CHECK(cd.ok);
-    vkrpc::GetDeviceQueueRequest gqr;
-    gqr.device = cd.device;
-    gqr.queue_family_index = cd.queue_family_index;
-    gqr.queue_index = 0;
-    const vkrpc::GetDeviceQueueResponse q = backend.get_device_queue(gqr);
-    VKR_CHECK(q.ok && q.queue != 0);
+    const bool device_ready = fixture.create_device(cdr, fixture_reason);
+    VKR_CHECK(device_ready);
+    if (!device_ready) {
+        std::fprintf(stderr, "integration_real_vbo: %s\n", fixture_reason.c_str());
+        return vkr::test::finish("integration_real_vbo");
+    }
+    const auto& ci = fixture.instance;
+    const std::uint64_t phys = fixture.physical_device;
+    const auto& cd = fixture.device;
+    const auto& q = fixture.queue;
+    const auto& mp = fixture.memory_properties;
 
     // Memory properties: find a HOST_VISIBLE | HOST_COHERENT type (the VBO upload target).
-    vkrpc::GetPhysicalDeviceMemoryPropertiesRequest mpr;
-    mpr.physical_device = phys;
-    const vkrpc::GetPhysicalDeviceMemoryPropertiesResponse mp =
-        backend.get_physical_device_memory_properties(mpr);
     VKR_CHECK(mp.ok && !mp.types.empty());
     int coherent_type = -1;
     for (std::size_t i = 0; i < mp.types.size(); ++i) {

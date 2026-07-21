@@ -24,6 +24,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vkr::vkrpc {
@@ -93,6 +94,10 @@ struct DeviceCaps {
     // the draw_indirect + draw_indexed_indirect record kinds. Additive: 0 = an older worker, so a
     // newer ICD marks the command buffer invalid locally instead of sending an unknown kind.
     std::uint32_t core_indirect_draw = 0;
+    // Allocation-free core-indirect payload spelling: 1 iff this worker decodes the dedicated
+    // indirect_* scalars (raw field group and JSON keys). Additive: 0 = a milestone-A worker, so
+    // a newer ICD emits the original args_u64/args_i64 spelling for rolling-upgrade safety.
+    std::uint32_t core_indirect_draw_scalar_payload = 0;
 
     json::Value to_body() const;
     static DeviceCaps from_body(const json::Value& body);
@@ -893,6 +898,18 @@ struct RecordedCommand {
     // 2D scope, stride VUs) is asserted ICD-side AND worker-side. Destroying EITHER src_buffer OR
     // image invalidates the baked CB (both join referenced_draw_objects at record time).
     std::uint64_t src_buffer = 0;
+    // Core draw_indirect / draw_indexed_indirect use dedicated scalars so their hot record path
+    // does not allocate two positional vectors. count/stride use the usual -1 malformed/missing
+    // sentinel; offset is a VkDeviceSize. New decoders retain the original args_u64/args_i64
+    // spelling for old-ICD compatibility.
+    std::uint64_t indirect_offset = 0;
+    long long indirect_draw_count = -1;
+    long long indirect_stride = -1;
+    // Producer-only kind hint for the negotiated scalar spelling: the ICD leaves the long kind
+    // string empty and sets this flag, avoiding its heap allocation. Codecs materialize the
+    // canonical wire name. Toward a milestone-A worker, the ICD instead retains the canonical
+    // kind string and positional vectors that worker understands.
+    bool indirect_indexed = false;
     // copy_width/height/depth are GENERIC codec fields (kept wire-compatible; exercised by the
     // codec parity test) -- copy_buffer_to_image itself no longer uses them (its regions ride
     // args_i64, above).
@@ -935,12 +952,27 @@ struct RecordedCommand {
     std::vector<DependencyInfo2> deps2;
 };
 
-// the recorded-command kind vocabulary as an enum. The `kind` STRING stays the wire +
-// struct identity (every existing producer/pin unchanged); this enum exists so the two backends'
-// per-command dispatch is ONE hash lookup (cmd_kind_from_string at the top of the loop) plus
-// integer compares, instead of a ~40-arm string-compare chain per command -- at ETR-class volumes
-// (~1.5M commands / 40 s) the chains were a measured slice of the worker's validate time. Unknown
-// strings map to Unknown, which every dispatch chain rejects exactly as the old final `else` did.
+struct CoreIndirectDrawArgs {
+    std::uint64_t offset = 0;
+    long long draw_count = -1;
+    long long stride = -1;
+};
+
+// Construct the capability-selected producer spelling. New-to-new uses the allocation-free
+// scalar form; a new ICD paired with a milestone-A worker uses its original positional form.
+RecordedCommand make_core_indirect_draw_command(std::uint64_t buffer, std::uint64_t offset,
+                                                std::uint32_t draw_count, std::uint32_t stride,
+                                                bool indexed, bool scalar_payload);
+
+// Decode the dedicated scalar spelling or the legacy positional-vector spelling, rejecting
+// mixed/partial payloads. Shared by mock and real validation/replay.
+bool core_indirect_draw_args(const RecordedCommand& command, CoreIndirectDrawArgs& args,
+                             const char** reason);
+
+// The recorded-command kind vocabulary as an enum. `kind` stays the wire and decoded-struct
+// identity; the indirect producer-only hint above is materialized into that canonical string by
+// either codec. This enum lets the two backends dispatch with one hash lookup plus integer compares
+// instead of a ~40-arm string chain. Unknown strings map to Unknown and fail closed.
 enum class CmdKind : unsigned char {
     Unknown = 0,
     PipelineBarrier,
@@ -1048,11 +1080,13 @@ enum class CmdKind : unsigned char {
     // enum (the wire is string-keyed; integer positions are per-TU baked).
     FillBuffer,
     // Core 1.0 indirect draw commands. Payload for both: src_buffer = guest buffer;
-    // args_u64=[offset]; args_i64=[drawCount, stride]. APPEND-ONLY.
+    // Dedicated indirect_* scalars; legacy positional payloads remain decodable. APPEND-ONLY.
     DrawIndirect,
     DrawIndexedIndirect,
 };
 CmdKind cmd_kind_from_string(const std::string& kind);
+CmdKind recorded_command_kind(const RecordedCommand& command);
+std::string_view recorded_command_kind_name(const RecordedCommand& command);
 
 // the fixed-slot per-barrier widths for the wait_events args_u64 flatten (the
 // sync1 barrier arrays). memory = [srcAccess, dstAccess]; buffer = [srcAccess, dstAccess, buffer,

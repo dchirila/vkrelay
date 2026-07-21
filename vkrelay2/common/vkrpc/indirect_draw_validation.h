@@ -19,6 +19,59 @@ constexpr std::uint64_t kDrawIndexedIndirectCommandBytes = 20;
 // not include Vulkan headers.
 constexpr std::uint64_t kFeatureMultiDrawIndirect = std::uint64_t{1} << 9;
 
+struct IndirectBufferState {
+    bool live = false;
+    bool bound = false;
+    bool has_indirect_usage = false;
+    std::uint64_t size = 0;
+};
+
+// The mock and real object tables deliberately expose the same four buffer members. Centralizing
+// this lookup keeps bind/indirect admission in lockstep without coupling this Vulkan-free header
+// to either backend's private record type.
+template <typename BufferMap, typename Device>
+const typename BufferMap::mapped_type*
+live_device_buffer(const BufferMap& buffers, std::uint64_t handle, const Device& device) {
+    const auto it = buffers.find(handle);
+    return it != buffers.end() && it->second.device == device ? &it->second : nullptr;
+}
+
+template <typename BufferMap, typename Device, typename Usage>
+IndirectBufferState indirect_buffer_state(const BufferMap& buffers, std::uint64_t handle,
+                                          const Device& device, Usage indirect_usage) {
+    const auto* buffer = live_device_buffer(buffers, handle, device);
+    IndirectBufferState state;
+    state.live = buffer != nullptr;
+    state.bound = buffer != nullptr && buffer->bound_memory != 0;
+    state.has_indirect_usage =
+        buffer != nullptr &&
+        (buffer->usage & static_cast<decltype(buffer->usage)>(indirect_usage)) != 0;
+    state.size = buffer != nullptr ? static_cast<std::uint64_t>(buffer->size) : 0;
+    return state;
+}
+
+inline bool dispatch_indirect_ok(const IndirectBufferState& buffer, std::uint64_t offset,
+                                 const char** reason) {
+    if (!buffer.live || !buffer.bound) {
+        *reason = "dispatch_indirect buffer is not live/bound on the device";
+        return false;
+    }
+    if (!buffer.has_indirect_usage) {
+        *reason = "dispatch_indirect buffer lacks INDIRECT_BUFFER usage";
+        return false;
+    }
+    if ((offset % 4) != 0 || offset > buffer.size || 12 > buffer.size - offset) {
+        *reason = "dispatch_indirect offset misaligned or out of range";
+        return false;
+    }
+    return true;
+}
+
+inline bool core_indirect_draw_ok(const IndirectBufferState& buffer, std::uint64_t offset,
+                                  long long draw_count, long long stride,
+                                  std::uint64_t command_size, bool multi_draw_indirect_enabled,
+                                  const char** reason);
+
 inline bool core_indirect_draw_ok(bool buffer_live, bool buffer_bound, bool has_indirect_usage,
                                   std::uint64_t buffer_size, std::uint64_t offset,
                                   long long draw_count, long long stride,
@@ -81,6 +134,15 @@ inline bool core_indirect_draw_ok(bool buffer_live, bool buffer_bound, bool has_
         return false;
     }
     return true;
+}
+
+inline bool core_indirect_draw_ok(const IndirectBufferState& buffer, std::uint64_t offset,
+                                  long long draw_count, long long stride,
+                                  std::uint64_t command_size, bool multi_draw_indirect_enabled,
+                                  const char** reason) {
+    return core_indirect_draw_ok(buffer.live, buffer.bound, buffer.has_indirect_usage, buffer.size,
+                                 offset, draw_count, stride, command_size,
+                                 multi_draw_indirect_enabled, reason);
 }
 
 } // namespace vkr::vkrpc

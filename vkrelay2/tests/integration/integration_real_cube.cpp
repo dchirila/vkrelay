@@ -23,6 +23,7 @@
 #include "common/vkrpc/vulkan_session.hpp"
 #include "tests/cube_geometry.h"
 #include "tests/cube_spv.h"
+#include "tests/real_backend_test_utils.hpp"
 #include "tests/test_assert.hpp"
 
 #include <cstdint>
@@ -36,23 +37,7 @@
 using namespace vkr;
 
 namespace {
-// Picks a memory type in `type_bits` matching a predicate over the property flags; -1 if none.
-long long pick_type(const vkrpc::GetPhysicalDeviceMemoryPropertiesResponse& mp,
-                    std::uint64_t type_bits, bool want_device_local) {
-    for (std::size_t i = 0; i < mp.types.size(); ++i) {
-        if ((type_bits & (1ull << i)) == 0) {
-            continue;
-        }
-        const std::uint64_t f = mp.types[i].property_flags;
-        const bool coherent = (f & vkrpc::kMemoryPropertyHostVisible) != 0 &&
-                              (f & vkrpc::kMemoryPropertyHostCoherent) != 0;
-        const bool device_local = (f & vkrpc::kMemoryPropertyDeviceLocal) != 0;
-        if (want_device_local ? device_local : coherent) {
-            return static_cast<long long>(i);
-        }
-    }
-    return -1;
-}
+using test::pick_type;
 } // namespace
 
 int main() {

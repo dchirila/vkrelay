@@ -108,6 +108,7 @@ vkrpc::DeviceCaps caps_from_props(const VkPhysicalDeviceProperties& p) {
     // does not advertise this gets the older ICD's fail-closed rejection of the stream shape.
     c.rasterization_stream_state = 1;
     c.core_indirect_draw = 1;
+    c.core_indirect_draw_scalar_payload = 1;
     return c;
 }
 
@@ -321,7 +322,7 @@ VkPhysicalDevice select_physical_device(VkInstance instance, bool required,
 // (a zero sync1 stage mask, a clear on a non-TRANSFER_DST image, an unknown kind).
 bool validate_recorded_command(const vkrpc::RecordedCommand& c, bool transfer_dst,
                                std::string& err) {
-    const vkrpc::CmdKind k = vkrpc::cmd_kind_from_string(c.kind);
+    const vkrpc::CmdKind k = vkrpc::recorded_command_kind(c);
     if (k == vkrpc::CmdKind::PipelineBarrier) {
         // Sync1 requires non-zero src/dst stage masks; access masks may be zero (e.g.
         // UNDEFINED->TRANSFER_DST has srcAccessMask 0); the aspect must be a non-zero mask.
@@ -5984,9 +5985,10 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
         VkBuffer index_buffer = VK_NULL_HANDLE;        // (GL/zink): bind_index_buffer
         VkDeviceSize index_offset = 0;
         VkIndexType index_type = VK_INDEX_TYPE_UINT16;
-        VkImage dst_image = VK_NULL_HANDLE;      // (GL/zink): blit_image dest
-        std::vector<VkDeviceSize> vsizes;        // (GL/zink): bind_transform_feedback sizes
-        VkQueryPool query_pool = VK_NULL_HANDLE; // query pools: reset/begin/end/write_timestamp
+        vkrpc::CoreIndirectDrawArgs indirect_draw; // validated scalar/legacy-normalized payload
+        VkImage dst_image = VK_NULL_HANDLE;        // (GL/zink): blit_image dest
+        std::vector<VkDeviceSize> vsizes;          // (GL/zink): bind_transform_feedback sizes
+        VkQueryPool query_pool = VK_NULL_HANDLE;   // query pools: reset/begin/end/write_timestamp
         // (dynamic rendering): the resolved host image views for a begin_rendering command,
         // in the same order the wire carried them (color[0..n-1], depth?, stencil?); a null
         // attachment stays VK_NULL_HANDLE. replay rebuilds VkRenderingInfo from r.cmd's enums +
@@ -6060,7 +6062,7 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
     for (const vkrpc::RecordedCommand& c : req.commands) {
         // one lookup, then integer dispatch (the string-compare chain was a measured
         // slice of per-command validate time at ETR volumes). Unknown -> the final else, as ever.
-        const vkrpc::CmdKind k = vkrpc::cmd_kind_from_string(c.kind);
+        const vkrpc::CmdKind k = vkrpc::recorded_command_kind(c);
         if (k == vkrpc::CmdKind::PipelineBarrier || k == vkrpc::CmdKind::ClearColorImage) {
             const auto img = images_.find(c.image);
             if (img == images_.end() || img->second.device != device) {
@@ -6465,16 +6467,15 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                 resp.reason = "malformed bind_index_buffer";
                 return resp;
             }
-            const auto ibf = buffers_.find(c.args_u64[0]);
-            if (ibf == buffers_.end() || ibf->second.device != device ||
-                ibf->second.bound_memory == 0) {
+            const auto* index_buffer = vkrpc::live_device_buffer(buffers_, c.args_u64[0], device);
+            if (index_buffer == nullptr || index_buffer->bound_memory == 0) {
                 resp.ok = false;
                 resp.reason = "bind_index_buffer references a buffer not live/bound on the device";
                 return resp;
             }
             Resolved r;
             r.cmd = &c;
-            r.index_buffer = ibf->second.vk;
+            r.index_buffer = index_buffer->vk;
             r.index_offset = static_cast<VkDeviceSize>(c.args_u64[1]);
             r.index_type = static_cast<VkIndexType>(c.args_i64[0]);
             resolved.push_back(r);
@@ -6638,19 +6639,16 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                 referenced_draw_objects.insert(c.args_u64[0]);
             } else if (k == vkrpc::CmdKind::DrawIndirect ||
                        k == vkrpc::CmdKind::DrawIndexedIndirect) {
-                if (c.args_u64.size() != 1 || c.args_i64.size() != 2) {
+                vkrpc::CoreIndirectDrawArgs args;
+                const char* why = "";
+                if (!vkrpc::core_indirect_draw_args(c, args, &why)) {
                     resp.ok = false;
-                    resp.reason = "malformed core indirect draw command";
+                    resp.reason = why;
                     return resp;
                 }
-                const auto ibf = buffers_.find(c.src_buffer);
-                const bool live = ibf != buffers_.end() && ibf->second.device == device;
-                const bool bound = live && ibf->second.bound_memory != 0;
-                const bool usage =
-                    live && (ibf->second.usage & vkrpc::kBufferUsageIndirectBuffer) != 0;
-                const char* why = "";
-                if (!vkrpc::core_indirect_draw_ok(live, bound, usage, live ? ibf->second.size : 0,
-                                                  c.args_u64[0], c.args_i64[0], c.args_i64[1],
+                const vkrpc::IndirectBufferState buffer = vkrpc::indirect_buffer_state(
+                    buffers_, c.src_buffer, device, vkrpc::kBufferUsageIndirectBuffer);
+                if (!vkrpc::core_indirect_draw_ok(buffer, args.offset, args.draw_count, args.stride,
                                                   k == vkrpc::CmdKind::DrawIndexedIndirect
                                                       ? vkrpc::kDrawIndexedIndirectCommandBytes
                                                       : vkrpc::kDrawIndirectCommandBytes,
@@ -6660,7 +6658,10 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                     resp.reason = why;
                     return resp;
                 }
-                r.src_buffer = ibf->second.vk;
+                const auto* indirect_buffer =
+                    vkrpc::live_device_buffer(buffers_, c.src_buffer, device);
+                r.src_buffer = indirect_buffer->vk;
+                r.indirect_draw = args;
                 referenced_draw_objects.insert(c.src_buffer);
             } else if (c.vertex_count < 0 || c.instance_count < 0 || c.first_vertex < 0 ||
                        c.first_instance < 0) {
@@ -6718,25 +6719,18 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                     resp.reason = "malformed dispatch_indirect command";
                     return resp;
                 }
-                const auto ibf = buffers_.find(c.src_buffer);
-                if (ibf == buffers_.end() || ibf->second.device != device ||
-                    ibf->second.bound_memory == 0) {
-                    resp.ok = false;
-                    resp.reason = "dispatch_indirect buffer is not live/bound on the device";
-                    return resp;
-                }
-                if ((ibf->second.usage & vkrpc::kBufferUsageIndirectBuffer) == 0) {
-                    resp.ok = false;
-                    resp.reason = "dispatch_indirect buffer lacks INDIRECT_BUFFER usage";
-                    return resp;
-                }
                 const std::uint64_t off = c.args_u64[0];
-                if (off % 4 != 0 || off + 12 > ibf->second.size || off + 12 < off) {
+                const vkrpc::IndirectBufferState buffer = vkrpc::indirect_buffer_state(
+                    buffers_, c.src_buffer, device, vkrpc::kBufferUsageIndirectBuffer);
+                const char* why = "";
+                if (!vkrpc::dispatch_indirect_ok(buffer, off, &why)) {
                     resp.ok = false;
-                    resp.reason = "dispatch_indirect offset misaligned or out of range";
+                    resp.reason = why;
                     return resp;
                 }
-                r.src_buffer = ibf->second.vk;
+                const auto* indirect_buffer =
+                    vkrpc::live_device_buffer(buffers_, c.src_buffer, device);
+                r.src_buffer = indirect_buffer->vk;
                 referenced_draw_objects.insert(c.src_buffer);
             }
             resolved.push_back(r);
@@ -8207,7 +8201,7 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
         }
         for (const Resolved& r : resolved) {
             // one lookup, then integer dispatch (same as validate above).
-            const vkrpc::CmdKind rk = vkrpc::cmd_kind_from_string(r.cmd->kind);
+            const vkrpc::CmdKind rk = vkrpc::recorded_command_kind(*r.cmd);
             if (rk == vkrpc::CmdKind::BindVertexBuffers) {
                 vkCmdBindVertexBuffers(cmd_vk, static_cast<std::uint32_t>(r.cmd->first_binding),
                                        static_cast<std::uint32_t>(r.vbufs.size()), r.vbufs.data(),
@@ -8435,14 +8429,14 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                                  static_cast<std::int32_t>(a[3]), static_cast<std::uint32_t>(a[4]));
             } else if (rk == vkrpc::CmdKind::DrawIndirect) {
                 vkCmdDrawIndirect(cmd_vk, r.src_buffer,
-                                  static_cast<VkDeviceSize>(r.cmd->args_u64[0]),
-                                  static_cast<std::uint32_t>(r.cmd->args_i64[0]),
-                                  static_cast<std::uint32_t>(r.cmd->args_i64[1]));
+                                  static_cast<VkDeviceSize>(r.indirect_draw.offset),
+                                  static_cast<std::uint32_t>(r.indirect_draw.draw_count),
+                                  static_cast<std::uint32_t>(r.indirect_draw.stride));
             } else if (rk == vkrpc::CmdKind::DrawIndexedIndirect) {
                 vkCmdDrawIndexedIndirect(cmd_vk, r.src_buffer,
-                                         static_cast<VkDeviceSize>(r.cmd->args_u64[0]),
-                                         static_cast<std::uint32_t>(r.cmd->args_i64[0]),
-                                         static_cast<std::uint32_t>(r.cmd->args_i64[1]));
+                                         static_cast<VkDeviceSize>(r.indirect_draw.offset),
+                                         static_cast<std::uint32_t>(r.indirect_draw.draw_count),
+                                         static_cast<std::uint32_t>(r.indirect_draw.stride));
             } else if (rk == vkrpc::CmdKind::ClearAttachments) {
                 // Rebuild the attachment/rect arrays; the 4 raw words restore the
                 // VkClearValue union bit-faithfully (color OR depth+stencil).
@@ -8821,7 +8815,7 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
         // offending command, so dump the recorded command-kind stream to localize it.
         std::string kinds;
         for (const auto& dc : req.commands) {
-            kinds += dc.kind;
+            kinds += vkrpc::recorded_command_kind_name(dc);
             kinds += " ";
         }
         std::fprintf(stderr, "vkrelay2-worker: record FAILED (%s) -- stream: %s\n", rec_err.c_str(),

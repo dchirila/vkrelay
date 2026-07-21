@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace vkr;
@@ -2794,133 +2795,206 @@ void test_draw_surface_wire() {
     VKR_CHECK(rec2.commands[2].vp_w > 1279.0 && rec2.commands[2].vp_w < 1281.0);
 }
 
+struct MockDrawFixture {
+    vkrpc::MockVulkanBackend& backend;
+    int extent = 0;
+    int format = 44;
+    vkrpc::CreateInstanceResponse ci;
+    vkrpc::EnumeratePhysicalDevicesResponse devices;
+    std::uint64_t physical_device = 0;
+    vkrpc::CreateDeviceResponse device;
+    vkrpc::GetDeviceQueueResponse queue;
+    vkrpc::CreateCommandPoolResponse command_pool;
+    std::uint64_t command_buffer = 0;
+    vkrpc::CreateSurfaceResponse surface;
+    vkrpc::CreateSwapchainResponse swapchain;
+    vkrpc::GetSwapchainImagesResponse images;
+    vkrpc::CreateImageViewResponse image_view;
+    vkrpc::CreateRenderPassResponse render_pass;
+    vkrpc::CreateFramebufferResponse framebuffer;
+    vkrpc::CreateShaderModuleResponse vertex_shader;
+    vkrpc::CreateShaderModuleResponse fragment_shader;
+    vkrpc::CreatePipelineLayoutResponse pipeline_layout;
+    vkrpc::CreateGraphicsPipelinesResponse pipeline;
+
+    MockDrawFixture(vkrpc::MockVulkanBackend& backend_in, int extent_in,
+                    std::uint64_t feature_bits = 0, std::vector<std::string> extensions = {})
+        : backend(backend_in), extent(extent_in) {
+        ci = backend.create_instance({});
+        vkrpc::EnumeratePhysicalDevicesRequest enumerate;
+        enumerate.instance = ci.instance;
+        devices = backend.enumerate_physical_devices(enumerate);
+        VKR_CHECK(ci.ok);
+        VKR_CHECK(devices.ok);
+        VKR_CHECK(!devices.devices.empty());
+        physical_device = devices.devices.front().handle;
+
+        vkrpc::CreateDeviceRequest create_device;
+        create_device.instance = ci.instance;
+        create_device.physical_device = physical_device;
+        create_device.enabled_extensions = std::move(extensions);
+        create_device.enabled_feature_bits = feature_bits;
+        device = backend.create_device(create_device);
+        VKR_CHECK(device.ok);
+
+        vkrpc::GetDeviceQueueRequest get_queue;
+        get_queue.device = device.device;
+        get_queue.queue_family_index = device.queue_family_index;
+        queue = backend.get_device_queue(get_queue);
+        VKR_CHECK(queue.ok);
+
+        vkrpc::CreateCommandPoolRequest create_pool;
+        create_pool.device = device.device;
+        create_pool.queue_family_index = device.queue_family_index;
+        command_pool = backend.create_command_pool(create_pool);
+        vkrpc::AllocateCommandBuffersRequest allocate;
+        allocate.command_pool = command_pool.command_pool;
+        allocate.count = 1;
+        const auto command_buffers = backend.allocate_command_buffers(allocate);
+        VKR_CHECK(command_pool.ok);
+        VKR_CHECK(command_buffers.ok);
+        VKR_CHECK_EQ(command_buffers.command_buffers.size(), static_cast<std::size_t>(1));
+        command_buffer = command_buffers.command_buffers.front();
+
+        vkrpc::CreateSurfaceRequest create_surface;
+        create_surface.instance = ci.instance;
+        surface = backend.create_surface(create_surface);
+        vkrpc::CreateSwapchainRequest create_swapchain;
+        create_swapchain.device = device.device;
+        create_swapchain.surface = surface.surface;
+        create_swapchain.image_format = format;
+        create_swapchain.color_space = 0;
+        create_swapchain.present_mode = 2;
+        create_swapchain.width = extent;
+        create_swapchain.height = extent;
+        create_swapchain.min_image_count = 2;
+        create_swapchain.image_usage = vkrpc::kImageUsageColorAttachment;
+        swapchain = backend.create_swapchain(create_swapchain);
+        vkrpc::GetSwapchainImagesRequest get_images;
+        get_images.swapchain = swapchain.swapchain;
+        images = backend.get_swapchain_images(get_images);
+        VKR_CHECK(surface.ok);
+        VKR_CHECK(swapchain.ok);
+        VKR_CHECK(images.ok);
+        VKR_CHECK(images.images.size() >= 2);
+
+        image_view = backend.create_image_view(make_image_view(images.images.front(), format));
+        render_pass = backend.create_render_pass(make_render_pass());
+        framebuffer = backend.create_framebuffer(
+            make_framebuffer(render_pass.render_pass, image_view.image_view));
+        vertex_shader = backend.create_shader_module(make_shader_module(8));
+        fragment_shader = backend.create_shader_module(make_shader_module(8));
+        vkrpc::CreatePipelineLayoutRequest create_layout;
+        create_layout.device = device.device;
+        create_layout.set_layout_count = 0;
+        create_layout.push_constant_range_count = 0;
+        pipeline_layout = backend.create_pipeline_layout(create_layout);
+        pipeline = backend.create_graphics_pipelines(make_pipeline());
+        VKR_CHECK(image_view.ok);
+        VKR_CHECK(render_pass.ok);
+        VKR_CHECK(framebuffer.ok);
+        VKR_CHECK(vertex_shader.ok);
+        VKR_CHECK(fragment_shader.ok);
+        VKR_CHECK(pipeline_layout.ok);
+        VKR_CHECK(pipeline.ok);
+    }
+
+    vkrpc::CreateImageViewRequest make_image_view(std::uint64_t image, int image_format) const {
+        vkrpc::CreateImageViewRequest request;
+        request.image = image;
+        request.view_type = 1;
+        request.format = image_format;
+        request.aspect = 1;
+        request.level_count = 1;
+        request.layer_count = 1;
+        return request;
+    }
+
+    vkrpc::CreateShaderModuleRequest make_shader_module(std::size_t bytes) const {
+        vkrpc::CreateShaderModuleRequest request;
+        request.device = device.device;
+        request.code.assign(bytes, '\0');
+        request.code_size = bytes;
+        return request;
+    }
+
+    vkrpc::CreateRenderPassRequest make_render_pass() const {
+        vkrpc::CreateRenderPassRequest request;
+        request.device = device.device;
+        vkrpc::AttachmentDesc attachment;
+        attachment.format = format;
+        attachment.samples = 1;
+        attachment.load_op = 1;
+        attachment.store_op = 0;
+        attachment.stencil_load_op = 2;
+        attachment.stencil_store_op = 1;
+        attachment.initial_layout = 0;
+        attachment.final_layout = 1000001002;
+        request.attachments = {attachment};
+        request.color_attachment = 0;
+        request.color_layout = 2;
+        return request;
+    }
+
+    vkrpc::CreateFramebufferRequest make_framebuffer(std::uint64_t pass, std::uint64_t view) const {
+        vkrpc::CreateFramebufferRequest request;
+        request.device = device.device;
+        request.render_pass = pass;
+        request.image_view = view;
+        request.width = extent;
+        request.height = extent;
+        request.layers = 1;
+        return request;
+    }
+
+    vkrpc::CreateGraphicsPipelinesRequest make_pipeline() const {
+        vkrpc::CreateGraphicsPipelinesRequest request;
+        request.device = device.device;
+        vkrpc::ShaderStageDesc vertex;
+        vertex.stage = 1;
+        vertex.module = vertex_shader.shader_module;
+        vertex.entry = "main";
+        vkrpc::ShaderStageDesc fragment;
+        fragment.stage = 16;
+        fragment.module = fragment_shader.shader_module;
+        fragment.entry = "main";
+        request.stages = {vertex, fragment};
+        request.topology = 3;
+        request.vertex_binding_count = 0;
+        request.vertex_attribute_count = 0;
+        request.cull_mode = 2;
+        request.front_face = 1;
+        request.dynamic_states = {0, 1};
+        request.layout = pipeline_layout.pipeline_layout;
+        request.render_pass = render_pass.render_pass;
+        request.subpass = 0;
+        return request;
+    }
+};
+
 // Core indirect draws need full draw readiness in addition to their buffer/stride/range rules.
 // Build the smallest real mock object graph twice so both feature states are exercised at the
 // backend boundary (the pure ICD/shared predicate has its own exhaustive pins).
 void test_core_indirect_draw_mock_case(bool multi_draw_indirect) {
     const std::vector<protocol::GpuDevice> devices = protocol::probe_mocked();
     vkrpc::MockVulkanBackend backend(devices.front().name);
-
-    const auto ci = backend.create_instance({});
-    vkrpc::EnumeratePhysicalDevicesRequest er;
-    er.instance = ci.instance;
-    const auto en = backend.enumerate_physical_devices(er);
-    VKR_CHECK(ci.ok && en.ok && !en.devices.empty());
-    const std::uint64_t phys = en.devices.front().handle;
-    vkrpc::CreateDeviceRequest cdr;
-    cdr.instance = ci.instance;
-    cdr.physical_device = phys;
-    if (multi_draw_indirect) {
-        cdr.enabled_feature_bits = vkrpc::kFeatureMultiDrawIndirect;
-    }
-    const auto cd = backend.create_device(cdr);
-    VKR_CHECK(cd.ok);
-    vkrpc::GetDeviceQueueRequest gqr;
-    gqr.device = cd.device;
-    gqr.queue_family_index = cd.queue_family_index;
-    const auto queue = backend.get_device_queue(gqr);
-    VKR_CHECK(queue.ok);
-
-    vkrpc::CreateSurfaceRequest sr;
-    sr.instance = ci.instance;
-    const auto surface = backend.create_surface(sr);
-    vkrpc::CreateSwapchainRequest scr;
-    scr.device = cd.device;
-    scr.surface = surface.surface;
-    scr.image_format = 44;
-    scr.color_space = 0;
-    scr.present_mode = 2;
-    scr.width = 64;
-    scr.height = 64;
-    scr.min_image_count = 2;
-    scr.image_usage = vkrpc::kImageUsageColorAttachment;
-    const auto swapchain = backend.create_swapchain(scr);
-    VKR_CHECK(surface.ok && swapchain.ok);
-    vkrpc::GetSwapchainImagesRequest gir;
-    gir.swapchain = swapchain.swapchain;
-    const auto images = backend.get_swapchain_images(gir);
-    VKR_CHECK(images.ok && !images.images.empty());
-    vkrpc::CreateImageViewRequest ivr;
-    ivr.image = images.images.front();
-    ivr.view_type = 1;
-    ivr.format = 44;
-    ivr.aspect = 1;
-    ivr.level_count = 1;
-    ivr.layer_count = 1;
-    const auto view = backend.create_image_view(ivr);
-    VKR_CHECK(view.ok);
-
-    vkrpc::CreateRenderPassRequest rpr;
-    rpr.device = cd.device;
-    vkrpc::AttachmentDesc attachment;
-    attachment.format = 44;
-    attachment.samples = 1;
-    attachment.load_op = 1;
-    attachment.store_op = 0;
-    attachment.stencil_load_op = 2;
-    attachment.stencil_store_op = 1;
-    attachment.initial_layout = 0;
-    attachment.final_layout = 1000001002;
-    rpr.attachments = {attachment};
-    rpr.color_attachment = 0;
-    rpr.color_layout = 2;
-    const auto render_pass = backend.create_render_pass(rpr);
-    VKR_CHECK(render_pass.ok);
-    vkrpc::CreateFramebufferRequest fbr;
-    fbr.device = cd.device;
-    fbr.render_pass = render_pass.render_pass;
-    fbr.image_view = view.image_view;
-    fbr.width = 64;
-    fbr.height = 64;
-    fbr.layers = 1;
-    const auto framebuffer = backend.create_framebuffer(fbr);
-    VKR_CHECK(framebuffer.ok);
-
-    vkrpc::CreateShaderModuleRequest smr;
-    smr.device = cd.device;
-    smr.code.assign(8, '\0');
-    smr.code_size = 8;
-    const auto vs = backend.create_shader_module(smr);
-    const auto fs = backend.create_shader_module(smr);
-    VKR_CHECK(vs.ok && fs.ok);
-    vkrpc::CreatePipelineLayoutRequest plr;
-    plr.device = cd.device;
-    plr.set_layout_count = 0;
-    plr.push_constant_range_count = 0;
-    const auto layout = backend.create_pipeline_layout(plr);
-    VKR_CHECK(layout.ok);
-    vkrpc::CreateGraphicsPipelinesRequest gpr;
-    gpr.device = cd.device;
-    vkrpc::ShaderStageDesc vstage;
-    vstage.stage = 1;
-    vstage.module = vs.shader_module;
-    vstage.entry = "main";
-    vkrpc::ShaderStageDesc fstage;
-    fstage.stage = 16;
-    fstage.module = fs.shader_module;
-    fstage.entry = "main";
-    gpr.stages = {vstage, fstage};
-    gpr.topology = 3;
-    gpr.vertex_binding_count = 0;
-    gpr.vertex_attribute_count = 0;
-    gpr.cull_mode = 0;
-    gpr.front_face = 1;
-    gpr.dynamic_states = {0, 1};
-    gpr.layout = layout.pipeline_layout;
-    gpr.render_pass = render_pass.render_pass;
-    gpr.subpass = 0;
-    const auto pipeline = backend.create_graphics_pipelines(gpr);
-    VKR_CHECK(pipeline.ok);
-    vkrpc::CreateCommandPoolRequest cpr;
-    cpr.device = cd.device;
-    cpr.queue_family_index = cd.queue_family_index;
-    const auto pool = backend.create_command_pool(cpr);
-    vkrpc::AllocateCommandBuffersRequest acbr;
-    acbr.command_pool = pool.command_pool;
-    acbr.count = 1;
-    const auto command_buffers = backend.allocate_command_buffers(acbr);
-    VKR_CHECK(pool.ok && command_buffers.ok && command_buffers.command_buffers.size() == 1);
-    const std::uint64_t command_buffer = command_buffers.command_buffers.front();
+    const std::uint64_t feature_bits = multi_draw_indirect ? vkrpc::kFeatureMultiDrawIndirect : 0;
+    MockDrawFixture fixture(backend, 64, feature_bits);
+    const auto& ci = fixture.ci;
+    const std::uint64_t phys = fixture.physical_device;
+    const auto& cd = fixture.device;
+    const auto& queue = fixture.queue;
+    const auto& surface = fixture.surface;
+    const auto& swapchain = fixture.swapchain;
+    const auto& view = fixture.image_view;
+    const auto& render_pass = fixture.render_pass;
+    const auto& framebuffer = fixture.framebuffer;
+    const auto& vs = fixture.vertex_shader;
+    const auto& fs = fixture.fragment_shader;
+    const auto& layout = fixture.pipeline_layout;
+    const auto& pipeline = fixture.pipeline;
+    const auto& pool = fixture.command_pool;
+    const std::uint64_t command_buffer = fixture.command_buffer;
 
     vkrpc::GetPhysicalDeviceMemoryPropertiesRequest mpr;
     mpr.physical_device = phys;
@@ -2973,8 +3047,9 @@ void test_core_indirect_draw_mock_case(bool multi_draw_indirect) {
         vkrpc::RecordedCommand c;
         c.kind = indexed ? "draw_indexed_indirect" : "draw_indirect";
         c.src_buffer = buffer;
-        c.args_u64 = {offset};
-        c.args_i64 = {count, stride};
+        c.indirect_offset = offset;
+        c.indirect_draw_count = count;
+        c.indirect_stride = stride;
         return c;
     };
     auto record = [&](vkrpc::RecordedCommand draw, bool bind_index) {
@@ -3015,6 +3090,14 @@ void test_core_indirect_draw_mock_case(bool multi_draw_indirect) {
 
     VKR_CHECK(record(indirect_command(false, indirect.buffer, 0, 1, 16), false).ok);
     VKR_CHECK(record(indirect_command(true, indirect.buffer, 0, 1, 20), true).ok);
+    vkrpc::RecordedCommand legacy = indirect_command(false, indirect.buffer, 0, 1, 16);
+    legacy.indirect_draw_count = -1;
+    legacy.indirect_stride = -1;
+    legacy.args_u64 = {0};
+    legacy.args_i64 = {1, 16};
+    VKR_CHECK(record(legacy, false).ok);
+    legacy.indirect_draw_count = 1; // mixed old/new spelling fails closed
+    VKR_CHECK(!record(legacy, false).ok);
     VKR_CHECK(!record(indirect_command(true, indirect.buffer, 0, 1, 20), false).ok);
     VKR_CHECK(!record(indirect_command(false, wrong_usage.buffer, 0, 1, 16), false).ok);
     VKR_CHECK(!record(indirect_command(false, unbound.buffer, 0, 1, 16), false).ok);
@@ -3083,87 +3166,37 @@ void test_core_indirect_draw_mock() {
 void test_draw_surface_mock() {
     const std::vector<protocol::GpuDevice> devices = protocol::probe_mocked();
     vkrpc::MockVulkanBackend backend(devices.front().name);
-
-    const vkrpc::CreateInstanceResponse ci = backend.create_instance({});
-    vkrpc::EnumeratePhysicalDevicesRequest er;
-    er.instance = ci.instance;
-    const vkrpc::EnumeratePhysicalDevicesResponse en = backend.enumerate_physical_devices(er);
-    vkrpc::CreateDeviceRequest cdr;
-    cdr.instance = ci.instance;
-    cdr.physical_device = en.devices.front().handle;
     // (GL/zink): this device enables the wired extension commands (transform feedback +
     // conditional rendering) so the block below exercises accept paths; the bare second
     // device there exercises the not-enabled rejections.
-    cdr.enabled_extensions = {"VK_EXT_transform_feedback", "VK_EXT_conditional_rendering"};
-    const vkrpc::CreateDeviceResponse cd = backend.create_device(cdr);
-    vkrpc::GetDeviceQueueRequest gq;
-    gq.device = cd.device;
-    gq.queue_family_index = cd.queue_family_index;
-    gq.queue_index = 0;
-    const vkrpc::GetDeviceQueueResponse q = backend.get_device_queue(gq);
-    vkrpc::CreateCommandPoolRequest cpr;
-    cpr.device = cd.device;
-    cpr.queue_family_index = cd.queue_family_index;
-    const vkrpc::CreateCommandPoolResponse cp = backend.create_command_pool(cpr);
-    vkrpc::AllocateCommandBuffersRequest acb;
-    acb.command_pool = cp.command_pool;
-    acb.count = 1;
-    const vkrpc::AllocateCommandBuffersResponse cbs = backend.allocate_command_buffers(acb);
-    const std::uint64_t cmd = cbs.command_buffers.front();
-    vkrpc::CreateSurfaceRequest sr;
-    sr.instance = ci.instance;
-    const vkrpc::CreateSurfaceResponse surf = backend.create_surface(sr);
-    const int kFormat = 44;
-    vkrpc::CreateSwapchainRequest scr;
-    scr.device = cd.device;
-    scr.surface = surf.surface;
-    scr.image_format = kFormat;
-    scr.color_space = 0;
-    scr.present_mode = 2;
-    scr.width = 256;
-    scr.height = 256;
-    scr.min_image_count = 2;
-    scr.image_usage = vkrpc::kImageUsageColorAttachment;
-    const vkrpc::CreateSwapchainResponse sc = backend.create_swapchain(scr);
-    VKR_CHECK(sc.ok);
-    vkrpc::GetSwapchainImagesRequest gir;
-    gir.swapchain = sc.swapchain;
-    const vkrpc::GetSwapchainImagesResponse imgs = backend.get_swapchain_images(gir);
-    VKR_CHECK(imgs.ok && imgs.images.size() >= 2);
+    MockDrawFixture fixture(backend, 256, 0,
+                            {"VK_EXT_transform_feedback", "VK_EXT_conditional_rendering"});
+    const auto& ci = fixture.ci;
+    const auto& en = fixture.devices;
+    const auto& cd = fixture.device;
+    const auto& q = fixture.queue;
+    const auto& cp = fixture.command_pool;
+    const std::uint64_t cmd = fixture.command_buffer;
+    const auto& surf = fixture.surface;
+    const int kFormat = fixture.format;
+    const auto& sc = fixture.swapchain;
+    const auto& imgs = fixture.images;
     const std::uint64_t img0 = imgs.images.front();
 
     // Image view (2D / matching format / identity / COLOR / single mip+layer) + rejections.
     auto make_iv = [&](std::uint64_t image, int format) {
-        vkrpc::CreateImageViewRequest r;
-        r.image = image;
-        r.view_type = 1;
-        r.format = format;
-        r.swizzle_r = r.swizzle_g = r.swizzle_b = r.swizzle_a = 0;
-        r.aspect = 1;
-        r.base_mip_level = 0;
-        r.level_count = 1;
-        r.base_array_layer = 0;
-        r.layer_count = 1;
-        return r;
+        return fixture.make_image_view(image, format);
     };
-    const vkrpc::CreateImageViewResponse iv = backend.create_image_view(make_iv(img0, kFormat));
-    VKR_CHECK(iv.ok && iv.image_view != 0);
+    const auto& iv = fixture.image_view;
     // (GL/zink): a mismatched format / non-2D viewType / non-identity swizzle are now
     // ACCEPTED (faithfully forwarded; the host driver gates them). An unknown image handle is still
     // rejected.
     VKR_CHECK(!backend.create_image_view(make_iv(0xDEAD, kFormat)).ok); // unknown image
 
     // Shader modules (vert + frag) + rejections.
-    auto make_sm = [&](std::size_t bytes) {
-        vkrpc::CreateShaderModuleRequest r;
-        r.device = cd.device;
-        r.code = std::string(bytes, '\0');
-        r.code_size = bytes;
-        return r;
-    };
-    const vkrpc::CreateShaderModuleResponse vs = backend.create_shader_module(make_sm(8));
-    const vkrpc::CreateShaderModuleResponse fs = backend.create_shader_module(make_sm(8));
-    VKR_CHECK(vs.ok && fs.ok);
+    auto make_sm = [&](std::size_t bytes) { return fixture.make_shader_module(bytes); };
+    const auto& vs = fixture.vertex_shader;
+    const auto& fs = fixture.fragment_shader;
     VKR_CHECK(!backend.create_shader_module(make_sm(7)).ok); // not a multiple of 4
     {
         vkrpc::CreateShaderModuleRequest r;
@@ -3174,25 +3207,8 @@ void test_draw_surface_mock() {
     }
 
     // Render pass (1 color attachment, UNDEFINED -> PRESENT_SRC_KHR) + rejections.
-    auto make_rp = [&]() {
-        vkrpc::CreateRenderPassRequest r;
-        r.device = cd.device;
-        vkrpc::AttachmentDesc a;
-        a.format = kFormat;
-        a.samples = 1;
-        a.load_op = 1;  // CLEAR
-        a.store_op = 0; // STORE
-        a.stencil_load_op = 2;
-        a.stencil_store_op = 1;
-        a.initial_layout = 0;        // UNDEFINED
-        a.final_layout = 1000001002; // PRESENT_SRC_KHR
-        r.attachments.push_back(a);
-        r.color_attachment = 0;
-        r.color_layout = 2; // COLOR_ATTACHMENT_OPTIMAL
-        return r;
-    };
-    const vkrpc::CreateRenderPassResponse rp = backend.create_render_pass(make_rp());
-    VKR_CHECK(rp.ok && rp.render_pass != 0);
+    auto make_rp = [&]() { return fixture.make_render_pass(); };
+    const auto& rp = fixture.render_pass;
     {
         auto r = make_rp();
         r.attachments.push_back(r.attachments[0]); // 2 attachments
@@ -3206,18 +3222,9 @@ void test_draw_surface_mock() {
 
     // Framebuffer + rejection (layers != 1).
     auto make_fb = [&](std::uint64_t renderpass, std::uint64_t view) {
-        vkrpc::CreateFramebufferRequest r;
-        r.device = cd.device;
-        r.render_pass = renderpass;
-        r.image_view = view;
-        r.width = 256;
-        r.height = 256;
-        r.layers = 1;
-        return r;
+        return fixture.make_framebuffer(renderpass, view);
     };
-    const vkrpc::CreateFramebufferResponse fb =
-        backend.create_framebuffer(make_fb(rp.render_pass, iv.image_view));
-    VKR_CHECK(fb.ok && fb.framebuffer != 0);
+    const auto& fb = fixture.framebuffer;
     auto imageless_req = make_fb(rp.render_pass, 0);
     imageless_req.imageless = true;
     imageless_req.attachment_count = 1;
@@ -3256,8 +3263,7 @@ void test_draw_surface_mock() {
     plr.device = cd.device;
     plr.set_layout_count = 0;
     plr.push_constant_range_count = 0;
-    const vkrpc::CreatePipelineLayoutResponse pl = backend.create_pipeline_layout(plr);
-    VKR_CHECK(pl.ok && pl.pipeline_layout != 0);
+    const auto& pl = fixture.pipeline_layout;
     {
         auto r = plr;
         r.set_layout_count = 1;
@@ -3265,32 +3271,8 @@ void test_draw_surface_mock() {
     }
 
     // Graphics pipeline (bufferless) + rejections.
-    auto make_gp = [&]() {
-        vkrpc::CreateGraphicsPipelinesRequest r;
-        r.device = cd.device;
-        r.pipeline_cache = 0;
-        vkrpc::ShaderStageDesc s0;
-        s0.stage = 1; // VERTEX
-        s0.module = vs.shader_module;
-        s0.entry = "main";
-        vkrpc::ShaderStageDesc s1;
-        s1.stage = 16; // FRAGMENT
-        s1.module = fs.shader_module;
-        s1.entry = "main";
-        r.stages = {s0, s1};
-        r.topology = 3; // TRIANGLE_LIST
-        r.vertex_binding_count = 0;
-        r.vertex_attribute_count = 0;
-        r.cull_mode = 2;
-        r.front_face = 1;
-        r.dynamic_states = {0, 1}; // VIEWPORT, SCISSOR
-        r.layout = pl.pipeline_layout;
-        r.render_pass = rp.render_pass;
-        r.subpass = 0;
-        return r;
-    };
-    const vkrpc::CreateGraphicsPipelinesResponse gp = backend.create_graphics_pipelines(make_gp());
-    VKR_CHECK(gp.ok && gp.pipeline != 0);
+    auto make_gp = [&]() { return fixture.make_pipeline(); };
+    const auto& gp = fixture.pipeline;
     {
         // Every ACCEPTED pipeline in this block is destroyed at the end so the teardown's
         // destroy_device (no-live-children) assertions stay exact.
@@ -5754,6 +5736,16 @@ void test_image_depth_wire() {
     VKR_CHECK_EQ(static_cast<int>(vkrpc::DeviceCaps::from_body(caps.to_body()).core_indirect_draw),
                  1);
     VKR_CHECK_EQ(static_cast<int>(vkrpc::DeviceCaps::from_body(stripped).core_indirect_draw), 0);
+    // The scalar payload spelling is negotiated separately: a milestone-A worker advertises the
+    // command vocabulary above but lacks this key, so a new ICD must use the positional spelling.
+    caps.core_indirect_draw_scalar_payload = 1;
+    VKR_CHECK_EQ(
+        static_cast<int>(
+            vkrpc::DeviceCaps::from_body(caps.to_body()).core_indirect_draw_scalar_payload),
+        1);
+    VKR_CHECK_EQ(
+        static_cast<int>(vkrpc::DeviceCaps::from_body(stripped).core_indirect_draw_scalar_payload),
+        0);
 
     // Pipeline carries depth-stencil state.
     vkrpc::CreateGraphicsPipelinesRequest gp;
@@ -9354,13 +9346,15 @@ void test_record_raw_wire() {
     vkrpc::RecordedCommand indirect;
     indirect.kind = "draw_indirect";
     indirect.src_buffer = 0x909;
-    indirect.args_u64 = {12};
-    indirect.args_i64 = {2, 16};
+    indirect.indirect_offset = 12;
+    indirect.indirect_draw_count = 2;
+    indirect.indirect_stride = 16;
     vkrpc::RecordedCommand indexed_indirect = indirect;
     indexed_indirect.kind = "draw_indexed_indirect";
     indexed_indirect.src_buffer = 0xA0A;
-    indexed_indirect.args_u64 = {20};
-    indexed_indirect.args_i64 = {3, 20};
+    indexed_indirect.indirect_offset = 20;
+    indexed_indirect.indirect_draw_count = 3;
+    indexed_indirect.indirect_stride = 20;
     req.commands = {c, d, indirect, indexed_indirect};
 
     const std::string wire = req.to_wire();
@@ -9374,12 +9368,40 @@ void test_record_raw_wire() {
     VKR_CHECK(via_json.to_body().dump(0) == back.to_body().dump(0));
     VKR_CHECK(back.commands[0].args_blob == c.args_blob); // bytes, not hex, still exact
     VKR_CHECK_EQ(back.commands[2].src_buffer, 0x909ull);
-    VKR_CHECK_EQ(back.commands[2].args_u64[0], 12ull);
-    VKR_CHECK_EQ(back.commands[2].args_i64[0], 2ll);
+    VKR_CHECK_EQ(back.commands[2].indirect_offset, 12ull);
+    VKR_CHECK_EQ(back.commands[2].indirect_draw_count, 2ll);
+    VKR_CHECK_EQ(back.commands[2].indirect_stride, 16ll);
     VKR_CHECK_EQ(back.commands[3].src_buffer, 0xA0Aull);
     VKR_CHECK(vkrpc::cmd_kind_from_string(back.commands[2].kind) == vkrpc::CmdKind::DrawIndirect);
     VKR_CHECK(vkrpc::cmd_kind_from_string(back.commands[3].kind) ==
               vkrpc::CmdKind::DrawIndexedIndirect);
+    // New-to-new: the ICD hot-path spelling owns no kind string or payload vectors; the codec
+    // emits the canonical kind and the worker decodes an ordinary command.
+    vkrpc::RecordCommandBufferRequest hot_path;
+    vkrpc::RecordedCommand hot_indexed =
+        vkrpc::make_core_indirect_draw_command(0xA1A, 4, 1, 20, true, true);
+    hot_path.commands = {hot_indexed};
+    const auto hot_back = vkrpc::RecordCommandBufferRequest::from_wire(hot_path.to_wire(), err);
+    VKR_CHECK(err.empty());
+    VKR_CHECK(hot_indexed.kind.empty());
+    VKR_CHECK(hot_indexed.args_u64.empty() && hot_indexed.args_i64.empty());
+    VKR_CHECK_EQ(hot_back.commands[0].kind, std::string("draw_indexed_indirect"));
+    VKR_CHECK_EQ(hot_back.commands[0].indirect_offset, 4ull);
+    // New ICD -> milestone-A worker: the absent scalar-payload capability selects exactly the old
+    // positional spelling, while a new worker continues to accept it in the opposite skew.
+    vkrpc::RecordedCommand legacy_indirect =
+        vkrpc::make_core_indirect_draw_command(0xB0B, 28, 1, 16, false, false);
+    VKR_CHECK_EQ(legacy_indirect.kind, std::string("draw_indirect"));
+    VKR_CHECK_EQ(legacy_indirect.src_buffer, 0xB0Bull);
+    VKR_CHECK(legacy_indirect.indirect_draw_count == -1 && legacy_indirect.indirect_stride == -1);
+    VKR_CHECK(legacy_indirect.args_u64 == std::vector<std::uint64_t>{28});
+    VKR_CHECK(legacy_indirect.args_i64 == std::vector<long long>({1, 16}));
+    vkrpc::CoreIndirectDrawArgs legacy_args;
+    const char* legacy_reason = "";
+    VKR_CHECK(vkrpc::core_indirect_draw_args(legacy_indirect, legacy_args, &legacy_reason));
+    VKR_CHECK_EQ(legacy_args.offset, 28ull);
+    VKR_CHECK_EQ(legacy_args.draw_count, 1ll);
+    VKR_CHECK_EQ(legacy_args.stride, 16ll);
     // i64 exactness: the wire is BIT-exact where JSON's number path would round (> 2^53).
     vkrpc::RecordCommandBufferRequest big;
     vkrpc::RecordedCommand bc;

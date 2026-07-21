@@ -97,9 +97,9 @@ class DecodedOpTrace {
             hash_dependency_handles(deps_handles, c.deps2);
             const std::string named = named_handles(c);
             out_ << "{\"event\":\"command\",\"seq\":" << seq_++ << ",\"recording\":" << recording
-                 << ",\"index\":" << i << ",\"kind\":\"" << c.kind << "\",\"scalar_hash\":\""
-                 << hex(scalars.value) << "\",\"u64_raw_hash\":\"" << hex(u64_raw.value)
-                 << "\",\"u64_ordinal_hash\":\"" << hex(u64_ordinal.value)
+                 << ",\"index\":" << i << ",\"kind\":\"" << recorded_command_kind_name(c)
+                 << "\",\"scalar_hash\":\"" << hex(scalars.value) << "\",\"u64_raw_hash\":\""
+                 << hex(u64_raw.value) << "\",\"u64_ordinal_hash\":\"" << hex(u64_ordinal.value)
                  << "\",\"blob_bytes\":" << c.args_blob.size() << ",\"blob_hash\":\""
                  << hex(hash_bytes(c.args_blob.data(), c.args_blob.size()))
                  << "\",\"deps_raw_hash\":\"" << hex(deps_raw.value)
@@ -550,6 +550,9 @@ class DecodedOpTrace {
         h.add(c.copy_width);
         h.add(c.copy_height);
         h.add(c.copy_depth);
+        h.add(c.indirect_offset);
+        h.add(c.indirect_draw_count);
+        h.add(c.indirect_stride);
         h.add(c.barrier_base_mip);
         h.add(c.barrier_level_count);
         h.add(c.barrier_base_layer);
@@ -838,7 +841,7 @@ void wire_put_f64(std::string& out, double v) {
     std::memcpy(&bits, &v, 8);
     wire_put_u64(out, bits);
 }
-void wire_put_str(std::string& out, const std::string& s) {
+void wire_put_str(std::string& out, std::string_view s) {
     wire_put_u64(out, s.size());
     out += s;
 }
@@ -1396,6 +1399,8 @@ json::Value DeviceCaps::to_body() const {
     b.set("rasterization_stream_state",
           json::Value(static_cast<long long>(rasterization_stream_state)));
     b.set("core_indirect_draw", json::Value(static_cast<long long>(core_indirect_draw)));
+    b.set("core_indirect_draw_scalar_payload",
+          json::Value(static_cast<long long>(core_indirect_draw_scalar_payload)));
     return b;
 }
 
@@ -1417,6 +1422,8 @@ DeviceCaps DeviceCaps::from_body(const json::Value& body) {
         get_i64(body, "rasterization_stream_state", 0)); // absent -> 0 (old worker)
     d.core_indirect_draw =
         static_cast<std::uint32_t>(get_i64(body, "core_indirect_draw", 0)); // absent -> 0
+    d.core_indirect_draw_scalar_payload = static_cast<std::uint32_t>(
+        get_i64(body, "core_indirect_draw_scalar_payload", 0)); // absent -> 0
     return d;
 }
 
@@ -2179,7 +2186,7 @@ json::Value RecordCommandBufferRequest::to_body() const {
     json::Array arr;
     for (const RecordedCommand& c : commands) {
         json::Value cv = json::Value::make_object();
-        cv.set("kind", json::Value(c.kind));
+        cv.set("kind", json::Value(std::string(recorded_command_kind_name(c))));
         cv.set("image", handle_value(c.image));
         cv.set("old_layout", json::Value(c.old_layout));
         cv.set("new_layout", json::Value(c.new_layout));
@@ -2228,6 +2235,9 @@ json::Value RecordCommandBufferRequest::to_body() const {
         cv.set("descriptor_sets", handle_array(c.descriptor_sets));
         // copy_buffer_to_image + generalized pipeline_barrier.
         cv.set("src_buffer", handle_value(c.src_buffer));
+        cv.set("indirect_offset", handle_value(c.indirect_offset));
+        cv.set("indirect_draw_count", json::Value(c.indirect_draw_count));
+        cv.set("indirect_stride", json::Value(c.indirect_stride));
         cv.set("copy_width", json::Value(c.copy_width));
         cv.set("copy_height", json::Value(c.copy_height));
         cv.set("copy_depth", json::Value(c.copy_depth));
@@ -2384,6 +2394,9 @@ RecordCommandBufferRequest RecordCommandBufferRequest::from_body(const json::Val
             // range wide with -1 = missing (the worker treats it as the whole single subresource --
             // the legacy swapchain-color barrier shape).
             c.src_buffer = get_handle(e, "src_buffer");
+            c.indirect_offset = get_handle(e, "indirect_offset");
+            c.indirect_draw_count = get_i64(e, "indirect_draw_count", -1);
+            c.indirect_stride = get_i64(e, "indirect_stride", -1);
             c.copy_width = get_i64(e, "copy_width", -1);
             c.copy_height = get_i64(e, "copy_height", -1);
             c.copy_depth = get_i64(e, "copy_depth", -1);
@@ -2587,6 +2600,66 @@ CmdKind cmd_kind_from_string(const std::string& kind) {
     return it != kMap.end() ? it->second : CmdKind::Unknown;
 }
 
+CmdKind recorded_command_kind(const RecordedCommand& command) {
+    if (command.kind.empty() &&
+        (command.indirect_draw_count != -1 || command.indirect_stride != -1)) {
+        return command.indirect_indexed ? CmdKind::DrawIndexedIndirect : CmdKind::DrawIndirect;
+    }
+    return cmd_kind_from_string(command.kind);
+}
+
+std::string_view recorded_command_kind_name(const RecordedCommand& command) {
+    if (command.kind.empty() &&
+        (command.indirect_draw_count != -1 || command.indirect_stride != -1)) {
+        return command.indirect_indexed ? "draw_indexed_indirect" : "draw_indirect";
+    }
+    return command.kind;
+}
+
+RecordedCommand make_core_indirect_draw_command(std::uint64_t buffer, std::uint64_t offset,
+                                                std::uint32_t draw_count, std::uint32_t stride,
+                                                bool indexed, bool scalar_payload) {
+    RecordedCommand command;
+    command.src_buffer = buffer;
+    if (scalar_payload) {
+        command.indirect_offset = offset;
+        command.indirect_draw_count = static_cast<long long>(draw_count);
+        command.indirect_stride = static_cast<long long>(stride);
+        command.indirect_indexed = indexed;
+    } else {
+        command.kind = indexed ? "draw_indexed_indirect" : "draw_indirect";
+        command.args_u64.push_back(offset);
+        command.args_i64.push_back(static_cast<long long>(draw_count));
+        command.args_i64.push_back(static_cast<long long>(stride));
+    }
+    return command;
+}
+
+bool core_indirect_draw_args(const RecordedCommand& command, CoreIndirectDrawArgs& args,
+                             const char** reason) {
+    const bool has_scalars = command.indirect_draw_count != -1 || command.indirect_stride != -1;
+    const bool has_legacy = !command.args_u64.empty() || !command.args_i64.empty();
+    if (has_scalars == has_legacy) {
+        *reason = has_scalars ? "core indirect draw mixes scalar and legacy payloads"
+                              : "core indirect draw payload is missing";
+        return false;
+    }
+    if (has_scalars) {
+        args.offset = command.indirect_offset;
+        args.draw_count = command.indirect_draw_count;
+        args.stride = command.indirect_stride;
+        return true;
+    }
+    if (command.args_u64.size() != 1 || command.args_i64.size() != 2) {
+        *reason = "malformed legacy core indirect draw payload";
+        return false;
+    }
+    args.offset = command.args_u64[0];
+    args.draw_count = command.args_i64[0];
+    args.stride = command.args_i64[1];
+    return true;
+}
+
 bool validate_dependency_info2(const DependencyInfo2& d, std::string& reason) {
     if (d.memory.size() > kMaxSync2BarriersPerDep || d.buffer.size() > kMaxSync2BarriersPerDep ||
         d.image.size() > kMaxSync2BarriersPerDep) {
@@ -2661,7 +2734,8 @@ enum : std::uint64_t {
     kRecArgsF64 = 1ull << 13,
     kRecArgsBlob = 1ull << 14,
     kRecDeps2 = 1ull << 15,           // the typed DependencyInfo2 vector
-    kRecKnownMask = (1ull << 16) - 1, // decode rejects any bit beyond the known set (fail-closed)
+    kRecIndirectDraw = 1ull << 16,    // offset, drawCount, stride dedicated scalars
+    kRecKnownMask = (1ull << 17) - 1, // decode rejects any bit beyond the known set (fail-closed)
 };
 } // namespace
 
@@ -2735,7 +2809,10 @@ std::string RecordCommandBufferRequest::to_wire() const {
         if (!c.deps2.empty()) {
             mask |= kRecDeps2;
         }
-        wire_put_str(out, c.kind);
+        if (c.indirect_draw_count != -1 || c.indirect_stride != -1) {
+            mask |= kRecIndirectDraw;
+        }
+        wire_put_str(out, recorded_command_kind_name(c));
         wire_put_u64(out, mask);
         if (mask & kRecBarrierCore) {
             wire_put_u64(out, c.image);
@@ -2832,6 +2909,11 @@ std::string RecordCommandBufferRequest::to_wire() const {
             for (const DependencyInfo2& d : c.deps2) {
                 wire_put_dep2(out, d);
             }
+        }
+        if (mask & kRecIndirectDraw) {
+            wire_put_u64(out, c.indirect_offset);
+            wire_put_i64(out, c.indirect_draw_count);
+            wire_put_i64(out, c.indirect_stride);
         }
     }
     return out;
@@ -2999,6 +3081,11 @@ RecordCommandBufferRequest RecordCommandBufferRequest::from_wire(const std::stri
                     c.deps2.push_back(wire_get_dep2(rd));
                 }
             }
+        }
+        if (mask & kRecIndirectDraw) {
+            c.indirect_offset = rd.get_u64();
+            c.indirect_draw_count = rd.get_i64();
+            c.indirect_stride = rd.get_i64();
         }
         r.commands.push_back(std::move(c));
     }
@@ -5976,6 +6063,7 @@ DeviceCaps MockVulkanBackend::device_caps() const {
     // pNext, so it advertises the capability exactly like the real worker (mock == real).
     caps.rasterization_stream_state = 1;
     caps.core_indirect_draw = 1;
+    caps.core_indirect_draw_scalar_payload = 1;
     return caps;
 }
 
@@ -7847,7 +7935,7 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
     for (const RecordedCommand& c : req.commands) {
         // one lookup, then integer dispatch (the string-compare chain was a measured
         // slice of per-command validate time at ETR volumes). Unknown -> the final else, as ever.
-        const CmdKind k = cmd_kind_from_string(c.kind);
+        const CmdKind k = recorded_command_kind(c);
         if (k == CmdKind::PipelineBarrier || k == CmdKind::ClearColorImage) {
             // Image-targeting commands: the referenced image must resolve and live on
             // the command buffer's device.
@@ -8147,9 +8235,8 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
                 resp.reason = "malformed bind_index_buffer";
                 return resp;
             }
-            const auto ibf = buffers_.find(c.args_u64[0]);
-            if (ibf == buffers_.end() || ibf->second.device != device ||
-                ibf->second.bound_memory == 0) {
+            const auto* index_buffer = live_device_buffer(buffers_, c.args_u64[0], device);
+            if (index_buffer == nullptr || index_buffer->bound_memory == 0) {
                 resp.ok = false;
                 resp.reason = "bind_index_buffer references a buffer not live/bound on the device";
                 return resp;
@@ -8269,19 +8356,17 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
                 }
                 referenced_draw_objects.insert(c.args_u64[0]);
             } else if (k == CmdKind::DrawIndirect || k == CmdKind::DrawIndexedIndirect) {
-                if (c.args_u64.size() != 1 || c.args_i64.size() != 2) {
+                CoreIndirectDrawArgs args;
+                const char* why = "";
+                if (!core_indirect_draw_args(c, args, &why)) {
                     resp.ok = false;
-                    resp.reason = "malformed core indirect draw command";
+                    resp.reason = why;
                     return resp;
                 }
-                const auto ibf = buffers_.find(c.src_buffer);
-                const bool live = ibf != buffers_.end() && ibf->second.device == device;
-                const bool bound = live && ibf->second.bound_memory != 0;
-                const bool usage = live && (ibf->second.usage & kBufferUsageIndirectBuffer) != 0;
-                const char* why = "";
+                const IndirectBufferState buffer = indirect_buffer_state(
+                    buffers_, c.src_buffer, device, kBufferUsageIndirectBuffer);
                 if (!core_indirect_draw_ok(
-                        live, bound, usage, live ? ibf->second.size : 0, c.args_u64[0],
-                        c.args_i64[0], c.args_i64[1],
+                        buffer, args.offset, args.draw_count, args.stride,
                         k == CmdKind::DrawIndexedIndirect ? kDrawIndexedIndirectCommandBytes
                                                           : kDrawIndirectCommandBytes,
                         mdev->second.multi_draw_indirect_feature_enabled, &why)) {
@@ -8357,22 +8442,13 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
                     resp.reason = "malformed dispatch_indirect command";
                     return resp;
                 }
-                const auto ibf = buffers_.find(c.src_buffer);
-                if (ibf == buffers_.end() || ibf->second.device != device ||
-                    ibf->second.bound_memory == 0) {
-                    resp.ok = false;
-                    resp.reason = "dispatch_indirect buffer is not live/bound on the device";
-                    return resp;
-                }
-                if ((ibf->second.usage & kBufferUsageIndirectBuffer) == 0) {
-                    resp.ok = false;
-                    resp.reason = "dispatch_indirect buffer lacks INDIRECT_BUFFER usage";
-                    return resp;
-                }
                 const std::uint64_t off = c.args_u64[0];
-                if (off % 4 != 0 || off + 12 > ibf->second.size || off + 12 < off) {
+                const IndirectBufferState buffer = indirect_buffer_state(
+                    buffers_, c.src_buffer, device, kBufferUsageIndirectBuffer);
+                const char* why = "";
+                if (!dispatch_indirect_ok(buffer, off, &why)) {
                     resp.ok = false;
-                    resp.reason = "dispatch_indirect offset misaligned or out of range";
+                    resp.reason = why;
                     return resp;
                 }
                 referenced_draw_objects.insert(c.src_buffer);

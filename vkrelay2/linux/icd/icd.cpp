@@ -185,6 +185,7 @@ struct DeviceImpl {
     // Core indirect-draw command vocabulary. The worker bit is additive protocol negotiation;
     // multi_draw_indirect_enabled is the base feature state requested at device creation.
     bool worker_core_indirect_draw = false;
+    bool worker_core_indirect_draw_scalar_payload = false;
     bool multi_draw_indirect_enabled = false;
     // descriptorIndexing: the enabled kDIFeature* bits. CreateDevice folds the app's
     // enabled-feature chain into these (served subset only -- an unserved or off-lane enable is
@@ -242,6 +243,7 @@ struct CommandBufferImpl {
     // Additive worker-vocabulary gate + the owning device's enabled base feature, stamped at
     // allocation like vk13_device so void vkCmd* recorders can fail locally without an RPC.
     bool worker_core_indirect_draw = false;
+    bool worker_core_indirect_draw_scalar_payload = false;
     bool multi_draw_indirect_enabled = false;
 };
 
@@ -2804,6 +2806,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
         dev->geometry_streams_feature_enabled = wants_geometry_streams_feature;
         dev->worker_rasterization_stream = pd->caps.rasterization_stream_state != 0;
         dev->worker_core_indirect_draw = pd->caps.core_indirect_draw != 0;
+        dev->worker_core_indirect_draw_scalar_payload =
+            pd->caps.core_indirect_draw_scalar_payload != 0;
         dev->multi_draw_indirect_enabled =
             (enabled_feature_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
         // (bufferDeviceAddress): native lane AND the enabled FEATURE (there is no
@@ -5416,6 +5420,8 @@ VKAPI_ATTR VkResult VKAPI_CALL AllocateCommandBuffers(VkDevice device,
             cb->worker = r.command_buffers[i];
             cb->vk13_device = dev->vk13_device; // Vulkan 1.3 support: gates the copy2 wrappers
             cb->worker_core_indirect_draw = dev->worker_core_indirect_draw;
+            cb->worker_core_indirect_draw_scalar_payload =
+                dev->worker_core_indirect_draw_scalar_payload;
             cb->multi_draw_indirect_enabled = dev->multi_draw_indirect_enabled;
             pCommandBuffers[i] = reinterpret_cast<VkCommandBuffer>(cb);
         }
@@ -7321,12 +7327,9 @@ void record_core_indirect_draw(VkCommandBuffer commandBuffer, VkBuffer buffer, V
         cb->invalid_reason = why;
         return;
     }
-    vkrpc::RecordedCommand c;
-    c.kind = indexed ? "draw_indexed_indirect" : "draw_indirect";
-    c.src_buffer = handle;
-    c.args_u64 = {static_cast<std::uint64_t>(offset)};
-    c.args_i64 = {static_cast<long long>(drawCount), static_cast<long long>(stride)};
-    cb->recording.push_back(std::move(c));
+    cb->recording.push_back(vkrpc::make_core_indirect_draw_command(
+        handle, static_cast<std::uint64_t>(offset), drawCount, stride, indexed,
+        cb->worker_core_indirect_draw_scalar_payload));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,

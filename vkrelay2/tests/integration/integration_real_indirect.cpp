@@ -8,6 +8,7 @@
 
 #include "common/vkrpc/indirect_draw_validation.h"
 #include "common/vkrpc/vulkan_session.hpp"
+#include "tests/real_backend_test_utils.hpp"
 #include "tests/test_assert.hpp"
 #include "tests/vbo_spv.h"
 
@@ -22,23 +23,7 @@
 using namespace vkr;
 
 namespace {
-
-long long pick_type(const vkrpc::GetPhysicalDeviceMemoryPropertiesResponse& props,
-                    std::uint64_t type_bits, bool device_local) {
-    for (std::size_t i = 0; i < props.types.size() && i < 32; ++i) {
-        if ((type_bits & (std::uint64_t{1} << i)) == 0) {
-            continue;
-        }
-        const std::uint64_t flags = props.types[i].property_flags;
-        const bool coherent = (flags & vkrpc::kMemoryPropertyHostVisible) != 0 &&
-                              (flags & vkrpc::kMemoryPropertyHostCoherent) != 0;
-        if ((device_local && (flags & vkrpc::kMemoryPropertyDeviceLocal) != 0) ||
-            (!device_local && coherent)) {
-            return static_cast<long long>(i);
-        }
-    }
-    return -1;
-}
+using test::pick_type;
 
 struct BoundBuffer {
     std::uint64_t buffer = 0;
@@ -49,20 +34,14 @@ struct BoundBuffer {
 
 int main() {
     worker::RealVulkanBackend backend("", "", false);
-    const auto ci = backend.create_instance({});
-    if (!ci.ok) {
-        std::fprintf(stderr, "integration_real_indirect: skipped (no instance: %s)\n",
-                     ci.reason.c_str());
+    test::RealDeviceFixture fixture(backend);
+    std::string fixture_reason;
+    if (!fixture.discover(fixture_reason)) {
+        std::fprintf(stderr, "integration_real_indirect: skipped (%s)\n", fixture_reason.c_str());
         return vkr::test::finish("integration_real_indirect");
     }
-    vkrpc::EnumeratePhysicalDevicesRequest er;
-    er.instance = ci.instance;
-    const auto en = backend.enumerate_physical_devices(er);
-    if (!en.ok || en.devices.empty()) {
-        std::fprintf(stderr, "integration_real_indirect: skipped (no physical device)\n");
-        return vkr::test::finish("integration_real_indirect");
-    }
-    const std::uint64_t phys = en.devices.front().handle;
+    const auto& ci = fixture.instance;
+    const std::uint64_t phys = fixture.physical_device;
     vkrpc::GetPhysicalDeviceFeaturesRequest feature_req;
     feature_req.physical_device = phys;
     const auto features = backend.get_physical_device_features(feature_req);
@@ -122,12 +101,14 @@ int main() {
             break;
         }
     }
-    const auto cd = backend.create_device(cdr);
-    VKR_CHECK(cd.ok);
-    vkrpc::GetDeviceQueueRequest gqr;
-    gqr.device = cd.device;
-    gqr.queue_family_index = cd.queue_family_index;
-    const auto queue = backend.get_device_queue(gqr);
+    const bool device_ready = fixture.create_device(cdr, fixture_reason);
+    VKR_CHECK(device_ready);
+    if (!device_ready) {
+        std::fprintf(stderr, "integration_real_indirect: %s\n", fixture_reason.c_str());
+        return vkr::test::finish("integration_real_indirect");
+    }
+    const auto& cd = fixture.device;
+    const auto& queue = fixture.queue;
     VKR_CHECK(queue.ok);
 
     vkrpc::GetPhysicalDeviceFormatPropertiesRequest fpr;
@@ -141,9 +122,7 @@ int main() {
                      "integration_real_indirect: skipped (RGBA8 lacks color+transfer-src)\n");
         return vkr::test::finish("integration_real_indirect");
     }
-    vkrpc::GetPhysicalDeviceMemoryPropertiesRequest mpr;
-    mpr.physical_device = phys;
-    const auto memory_props = backend.get_physical_device_memory_properties(mpr);
+    const auto& memory_props = fixture.memory_properties;
     VKR_CHECK(memory_props.ok);
 
     constexpr int kExtent = 64;
@@ -366,8 +345,9 @@ int main() {
         vkrpc::RecordedCommand draw;
         draw.kind = "draw_indexed_indirect";
         draw.src_buffer = indirect.buffer;
-        draw.args_u64 = {0};
-        draw.args_i64 = {draw_count, sizeof(VkDrawIndexedIndirectCommand)};
+        draw.indirect_offset = 0;
+        draw.indirect_draw_count = draw_count;
+        draw.indirect_stride = sizeof(VkDrawIndexedIndirectCommand);
         vkrpc::RecordedCommand end;
         end.kind = "end_render_pass";
         vkrpc::RecordedCommand barrier;
