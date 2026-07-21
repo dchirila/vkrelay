@@ -204,6 +204,34 @@ application; that mode intentionally does not steer GL through Zink.
 Inspect `app.log` for `MESA`, `ZINK`, Vulkan loader, or `VK_ERROR_*` messages. Also check that the
 generated manifest points at the shared library in the same build tree.
 
+## Moving or Blurred Content Shows Stale Rectangular Tiles on Mesa 23.2.x
+
+Mesa 23.2.x Zink has an upstream swapchain-acquire synchronization bug which can appear as stale
+rectangular tiles in moving or blurred content. It is readily visible in glmark2's `desktop` scene
+on discrete NVIDIA GPUs; AMD GPUs may render clean pixels despite executing the same invalid
+synchronization sequence.
+
+Zink waits for the acquire semaphore at `VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT`, but the
+affected version can issue the acquired image's first layout transition with
+`VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT` as its source stage. Those scopes do not form the dependency
+chain required to keep the layout transition after presentation releases the image. Vulkan
+validation reports a `SYNC-HAZARD-WRITE-AFTER-READ` between `vkAcquireNextImageKHR` and the image
+barrier. The Vulkan [`VkSubmitInfo` reference](https://docs.vulkan.org/refpages/latest/refpages/source/VkSubmitInfo.html)
+and [swapchain synchronization example](https://docs.vulkan.org/guide/latest/synchronization_examples.html#swapchain-image-acquire-and-present)
+show the required `COLOR_ATTACHMENT_OUTPUT`-to-`COLOR_ATTACHMENT_OUTPUT` chain.
+
+Mesa fixed this in commit
+[`69b5abee` (`zink: fix acquire semaphore sync`)](https://gitlab.freedesktop.org/mesa/mesa/-/commit/69b5abee148522e7792b85ec58f50660272e6317).
+Upgrade to a Mesa build containing that commit or backport it into the guest Zink build. As a
+diagnostic only, forcing `glFinish` at every frame also hides the corruption by serializing the
+frames, but it is not a practical fix. vkrelay2 deliberately forwards the application's semaphore
+and barrier stages instead of silently rewriting invalid guest synchronization.
+
+The diagnosis was reproduced with Ubuntu 22.04's Mesa 23.2.1 on both NVIDIA and AMD. On the same
+NVIDIA GPU, Mesa 26.0.3 produced clean glmark2 output, used
+`COLOR_ATTACHMENT_OUTPUT` for both the acquire wait and swapchain barrier source stage, and emitted
+no acquire-related synchronization hazard.
+
 ## Application Reports VK_ERROR_FEATURE_NOT_PRESENT or VK_ERROR_EXTENSION_NOT_PRESENT
 
 The relay exposes the intersection of host support and implemented relay support. A Windows driver
