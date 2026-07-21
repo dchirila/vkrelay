@@ -7986,7 +7986,12 @@ int g_stub_count = 0;
 std::mutex g_stub_mu;
 
 template <int I> VKAPI_ATTR void VKAPI_CALL unimpl_device_stub() {
-    icd_trace("UNIMPL device fn CALLED: %s", g_stub_names[I].c_str());
+    // This is the terminal fail-closed edge for a core/device command that the relay does not
+    // implement. Keep it unconditional: without VKRELAY2_ICD_TRACE the old trace-only message was
+    // lost immediately to abort(), leaving the application with no actionable function name.
+    std::fprintf(stderr, "vkrelay2-icd: unimplemented device function called: %s\n",
+                 g_stub_names[I].c_str());
+    std::fflush(stderr);
     std::abort();
 }
 template <int... I>

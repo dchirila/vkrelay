@@ -25,6 +25,20 @@ The bundle can contain:
 Set `VKRELAY2_LOG_DIR` to choose another destination. A failure before the private display starts
 still preserves `phase.log` when possible.
 
+### What to send when an application fails
+
+Reproduce once with the ICD trace enabled:
+
+```bash
+VKRELAY2_ICD_TRACE=1 \
+    ./linux/launcher/vkrun -- app [args...]
+```
+
+Send the resulting diagnostic-bundle path and the complete `app.log` and `worker.log`. The first
+`vkrelay2-icd: rejecting ...`, `command buffer rejected`, `record_command_buffer rejected`, or
+`unimplemented device function called` line names the fail-closed Vulkan boundary; include the
+lines immediately before and after it as well.
+
 ## No Build Artifact Found
 
 Typical messages mention a missing `vkrelay2-launch`, ICD manifest, sidecar, or Windows build.
