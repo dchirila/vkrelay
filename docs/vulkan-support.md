@@ -47,8 +47,8 @@ The current RPC and ICD implementation covers these major families:
   of descriptor indexing, inline uniform blocks, and layout-support queries;
 - shader modules, pipeline layouts, graphics pipelines, compute pipelines, render passes,
   render-pass2, framebuffers, and imageless framebuffers;
-- vertex/index/indirect buffers, uniform and sampled-image access, push constants, direct draw,
-  indexed draw, core/KHR indirect-count draw, core draw indirect and indexed draw indirect,
+- vertex/index/indirect buffers, uniform and sampled-image access, push constants, direct and
+  indexed draw, core indirect and indexed-indirect draw, Vulkan 1.2 and KHR indirect-count draw,
   dispatch, dispatch indirect, transfers, clears, blits, resolves, and query copy;
 - dynamic rendering, synchronization2, extended dynamic state used by the native lane, maintenance4
   memory-requirement queries, private data, buffer device address, multiview, host query reset, and
@@ -79,6 +79,18 @@ feature, ownership, range, and handle validation before calling the host driver.
 
 Host `VK_ERROR_DEVICE_LOST` results latch the worker device as lost. Later operations return the
 lost result without continuing to enter the driver, containing failure to that worker session.
+
+### Indirect draw capability
+
+The relay supports the complete core indirect-draw family, including multi-draw when the selected
+device exposes `multiDrawIndirect`. Indirect-count commands are available through the Vulkan 1.2
+core names and, when enabled, the `VK_KHR_draw_indirect_count` aliases. Their feature and extension
+reporting is intersected with both the selected host device and worker capability; requesting an
+unsupported combination fails during device creation.
+
+Command admission validates the indirect and count buffers independently, including binding,
+usage, lifetime, alignment, stride, maximum draw count, and overflow-safe ranges. The worker then
+repeats those checks against its own object table before recording the host command.
 
 ## Memory Visibility
 
