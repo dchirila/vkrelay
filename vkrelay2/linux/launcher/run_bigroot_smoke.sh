@@ -70,7 +70,7 @@ smoke_cleanup() {
 }
 trap 'smoke_cleanup "$?"' EXIT
 
-vkr_reexec_in_private_x11_namespace "$@"
+vkr_reexec_in_private_x11_namespace "$@" || exit $?
 
 if [ "${VKRELAY2_BIGROOT_EXTERNAL_DAEMON:-0}" = "1" ]; then
     unset VKRELAY2_DISPLAY_SNAPSHOT_ID VKRELAY2_HOST_VIRTUAL_W VKRELAY2_HOST_VIRTUAL_H

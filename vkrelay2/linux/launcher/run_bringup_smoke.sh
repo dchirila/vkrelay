@@ -76,7 +76,7 @@ trap 'smoke_cleanup "$?"' EXIT
 trap 'smoke_cleanup 143; exit 143' TERM
 trap 'smoke_cleanup 130; exit 130' INT
 
-vkr_reexec_in_private_x11_namespace "$@"
+vkr_reexec_in_private_x11_namespace "$@" || exit $?
 
 # Begin the phase trace up front so a stall is localized in the preserved bundle.
 VKR_PHASE_LOG="$(mktemp "${TMPDIR:-/tmp}/vkrelay2-phase-XXXXXX.log" 2>/dev/null)" || VKR_PHASE_LOG=""

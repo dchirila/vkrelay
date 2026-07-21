@@ -44,7 +44,7 @@ smoke_cleanup() {
 trap 'smoke_cleanup "$?"' EXIT
 
 # WSLg read-only /tmp/.X11-unix workaround (same as the app-run path).
-vkr_reexec_in_private_x11_namespace "$@"
+vkr_reexec_in_private_x11_namespace "$@" || exit $?
 
 vkr_start_private_display || { echo "SIDECAR-SMOKE: FAIL (private display setup)"; exit 1; }
 

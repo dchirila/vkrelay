@@ -46,7 +46,7 @@ source "$here/lib_private_session.sh"
 
 # On a WSLg box /tmp/.X11-unix is read-only; transparently re-exec inside a private mount namespace
 # with a writable overlay first (no sudo, no global change). No-op when not needed.
-vkr_reexec_in_private_x11_namespace "$@"
+vkr_reexec_in_private_x11_namespace "$@" || exit $?
 
 fail() { echo "run_vkcube: $*" >&2; exit 1; }
 

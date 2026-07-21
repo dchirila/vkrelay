@@ -518,7 +518,7 @@ fi
 # This precedes daemon bring-up so the entire app-run -- daemon contact + display + the app -- runs
 # in one namespace (Windows interop and TCP both work inside it). No-op when not needed.
 if ((app_run)); then
-    vkr_reexec_in_private_x11_namespace "$@"
+    vkr_reexec_in_private_x11_namespace "$@" || exit $?
     # begin the phase trace BEFORE daemon contact (the first phase that can hang),
     # so a stall in ANY bring-up phase is localized; vkr_session_cleanup folds it into the failure
     # bundle. Best-effort -- if mktemp fails, vkr_phase degrades to stderr-only.

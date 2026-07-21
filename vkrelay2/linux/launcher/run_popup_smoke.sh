@@ -54,7 +54,7 @@ smoke_cleanup() {
 }
 trap 'smoke_cleanup "$?"' EXIT
 
-vkr_reexec_in_private_x11_namespace "$@"
+vkr_reexec_in_private_x11_namespace "$@" || exit $?
 
 vkr_start_private_display || { echo "POPUP-SMOKE: FAIL (private display setup)"; exit 1; }
 

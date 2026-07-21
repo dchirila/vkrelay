@@ -360,6 +360,11 @@ if(VKRELAY2_BASH)
         add_test(NAME smoke_launch_teardown_bash
                  COMMAND ${VKRELAY2_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/smoke/launch_teardown_bash.sh
                          $<TARGET_FILE:vkrelay2-launch>)
+        # WSLg's read-only X11 socket directory requires a private mount namespace. Exercise the
+        # actual double re-exec and prove that the application-facing process retains caller uid/gid.
+        add_test(NAME smoke_x11_namespace_identity_bash
+                 COMMAND ${VKRELAY2_BASH}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/smoke/x11_namespace_identity_bash.sh)
     endif()
 endif()
 
