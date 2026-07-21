@@ -111,33 +111,109 @@ vkr_x11_dir_usable() {
     [ -w /tmp ] # missing: fine as long as the X server can create it 1777
 }
 
-# Re-exec the CALLING script inside a private mount namespace with a writable /tmp/.X11-unix -- ONCE,
-# only when needed, only when unprivileged user namespaces are available. A no-op otherwise (the
-# normal path then runs and, if it cannot reach a display, fails with its own message plus the manual
-# remedies below). The caller passes its "$@" so argv rides across exec as an array, never a
-# re-parsed string.
-vkr_reexec_in_private_x11_namespace() {
-    [ "${VKRELAY2_X11NS:-0}" = "1" ] && return 0 # already inside our namespace (re-exec guard)
-    vkr_x11_dir_usable && return 0               # /tmp/.X11-unix already works -> nothing to do
-    command -v unshare >/dev/null 2>&1 || return 0
-    if ! unshare --user --map-root-user --mount -- true 2>/dev/null; then
-        echo "vkrelay2: /tmp/.X11-unix is read-only (WSLg mounts it so) and unprivileged user" >&2
-        echo "  namespaces are unavailable, so I cannot transparently work around it. Use ONE of" >&2
-        echo "  these (then re-run):" >&2
-        echo "    sudo mount -o remount,rw /tmp/.X11-unix && sudo chmod 1777 /tmp/.X11-unix   # per session" >&2
-        echo "    # or set 'guiApplications=false' under [wsl2] in %USERPROFILE%\\.wslconfig + 'wsl --shutdown'" >&2
-        return 0 # do not mask the failure -- let the normal path run and report it
+# True only when the namespace re-exec restored the exact numeric caller identity captured before
+# the outer root mapping. Kept pure so the shell smoke can exercise malformed/missing markers without
+# entering a namespace.
+vkr_x11ns_identity_matches() { # <expected-uid> <expected-gid>
+    local expected_uid="${1:-}" expected_gid="${2:-}" actual_uid actual_gid
+    case "${expected_uid}" in '' | *[!0-9]*) return 1 ;; esac
+    case "${expected_gid}" in '' | *[!0-9]*) return 1 ;; esac
+    actual_uid="$(id -u 2>/dev/null)" || return 1
+    actual_gid="$(id -g 2>/dev/null)" || return 1
+    [ "${actual_uid}" = "${expected_uid}" ] && [ "${actual_gid}" = "${expected_gid}" ]
+}
+
+# Exercise the complete privilege transition in a disposable directory: acquire mount privilege in
+# the outer root-mapped user+mount namespace, create a private tmpfs, then enter the nested user
+# namespace mapped back to the caller and prove that identity + tmpfs write access both hold. This
+# is an execution probe -- never infer support from util-linux help text (its spelling differs across
+# Jammy/Noble/Resolute). The mount disappears with the probe namespace; only the empty underlying
+# directory exists in the caller and is removed before return.
+vkr_probe_identity_preserving_x11_namespace() { # <caller-uid> <caller-gid>
+    local caller_uid="${1:-}" caller_gid="${2:-}" probe_dir probe_ok=0
+    case "${caller_uid}" in '' | *[!0-9]*) return 1 ;; esac
+    case "${caller_gid}" in '' | *[!0-9]*) return 1 ;; esac
+    command -v unshare >/dev/null 2>&1 || return 1
+    command -v mount >/dev/null 2>&1 || return 1
+    probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/vkrelay2-x11ns-probe.XXXXXX" 2>/dev/null)" \
+        || return 1
+
+    local inner_script outer_script
+    inner_script='
+        [ "$(id -u 2>/dev/null)" = "$1" ] || exit 20
+        [ "$(id -g 2>/dev/null)" = "$2" ] || exit 21
+        : > "$3/.identity-write-ok" || exit 22
+    '
+    outer_script='
+        mount -t tmpfs tmpfs "$1" || exit 10
+        chmod 1777 "$1" || exit 11
+        exec unshare --user --map-user="$2" --map-group="$3" -- \
+            bash -c "$4" _ "$2" "$3" "$1"
+    '
+    if unshare --user --map-root-user --mount -- \
+        bash -c "${outer_script}" _ "${probe_dir}" "${caller_uid}" "${caller_gid}" \
+        "${inner_script}" >/dev/null 2>&1; then
+        probe_ok=1
     fi
+    rmdir "${probe_dir}" 2>/dev/null || true
+    [ "${probe_ok}" -eq 1 ]
+}
+
+vkr_x11ns_identity_failure() {
+    echo "vkrelay2: /tmp/.X11-unix is read-only (WSLg mounts it so), but an" >&2
+    echo "  identity-preserving private user/mount namespace could not be established." >&2
+    echo "  Refusing to launch the application with a different uid. Use ONE of" >&2
+    echo "  these remedies, then re-run:" >&2
+    echo "    sudo mount -o remount,rw /tmp/.X11-unix && sudo chmod 1777 /tmp/.X11-unix" >&2
+    echo "    # or set 'guiApplications=false' under [wsl2] in %USERPROFILE%\\.wslconfig + 'wsl --shutdown'" >&2
+    return 1
+}
+
+# Re-exec the CALLING script inside a private mount namespace with a writable /tmp/.X11-unix -- ONCE,
+# only when needed and only when the caller's numeric uid/gid can be restored before application
+# bring-up. The caller passes its "$@" so argv rides across both execs as an array, never a re-parsed
+# string. Failure is explicit: callers must not continue to daemon contact after a nonzero return.
+vkr_reexec_in_private_x11_namespace() {
+    if [ "${VKRELAY2_X11NS:-0}" = "1" ]; then
+        if ! vkr_x11ns_identity_matches "${VKR_X11NS_EXPECT_UID:-}" \
+            "${VKR_X11NS_EXPECT_GID:-}"; then
+            echo "vkrelay2: private X11 namespace did not preserve the invoking uid/gid;" >&2
+            echo "  refusing to contact the daemon or launch the application." >&2
+            return 1
+        fi
+        if ! vkr_x11_dir_usable; then
+            echo "vkrelay2: private X11 namespace marker is set, but its writable" >&2
+            echo "  /tmp/.X11-unix overlay is missing; refusing to continue." >&2
+            return 1
+        fi
+        return 0 # already inside the identity-restored nested namespace
+    fi
+    vkr_x11_dir_usable && return 0 # /tmp/.X11-unix already works -> nothing to do
+
+    local orig_uid orig_gid
+    orig_uid="$(id -u 2>/dev/null)" || { vkr_x11ns_identity_failure; return 1; }
+    orig_gid="$(id -g 2>/dev/null)" || { vkr_x11ns_identity_failure; return 1; }
+    if ! vkr_probe_identity_preserving_x11_namespace "${orig_uid}" "${orig_gid}"; then
+        vkr_x11ns_identity_failure
+        return 1
+    fi
+
     echo "vkrelay2: /tmp/.X11-unix is read-only (WSLg); re-running inside a private mount namespace" \
-         "with a writable overlay (no sudo, no global change)." >&2
+         "with a writable overlay and preserved uid/gid (no sudo, no global change)." >&2
     export VKRELAY2_X11NS=1
-    # Overlay an empty writable tmpfs on /tmp/.X11-unix, then re-run this script via bash (so no +x
-    # bit is required) with its original argv preserved exactly.
+    VKR_X11NS_EXPECT_UID="${orig_uid}"
+    VKR_X11NS_EXPECT_GID="${orig_gid}"
+    export VKR_X11NS_EXPECT_UID VKR_X11NS_EXPECT_GID
+    # The outer namespace exists only to mount/chmod the overlay. Before re-running the caller, enter
+    # a nested user namespace that maps outer uid/gid 0 back to the original numeric identity. The
+    # inner process retains the mount namespace but has no capabilities in its owning (outer) user
+    # namespace. Jammy 2.37.2, Noble 2.39.3, and Resolute 2.41.3 all execute this exact option shape.
     exec unshare --user --map-root-user --mount -- bash -c '
         mount -t tmpfs tmpfs /tmp/.X11-unix || exit 1
-        chmod 1777 /tmp/.X11-unix
-        exec "$@"
-    ' _ bash "$0" "$@"
+        chmod 1777 /tmp/.X11-unix || exit 1
+        uid="$1"; gid="$2"; shift 2
+        exec unshare --user --map-user="${uid}" --map-group="${gid}" -- "$@"
+    ' _ "${orig_uid}" "${orig_gid}" bash "$0" "$@"
 }
 
 # launcher/session reliability: phase-stamped bring-up progress so a hang can be

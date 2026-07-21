@@ -136,6 +136,22 @@ command -v unshare weston Xwayland
 Also inspect `weston.log` and `xwayland.log` in the failure bundle. The launcher tries X displays
 `:30` through `:60` and never removes another server's lock.
 
+## Application Reports That It Is Running as root
+
+The private X11 workaround briefly acquires mount privilege in an outer user namespace, then enters
+a nested namespace that restores the invoking numeric user and primary group before contacting the
+daemon or starting the application. Verify the application-facing identity with:
+
+```bash
+./linux/launcher/vkrun -- bash -lc 'id; getent passwd "$(id -u)"'
+```
+
+If the launcher cannot prove that the nested namespace preserves identity and retains a writable
+private `/tmp/.X11-unix`, it fails closed and prints the same manual remount/WSLg-disable remedies as
+the private-display error above. Upgrade an older vkrelay2 package if the command instead reports
+uid 0 for an ordinary user. Supplementary groups may appear as the user-namespace overflow group;
+the invoking numeric uid and primary gid are the enforced compatibility boundary.
+
 ## Xwayland Crashes During Pointer Warps or Window Moves
 
 A crash during Blender view rotation (a pointer recenter) or a window move usually means the stock
