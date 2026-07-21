@@ -45,18 +45,9 @@ inline bool indirect_count_device_enabled(bool extension_enabled, bool feature_e
     return extension_enabled || feature_enabled;
 }
 
-inline bool indirect_count_khr_proc_available(bool extension_enabled) {
-    return extension_enabled;
-}
-
-inline bool indirect_count_core_proc_name(const char* name) {
-    return name != nullptr && (std::strcmp(name, "vkCmdDrawIndirectCount") == 0 ||
-                               std::strcmp(name, "vkCmdDrawIndexedIndirectCount") == 0);
-}
-
-inline bool indirect_count_khr_proc_name(const char* name) {
-    return name != nullptr && (std::strcmp(name, "vkCmdDrawIndirectCountKHR") == 0 ||
-                               std::strcmp(name, "vkCmdDrawIndexedIndirectCountKHR") == 0);
+inline bool indirect_count_request_supported(bool worker_support, bool reported_feature,
+                                             bool extension_requested, bool feature_requested) {
+    return !(extension_requested || feature_requested) || (worker_support && reported_feature);
 }
 
 } // namespace vkr::icd_policy

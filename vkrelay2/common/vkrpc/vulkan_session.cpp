@@ -6282,6 +6282,10 @@ CreateDeviceResponse MockVulkanBackend::create_device(const CreateDeviceRequest&
         it->second.devices.erase(device);
         return resp;
     }
+    // Vulkan-free mock policy: it does not interpret ABI-dependent Vulkan12Features blobs. New
+    // ICDs always send the explicit scalar; for an old-ICD omitted scalar, derive the only fact
+    // this oracle owns -- whether the featureless KHR extension was enabled. The real worker
+    // additionally derives and host-validates the promoted f12 feature path.
     dev.draw_indirect_count_enabled =
         req.draw_indirect_count_enabled < 0
             ? dev.enabled_exts.count(kDrawIndirectCountExtensionName) != 0

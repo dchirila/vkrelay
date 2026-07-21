@@ -261,8 +261,9 @@ struct CreateDeviceRequest {
     int geometry_streams_feature_enabled = 0;
     // Core-1.2/KHR indirect-count operational state. New ICDs send extension-enabled OR
     // Vulkan12Features.drawIndirectCount-enabled. On the wire this is three-state: an absent key
-    // from an older ICD is derived by the worker from the extension/feature chain; an explicit
-    // 0/1 must agree with that derivation.
+    // from an older ICD is derived by the real worker from the extension/feature chain; an
+    // explicit 0/1 must agree with that derivation. The Vulkan-free mock is deliberately a scalar
+    // oracle and can derive an omitted value only from the enabled-extension list.
     int draw_indirect_count_enabled = 0;
     // Descriptor indexing: the enabled kDIFeature* bits (the ICD sends only the
     // served kDIFeatureServedBits subset, native lane only). Gates the per-binding flag

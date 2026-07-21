@@ -2321,10 +2321,25 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
                 }
             }
         }
-        if ((wants_draw_indirect_count || wants_draw_indirect_count_feature) &&
-            pd->caps.core_indirect_draw_count == 0) {
-            std::fprintf(stderr, "vkrelay2-icd: rejecting device -- indirect-count drawing "
-                                 "requested but the worker lacks its command vocabulary\n");
+        const bool wants_any_draw_indirect_count =
+            wants_draw_indirect_count || wants_draw_indirect_count_feature;
+        bool reported_draw_indirect_count = false;
+        if (wants_any_draw_indirect_count && pd->caps.core_indirect_draw_count != 0) {
+            // A non-conformant app may enable a feature the relay reported FALSE without first
+            // querying it. Re-query the same host-authoritative, worker-masked f12 value used by
+            // GetPhysicalDeviceFeatures2 so CreateDevice still returns the spec-correct local
+            // FEATURE_NOT_PRESENT instead of leaking a host-side generic create failure.
+            VkPhysicalDeviceVulkan12Features supported{};
+            supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            forward_capability_chain(pd, /*which=*/0, &supported);
+            reported_draw_indirect_count = supported.drawIndirectCount != VK_FALSE;
+        }
+        if (!vkr::icd_policy::indirect_count_request_supported(
+                pd->caps.core_indirect_draw_count != 0, reported_draw_indirect_count,
+                wants_draw_indirect_count, wants_draw_indirect_count_feature)) {
+            std::fprintf(stderr,
+                         "vkrelay2-icd: rejecting device -- indirect-count drawing requested "
+                         "but its worker/host feature was reported FALSE\n");
             return VK_ERROR_FEATURE_NOT_PRESENT;
         }
         // did the app enable the dynamicRendering FEATURE (not
@@ -8654,10 +8669,6 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetInstanceProcAddr(VkInstance, const c
 // extension's alias spellings resolve only where THAT extension was actually enabled. Returns
 // true when `name` must answer NULL for this device (call-time gates stay as defense in depth).
 bool device_proc_gated_off(const DeviceImpl* dev, const char* name) {
-    if (vkr::icd_policy::indirect_count_khr_proc_name(name)) {
-        return !vkr::icd_policy::indirect_count_khr_proc_available(
-            dev->enabled_extensions.count(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) != 0);
-    }
     // Device-level commands that exist ONLY at core 1.3 (no suffix): dynamic rendering, sync2,
     // copy_commands2, private data, maintenance4's queries, and the EDS1/EDS2-subset core names.
     static const char* const kVk13CoreOnly[] = {
@@ -8733,6 +8744,8 @@ bool device_proc_gated_off(const DeviceImpl* dev, const char* name) {
         {"vkCmdSetEvent2KHR", "VK_KHR_synchronization2"},
         {"vkCmdResetEvent2KHR", "VK_KHR_synchronization2"},
         {"vkCmdWaitEvents2KHR", "VK_KHR_synchronization2"},
+        {"vkCmdDrawIndirectCountKHR", "VK_KHR_draw_indirect_count"},
+        {"vkCmdDrawIndexedIndirectCountKHR", "VK_KHR_draw_indirect_count"},
         {"vkCmdCopyBuffer2KHR", "VK_KHR_copy_commands2"},
         {"vkCmdCopyImage2KHR", "VK_KHR_copy_commands2"},
         {"vkCmdCopyBufferToImage2KHR", "VK_KHR_copy_commands2"},

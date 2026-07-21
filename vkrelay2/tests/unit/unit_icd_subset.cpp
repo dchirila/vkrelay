@@ -1448,7 +1448,7 @@ void test_native_lane_policy() {
     using vkr::icd_policy::indirect_count_device_enabled;
     using vkr::icd_policy::indirect_count_extension_advertised;
     using vkr::icd_policy::indirect_count_feature_reported;
-    using vkr::icd_policy::indirect_count_khr_proc_available;
+    using vkr::icd_policy::indirect_count_request_supported;
     VKR_CHECK(!indirect_count_extension_advertised(false, true, false));
     VKR_CHECK(!indirect_count_extension_advertised(false, false, true));
     // Unlike legacy allowlist entries, this new surface is strictly host-list-intersected: an
@@ -1470,14 +1470,12 @@ void test_native_lane_policy() {
     VKR_CHECK(indirect_count_device_enabled(true, false));
     VKR_CHECK(indirect_count_device_enabled(false, true));
     VKR_CHECK(!indirect_count_device_enabled(false, false));
-    VKR_CHECK(indirect_count_khr_proc_available(true));
-    VKR_CHECK(!indirect_count_khr_proc_available(false));
-    VKR_CHECK(vkr::icd_policy::indirect_count_core_proc_name("vkCmdDrawIndirectCount"));
-    VKR_CHECK(vkr::icd_policy::indirect_count_core_proc_name("vkCmdDrawIndexedIndirectCount"));
-    VKR_CHECK(!vkr::icd_policy::indirect_count_core_proc_name("vkCmdDrawIndirectCountKHR"));
-    VKR_CHECK(vkr::icd_policy::indirect_count_khr_proc_name("vkCmdDrawIndirectCountKHR"));
-    VKR_CHECK(vkr::icd_policy::indirect_count_khr_proc_name("vkCmdDrawIndexedIndirectCountKHR"));
-    VKR_CHECK(!vkr::icd_policy::indirect_count_khr_proc_name("vkCmdDrawIndirectCount"));
+    VKR_CHECK(indirect_count_request_supported(true, true, false, false));
+    VKR_CHECK(indirect_count_request_supported(true, true, true, false));
+    VKR_CHECK(indirect_count_request_supported(true, true, false, true));
+    VKR_CHECK(!indirect_count_request_supported(false, true, true, false));
+    VKR_CHECK(!indirect_count_request_supported(true, false, false, true));
+    VKR_CHECK(!indirect_count_request_supported(true, false, true, false));
 }
 
 void test_core_indirect_draw_validation() {

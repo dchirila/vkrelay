@@ -515,15 +515,9 @@ int main() {
     };
     const auto counted_draw = [&](std::uint64_t count_buffer, std::uint64_t count_buffer_offset,
                                   long long max_draw_count) {
-        vkrpc::RecordedCommand draw;
-        draw.kind = "draw_indexed_indirect_count";
-        draw.src_buffer = indirect.buffer;
-        draw.indirect_offset = 0;
-        draw.indirect_draw_count = max_draw_count;
-        draw.indirect_stride = sizeof(VkDrawIndexedIndirectCommand);
-        draw.indirect_count_buffer = count_buffer;
-        draw.indirect_count_buffer_offset = count_buffer_offset;
-        return draw;
+        return vkrpc::make_core_indirect_count_draw_command(
+            indirect.buffer, 0, count_buffer, count_buffer_offset,
+            static_cast<std::uint32_t>(max_draw_count), sizeof(VkDrawIndexedIndirectCommand), true);
     };
     const auto reset_fence = [&] {
         vkrpc::ResetFencesRequest reset;

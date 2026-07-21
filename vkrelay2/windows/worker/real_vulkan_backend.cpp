@@ -2469,6 +2469,23 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
         const bool extension_draw_indirect_count =
             std::find(ext_storage.begin(), ext_storage.end(),
                       VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) != ext_storage.end();
+        if (chain_draw_indirect_count) {
+            // Hostile/stale RPC safety net: the forwarded f12 chain must not enable a feature the
+            // selected physical device reports FALSE. Check before vkCreateDevice so the backend
+            // returns a named feature rejection instead of collapsing the host's result into the
+            // generic "vkCreateDevice failed" response.
+            VkPhysicalDeviceVulkan12Features host_f12{};
+            host_f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            VkPhysicalDeviceFeatures2 host_f2{};
+            host_f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            host_f2.pNext = &host_f12;
+            vkGetPhysicalDeviceFeatures2(it->second.physical_vk, &host_f2);
+            if (host_f12.drawIndirectCount == VK_FALSE) {
+                resp.ok = false;
+                resp.reason = "drawIndirectCount feature requested but the host reports it FALSE";
+                return resp;
+            }
+        }
         const bool derived_draw_indirect_count =
             extension_draw_indirect_count || chain_draw_indirect_count;
         if (req.draw_indirect_count_enabled >= 0 &&
