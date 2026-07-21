@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -67,11 +68,59 @@ int main() {
     const auto features = backend.get_physical_device_features(feature_req);
     VKR_CHECK(features.ok);
     const bool multi = (features.feature_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.features.multiDrawIndirect = multi ? VK_TRUE : VK_FALSE;
+    vkrpc::CapabilityChainEntry features2_entry;
+    features2_entry.s_type = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2_entry.size = sizeof(features2);
+    features2_entry.blob.assign(reinterpret_cast<const char*>(&features2), sizeof(features2));
     vkrpc::CreateDeviceRequest cdr;
     cdr.instance = ci.instance;
     cdr.physical_device = phys;
+    cdr.enabled_feature_chain = {features2_entry};
+    cdr.enabled_feature_bits_authoritative = true;
     if (multi) {
         cdr.enabled_feature_bits = vkrpc::kFeatureMultiDrawIndirect;
+    }
+    // A new-client scalar must agree exactly with the Features2 chain: the chain is what reaches
+    // host vkCreateDevice. An absent authority marker retains the legacy old-ICD spelling, where
+    // scalar zero accompanied a populated chain.
+    {
+        vkrpc::CreateDeviceRequest bad = cdr;
+        VkPhysicalDeviceFeatures2 disabled{};
+        disabled.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        bad.enabled_feature_bits = vkrpc::kFeatureMultiDrawIndirect;
+        bad.enabled_feature_chain[0].blob.assign(reinterpret_cast<const char*>(&disabled),
+                                                 sizeof(disabled));
+        const auto rejected = backend.create_device(bad);
+        VKR_CHECK(!rejected.ok);
+        VKR_CHECK(rejected.reason.find("scalar disagrees") != std::string::npos);
+    }
+    if (multi) {
+        vkrpc::CreateDeviceRequest legacy = cdr;
+        legacy.enabled_feature_bits = 0;
+        legacy.enabled_feature_bits_authoritative = false;
+        const auto legacy_device = backend.create_device(legacy);
+        VKR_CHECK(legacy_device.ok);
+        if (legacy_device.ok) {
+            VKR_CHECK(backend.destroy_device({legacy_device.device}).ok);
+        }
+    }
+    // The no-chain pEnabledFeatures spelling rejects an unsupported host bit instead of silently
+    // clamping it off. Conditional because a theoretical device may expose every core-1.0 bit.
+    for (std::uint32_t bit = 0; bit < 55; ++bit) {
+        const std::uint64_t mask = std::uint64_t{1} << bit;
+        if ((features.feature_bits & mask) == 0) {
+            vkrpc::CreateDeviceRequest unsupported;
+            unsupported.instance = ci.instance;
+            unsupported.physical_device = phys;
+            unsupported.enabled_feature_bits = mask;
+            const auto rejected = backend.create_device(unsupported);
+            VKR_CHECK(!rejected.ok);
+            VKR_CHECK(rejected.reason.find("not supported by the host") != std::string::npos);
+            break;
+        }
     }
     const auto cd = backend.create_device(cdr);
     VKR_CHECK(cd.ok);

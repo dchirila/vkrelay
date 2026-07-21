@@ -74,7 +74,7 @@ namespace vkr::vkrpc {
     X(variableMultisampleRate)                                                                     \
     X(inheritedQueries)
 
-inline std::uint64_t pack_physical_device_features(const VkPhysicalDeviceFeatures& f) {
+constexpr std::uint64_t pack_physical_device_features(const VkPhysicalDeviceFeatures& f) {
     std::uint64_t bits = 0;
     int i = 0;
 #define VKR_PACK_ONE(name)                                                                         \

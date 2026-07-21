@@ -12,6 +12,9 @@ between minor releases.
   closing the missing core-1.0 command surface. The implementation includes additive worker
   capability negotiation, `multiDrawIndirect` feature gating, overflow-safe buffer-range
   validation, and observable indexed-indirect GPU readback coverage.
+- Fixed GPU-to-host readback bookkeeping for destination buffers bound through
+  `vkBindBufferMemory2`; both core-equivalent buffer-memory binding spellings now enroll completed
+  GPU writes for shadow-memory download.
 
 ### Build
 

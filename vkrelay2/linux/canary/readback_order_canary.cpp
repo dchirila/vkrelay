@@ -9,7 +9,8 @@
 //                             then an EMPTY fence-only vkQueueSubmit; wait THAT fence; map buf1.
 //   phase B (timeline proof): clear image (2nd color) -> copy image->buf2, again unproven;
 //                             then an EMPTY batch signalling a timeline value; vkWaitSemaphores;
-//                             map buf2.
+//                             map buf2. buf2 uses vkBindBufferMemory2, so exact pixels also pin the
+//                             Bind2 -> destination-memory -> fence-time download bookkeeping.
 // Self-judging, greppable: run_readback_smoke.sh gates on the printed pixels + PASS. Pre-fix (RED)
 // both phases read stale zeros (the proofs matched no armed record); post-fix the exact clear
 // colors. Skips cleanly (exit 0) when no ICD/worker stack is reachable.
@@ -232,9 +233,21 @@ int main() {
         bai.allocationSize = bmr.size;
         bai.memoryTypeIndex = static_cast<std::uint32_t>(bt);
         if (!check(vkAllocateMemory(device, &bai, nullptr, &buf_mems[i]),
-                   "vkAllocateMemory (buffer)") ||
-            !check(vkBindBufferMemory(device, bufs[i], buf_mems[i], 0), "vkBindBufferMemory")) {
+                   "vkAllocateMemory (buffer)")) {
             return 2;
+        }
+        if (i == 0) {
+            if (!check(vkBindBufferMemory(device, bufs[i], buf_mems[i], 0), "vkBindBufferMemory")) {
+                return 2;
+            }
+        } else {
+            VkBindBufferMemoryInfo bind{};
+            bind.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
+            bind.buffer = bufs[i];
+            bind.memory = buf_mems[i];
+            if (!check(vkBindBufferMemory2(device, 1, &bind), "vkBindBufferMemory2")) {
+                return 2;
+            }
         }
     }
 

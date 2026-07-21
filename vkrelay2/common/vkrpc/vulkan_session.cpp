@@ -1552,6 +1552,7 @@ json::Value CreateDeviceRequest::to_body() const {
     }
     b.set("enabled_extensions", json::Value(std::move(exts)));
     b.set("enabled_feature_bits", handle_value(enabled_feature_bits));
+    b.set("enabled_feature_bits_authoritative", json::Value(enabled_feature_bits_authoritative));
     b.set("dynamic_rendering_feature_enabled", json::Value(dynamic_rendering_feature_enabled));
     b.set("synchronization2_feature_enabled", json::Value(synchronization2_feature_enabled));
     b.set("host_query_reset_feature_enabled", json::Value(host_query_reset_feature_enabled));
@@ -1586,6 +1587,7 @@ CreateDeviceRequest CreateDeviceRequest::from_body(const json::Value& body) {
         }
     }
     r.enabled_feature_bits = get_handle(body, "enabled_feature_bits");
+    r.enabled_feature_bits_authoritative = get_bool(body, "enabled_feature_bits_authoritative");
     r.dynamic_rendering_feature_enabled = get_int(body, "dynamic_rendering_feature_enabled", 0);
     r.synchronization2_feature_enabled = get_int(body, "synchronization2_feature_enabled", 0);
     r.host_query_reset_feature_enabled = get_int(body, "host_query_reset_feature_enabled", 0);

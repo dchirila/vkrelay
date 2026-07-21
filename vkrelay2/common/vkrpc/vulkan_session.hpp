@@ -192,6 +192,11 @@ struct CreateDeviceRequest {
     // unchanged.
     std::vector<std::string> enabled_extensions;
     std::uint64_t enabled_feature_bits = 0;
+    // True when enabled_feature_bits is a faithful mirror of the base-feature spelling in
+    // enabled_feature_chain. New ICDs always set this, so a Features2/scalar disagreement is
+    // rejected in either direction. Absent/false preserves compatibility with older ICDs, which
+    // left the scalar at zero when Features2 owned the base features.
+    bool enabled_feature_bits_authoritative = false;
     // Native lane: did the app enable the dynamicRendering
     // FEATURE (VkPhysicalDeviceDynamicRenderingFeatures.dynamicRendering or the Vulkan13Features
     // spelling), not merely the extension? The ICD parses the enabled-feature chain (it has the

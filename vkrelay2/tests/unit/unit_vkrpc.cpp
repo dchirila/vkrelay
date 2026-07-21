@@ -8329,10 +8329,12 @@ void test_zink_caps_wire() {
         req.physical_device = 0x2;
         req.enabled_extensions = {"VK_KHR_swapchain", "VK_KHR_maintenance1"};
         req.enabled_feature_bits = 0xDEAD;
+        req.enabled_feature_bits_authoritative = true;
         const auto rt = vkrpc::CreateDeviceRequest::from_body(req.to_body());
         VKR_CHECK_EQ(rt.enabled_extensions.size(), static_cast<std::size_t>(2));
         VKR_CHECK_EQ(rt.enabled_extensions[1], std::string("VK_KHR_maintenance1"));
         VKR_CHECK_EQ(rt.enabled_feature_bits, static_cast<std::uint64_t>(0xDEAD));
+        VKR_CHECK(rt.enabled_feature_bits_authoritative);
         // Legacy request (no new keys) -> empty list + 0 bits (the worker's prior behavior).
         const auto legacy = vkrpc::CreateDeviceRequest::from_body([] {
             json::Value b = json::Value::make_object();
@@ -8342,6 +8344,7 @@ void test_zink_caps_wire() {
         }());
         VKR_CHECK(legacy.enabled_extensions.empty());
         VKR_CHECK_EQ(legacy.enabled_feature_bits, static_cast<std::uint64_t>(0));
+        VKR_CHECK(!legacy.enabled_feature_bits_authoritative);
     }
 }
 

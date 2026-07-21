@@ -74,6 +74,14 @@ namespace transport = vkr::transport;
 namespace protocol = vkr::protocol;
 namespace json = vkr::json;
 
+constexpr bool multi_draw_indirect_feature_bit_matches_wire_order() {
+    VkPhysicalDeviceFeatures features{};
+    features.multiDrawIndirect = VK_TRUE;
+    return vkrpc::pack_physical_device_features(features) == vkrpc::kFeatureMultiDrawIndirect;
+}
+static_assert(multi_draw_indirect_feature_bit_matches_wire_order(),
+              "kFeatureMultiDrawIndirect drifted from VkPhysicalDeviceFeatures wire order");
+
 // --- Dispatchable handle impls (VK_LOADER_DATA MUST be first) ---------------
 struct PhysicalDeviceImpl; // defined below; the instance caches STABLE handles to these
 struct InstanceImpl {
@@ -397,17 +405,17 @@ std::uint64_t sweep_rebaseline_every() {
     }();
     return n;
 }
-// vkGetBufferMemoryRequirements is void, so the requirements ride on CreateBufferResponse and are
-// cached here (keyed by worker buffer handle); the getter is a pure cache copy.
-std::map<std::uint64_t, VkMemoryRequirements> g_buffer_reqs;
-// Core indirect-draw admission needs the guest-visible logical size + usage (the memory
-// requirements size may include host padding and is not the Vulkan buffer bound).
-std::map<std::uint64_t, VkDeviceSize> g_buffer_sizes;
-std::map<std::uint64_t, VkBufferUsageFlags> g_buffer_usages;
-// GPU-write readback (surgical): worker buffer handle -> its bound worker memory handle (set at
-// BindBufferMemory). Only readback destinations ever download from the worker, so streaming
-// upload buffers -- mapped every frame -- pay ZERO readback cost. Guarded by g_mu.
-std::map<std::uint64_t, std::uint64_t> g_buffer_memory;
+// One authoritative entry per live worker buffer, guarded by g_mu. Requirements make the void
+// getters pure cache copies; logical size/usage drive indirect-draw admission (requirements.size
+// may include host tail padding); memory is populated by either BindBufferMemory spelling and lets
+// GPU-write recorders enroll exactly their destination allocation in fence-time readback.
+struct BufferInfo {
+    VkMemoryRequirements requirements{};
+    VkDeviceSize size = 0;
+    VkBufferUsageFlags usage = 0;
+    std::uint64_t memory = 0;
+};
+std::map<std::uint64_t, BufferInfo> g_buffers;
 // Readback lifecycle: recorded -> SUBMITTED -> READY -> delivered. A
 // recorder (vkCmdCopyQueryPoolResults / vkCmdCopyImageToBuffer) notes its dst memory ON THE
 // COMMAND BUFFER; a successful vkQueueSubmit arms one record per submitted batch (the batch's dst
@@ -2716,6 +2724,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
         req.physical_device = pd->worker;
         req.enabled_extensions = std::move(enabled_exts);
         req.enabled_feature_bits = enabled_feature_bits;
+        req.enabled_feature_bits_authoritative = true;
         req.dynamic_rendering_feature_enabled = wants_dynamic_rendering_feature ? 1 : 0;
         req.synchronization2_feature_enabled = wants_synchronization2_feature ? 1 : 0;
         req.host_query_reset_feature_enabled = wants_host_query_reset_feature ? 1 : 0;
@@ -4552,9 +4561,11 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateBuffer(VkDevice device, const VkBufferCreat
         mr.size = r.mem_size;
         mr.alignment = r.mem_alignment;
         mr.memoryTypeBits = static_cast<std::uint32_t>(r.mem_type_bits);
-        g_buffer_reqs[r.buffer] = mr;
-        g_buffer_sizes[r.buffer] = pCreateInfo->size;
-        g_buffer_usages[r.buffer] = pCreateInfo->usage;
+        BufferInfo info;
+        info.requirements = mr;
+        info.size = pCreateInfo->size;
+        info.usage = pCreateInfo->usage;
+        g_buffers[r.buffer] = info;
         return VK_SUCCESS;
     } catch (const std::exception&) {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -4570,10 +4581,7 @@ VKAPI_ATTR void VKAPI_CALL DestroyBuffer(VkDevice, VkBuffer buffer, const VkAllo
         vkrpc::HandleRequest req;
         req.handle = from_handle(buffer);
         (void) vkrpc::destroy_buffer(*g_rpc, next_id(), req);
-        g_buffer_reqs.erase(from_handle(buffer));
-        g_buffer_sizes.erase(from_handle(buffer));
-        g_buffer_usages.erase(from_handle(buffer));
-        g_buffer_memory.erase(from_handle(buffer));
+        g_buffers.erase(from_handle(buffer));
     } catch (const std::exception&) {
     }
 }
@@ -4582,8 +4590,8 @@ VKAPI_ATTR void VKAPI_CALL GetBufferMemoryRequirements(VkDevice, VkBuffer buffer
                                                        VkMemoryRequirements* pRequirements) {
     // Pure copy of the requirements cached at vkCreateBuffer (this entrypoint is void).
     std::lock_guard<std::mutex> lk(g_mu);
-    const auto it = g_buffer_reqs.find(from_handle(buffer));
-    *pRequirements = it != g_buffer_reqs.end() ? it->second : VkMemoryRequirements{};
+    const auto it = g_buffers.find(from_handle(buffer));
+    *pRequirements = it != g_buffers.end() ? it->second.requirements : VkMemoryRequirements{};
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL BindBufferMemory(VkDevice, VkBuffer buffer, VkDeviceMemory memory,
@@ -4596,7 +4604,10 @@ VKAPI_ATTR VkResult VKAPI_CALL BindBufferMemory(VkDevice, VkBuffer buffer, VkDev
         req.memory_offset = static_cast<std::uint64_t>(memoryOffset);
         const vkrpc::StatusResponse r = vkrpc::bind_buffer_memory(*g_rpc, next_id(), req);
         if (r.ok) {
-            g_buffer_memory[from_handle(buffer)] = from_handle(memory); // query-readback lookup
+            const auto it = g_buffers.find(req.buffer);
+            if (it != g_buffers.end()) {
+                it->second.memory = req.memory;
+            }
         }
         return r.ok ? VK_SUCCESS : fault();
     } catch (const std::exception&) {
@@ -4778,8 +4789,9 @@ void fill_dedicated_reqs(void* pNext) {
 VKAPI_ATTR void VKAPI_CALL GetBufferMemoryRequirements2(
     VkDevice, const VkBufferMemoryRequirementsInfo2* pInfo, VkMemoryRequirements2* pOut) {
     std::lock_guard<std::mutex> lk(g_mu);
-    const auto it = g_buffer_reqs.find(from_handle(pInfo->buffer));
-    pOut->memoryRequirements = it != g_buffer_reqs.end() ? it->second : VkMemoryRequirements{};
+    const auto it = g_buffers.find(from_handle(pInfo->buffer));
+    pOut->memoryRequirements =
+        it != g_buffers.end() ? it->second.requirements : VkMemoryRequirements{};
     fill_dedicated_reqs(pOut->pNext);
 }
 VKAPI_ATTR void VKAPI_CALL GetImageMemoryRequirements2(VkDevice,
@@ -4802,7 +4814,10 @@ VKAPI_ATTR VkResult VKAPI_CALL BindBufferMemory2(VkDevice, std::uint32_t bindInf
             if (!vkrpc::bind_buffer_memory(*g_rpc, next_id(), req).ok) {
                 return fault();
             }
-            g_buffer_memory[req.buffer] = req.memory;
+            const auto it = g_buffers.find(req.buffer);
+            if (it != g_buffers.end()) {
+                it->second.memory = req.memory;
+            }
         }
         return VK_SUCCESS;
     } catch (const std::exception&) {
@@ -5178,9 +5193,9 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer
     // readback cost). Armed at vkQueueSubmit, promoted to downloadable at a PROVEN sync point
     // (record-time arming could deliver pre-copy bytes).
     std::lock_guard<std::mutex> lk(g_mu);
-    const auto it = g_buffer_memory.find(from_handle(dstBuffer));
-    if (it != g_buffer_memory.end()) {
-        cb->readback_dsts.push_back(it->second);
+    const auto it = g_buffers.find(from_handle(dstBuffer));
+    if (it != g_buffers.end() && it->second.memory != 0) {
+        cb->readback_dsts.push_back(it->second.memory);
     }
 }
 
@@ -6373,9 +6388,9 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyImageToBuffer(VkCommandBuffer commandBuffer, V
     // the CB -- the same surgical contract as CmdCopyQueryPoolResults above: armed at
     // vkQueueSubmit, promoted to downloadable at a PROVEN sync point.
     std::lock_guard<std::mutex> lk(g_mu);
-    const auto it = g_buffer_memory.find(from_handle(dstBuffer));
-    if (it != g_buffer_memory.end()) {
-        cb->readback_dsts.push_back(it->second);
+    const auto it = g_buffers.find(from_handle(dstBuffer));
+    if (it != g_buffers.end() && it->second.memory != 0) {
+        cb->readback_dsts.push_back(it->second.memory);
     }
 }
 
@@ -6400,9 +6415,9 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBuffer(VkCommandBuffer commandBuffer, VkBuffer
     // glGetBufferSubData staging). The same surgical contract as CmdCopyImageToBuffer: note
     // JUST that memory on the CB; armed at vkQueueSubmit, promoted at a PROVEN sync point.
     std::lock_guard<std::mutex> lk(g_mu);
-    const auto it = g_buffer_memory.find(from_handle(dstBuffer));
-    if (it != g_buffer_memory.end()) {
-        cb->readback_dsts.push_back(it->second);
+    const auto it = g_buffers.find(from_handle(dstBuffer));
+    if (it != g_buffers.end() && it->second.memory != 0) {
+        cb->readback_dsts.push_back(it->second.memory);
     }
 }
 
@@ -6423,9 +6438,9 @@ VKAPI_ATTR void VKAPI_CALL CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer
     c.args_u64.push_back(static_cast<std::uint64_t>(data));
     cb->recording.push_back(std::move(c));
     std::lock_guard<std::mutex> lk(g_mu);
-    const auto it = g_buffer_memory.find(from_handle(dstBuffer));
-    if (it != g_buffer_memory.end()) {
-        cb->readback_dsts.push_back(it->second);
+    const auto it = g_buffers.find(from_handle(dstBuffer));
+    if (it != g_buffers.end() && it->second.memory != 0) {
+        cb->readback_dsts.push_back(it->second.memory);
     }
 }
 
@@ -7288,14 +7303,20 @@ void record_core_indirect_draw(VkCommandBuffer commandBuffer, VkBuffer buffer, V
         return;
     }
     const std::uint64_t handle = from_handle(buffer);
-    const auto size_it = g_buffer_sizes.find(handle);
-    const auto usage_it = g_buffer_usages.find(handle);
-    const bool live = size_it != g_buffer_sizes.end() && usage_it != g_buffer_usages.end();
-    const bool bound = g_buffer_memory.find(handle) != g_buffer_memory.end();
-    const VkDeviceSize size = live ? size_it->second : 0;
-    const VkBufferUsageFlags usage = live ? usage_it->second : 0;
-    if (!vkr::icd_subset::draw_indirect_ok(live, bound, usage, size, offset, drawCount, stride,
-                                           indexed, cb->multi_draw_indirect_enabled, &why)) {
+    BufferInfo info;
+    bool live = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        const auto it = g_buffers.find(handle);
+        live = it != g_buffers.end();
+        if (live) {
+            info = it->second;
+        }
+    }
+    const bool bound = live && info.memory != 0;
+    if (!vkr::icd_subset::draw_indirect_ok(live, bound, info.usage, info.size, offset, drawCount,
+                                           stride, indexed, cb->multi_draw_indirect_enabled,
+                                           &why)) {
         cb->local_invalid = true;
         cb->invalid_reason = why;
         return;

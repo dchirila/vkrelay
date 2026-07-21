@@ -2154,32 +2154,77 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
         ext_ptrs.push_back(e.c_str());
     }
 
-    // enable the app's requested features intersected with the host's real support (so we
-    // never request an unsupported feature). enabled_feature_bits == 0 (legacy) -> no features, the
-    // prior behavior.
+    // Base features are normalized against both the host and the spelling that will actually reach
+    // vkCreateDevice. A Features2 chain owns the base members; otherwise pEnabledFeatures owns
+    // them. Never silently clamp an over-request: a hostile/skewed RPC must fail closed instead of
+    // creating a feature-OFF device while later command gates believe the feature is ON.
     VkPhysicalDeviceFeatures host_feats{};
     vkGetPhysicalDeviceFeatures(it->second.physical_vk, &host_feats);
     const std::uint64_t host_bits = vkrpc::pack_physical_device_features(host_feats);
-    const VkPhysicalDeviceFeatures enabled_feats =
-        vkrpc::unpack_physical_device_features(req.enabled_feature_bits & host_bits);
+    std::uint64_t enabled_base_bits = 0;
+    VkPhysicalDeviceFeatures enabled_feats{};
 
     // (GL/zink): rebuild the app's enabled-feature pNext chain (VkPhysicalDeviceFeatures2 +
     // Vulkan11/12/13 + ext feature structs) from the forwarded blobs and hang it off
-    // VkDeviceCreateInfo.pNext, so the real device enables exactly what the app requested. When the
-    // chain is present it carries the base features (via its Features2), so pEnabledFeatures must
-    // be null (Vulkan forbids both). When absent (vkcube path) use pEnabledFeatures from the base
-    // bits.
+    // VkDeviceCreateInfo.pNext, so the real device enables exactly what the app requested. A
+    // Features2 entry owns the base members and forbids pEnabledFeatures; an extension-only chain
+    // legally coexists with pEnabledFeatures.
     constexpr std::uint32_t kHeaderBytes = static_cast<std::uint32_t>(sizeof(VkBaseOutStructure));
     constexpr std::uint32_t kMaxFeatureStructBytes = 4096;
     std::vector<std::vector<unsigned char>> chain_bufs;
+    bool chain_has_features2 = false;
+    std::uint64_t chain_base_bits = 0;
     for (const vkrpc::CapabilityChainEntry& e : req.enabled_feature_chain) {
         if (e.size < kHeaderBytes || e.size > kMaxFeatureStructBytes || e.blob.size() < e.size) {
             resp.ok = false;
             resp.reason = "enabled-feature chain entry malformed";
             return resp;
         }
+        if (e.s_type == static_cast<std::uint32_t>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)) {
+            if (e.size != sizeof(VkPhysicalDeviceFeatures2) || chain_has_features2) {
+                resp.ok = false;
+                resp.reason = chain_has_features2
+                                  ? "enabled-feature chain contains duplicate Features2"
+                                  : "Features2 feature struct has a wrong size";
+                return resp;
+            }
+            VkPhysicalDeviceFeatures2 features2{};
+            std::memcpy(&features2, e.blob.data(), sizeof(features2));
+            chain_base_bits = vkrpc::pack_physical_device_features(features2.features);
+            chain_has_features2 = true;
+        }
         std::vector<unsigned char> buf(e.blob.begin(), e.blob.begin() + e.size);
         chain_bufs.push_back(std::move(buf));
+    }
+    if (chain_has_features2) {
+        if ((chain_base_bits & ~host_bits) != 0) {
+            resp.ok = false;
+            resp.reason = "Features2 enables a base feature the host does not support";
+            return resp;
+        }
+        // New ICDs declare the scalar mirror authoritative, so require exact agreement in both
+        // directions. Older ICDs left it zero when Features2 owned the base members; for those
+        // requests allow chain-only enables, but still reject the dangerous inverse where the
+        // scalar claims a bit that the actual host chain leaves disabled.
+        const bool scalar_mismatch = req.enabled_feature_bits_authoritative
+                                         ? req.enabled_feature_bits != chain_base_bits
+                                         : (req.enabled_feature_bits & ~chain_base_bits) != 0;
+        if (scalar_mismatch) {
+            resp.ok = false;
+            resp.reason = req.enabled_feature_bits_authoritative
+                              ? "base-feature scalar disagrees with the Features2 chain"
+                              : "base-feature scalar claims bits disabled in the Features2 chain";
+            return resp;
+        }
+        enabled_base_bits = chain_base_bits;
+    } else {
+        if ((req.enabled_feature_bits & ~host_bits) != 0) {
+            resp.ok = false;
+            resp.reason = "requested base feature is not supported by the host";
+            return resp;
+        }
+        enabled_base_bits = req.enabled_feature_bits;
+        enabled_feats = vkrpc::unpack_physical_device_features(enabled_base_bits);
     }
     // (bufferDeviceAddress): NORMALIZE the BDA feature state against the
     // forwarded chain BEFORE the host device becomes live -- the scalar request bit alone must
@@ -2754,11 +2799,11 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
     dci.enabledExtensionCount = static_cast<std::uint32_t>(ext_ptrs.size());
     dci.ppEnabledExtensionNames = ext_ptrs.data();
     if (!chain_bufs.empty()) {
-        dci.pNext = chain_bufs[0].data(); // the app's Features2 chain carries base + extended
-        dci.pEnabledFeatures = nullptr;   // forbidden alongside a Features2 in pNext
-    } else {
-        dci.pEnabledFeatures = &enabled_feats; // vkcube path: base features from the bitmask
+        dci.pNext = chain_bufs[0].data();
     }
+    // pEnabledFeatures is forbidden only when Features2 is present. An extension-only feature
+    // chain may legally coexist with the base struct and must not silently disable its bits.
+    dci.pEnabledFeatures = chain_has_features2 ? nullptr : &enabled_feats;
     // cross-adapter retirement: chain the swapchainMaintenance1 ENABLE struct. Prepending
     // works for both branches (an extension feature struct is legal alongside pEnabledFeatures;
     // only a second VkPhysicalDeviceFeatures2 would conflict).
@@ -2806,7 +2851,7 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
     // enabled; core-1.1 props2 is safe (the worker instance requests >= 1.1 on this host path).
     rd.geometry_streams_feature_enabled = geometry_streams_enabled;
     rd.multi_draw_indirect_feature_enabled =
-        (req.enabled_feature_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
+        (enabled_base_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
     if (rd.enabled_extensions.count(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME) != 0) {
         VkPhysicalDeviceTransformFeedbackPropertiesEXT tf_props{};
         tf_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT;
