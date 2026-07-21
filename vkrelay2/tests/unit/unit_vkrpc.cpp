@@ -2974,6 +2974,95 @@ struct MockDrawFixture {
     }
 };
 
+struct MockTestBuffer {
+    std::uint64_t buffer = 0;
+    std::uint64_t memory = 0;
+};
+
+MockTestBuffer make_mock_test_buffer(vkrpc::MockVulkanBackend& backend, std::uint64_t device,
+                                     const vkrpc::GetPhysicalDeviceMemoryPropertiesResponse& props,
+                                     std::uint64_t usage, bool bind, std::uint64_t size = 64) {
+    vkrpc::CreateBufferRequest request;
+    request.device = device;
+    request.size = size;
+    request.usage = usage;
+    request.sharing_mode = 0;
+    const auto created = backend.create_buffer(request);
+    VKR_CHECK(created.ok);
+    MockTestBuffer result{created.buffer, 0};
+    if (!bind) {
+        return result;
+    }
+    int type = -1;
+    for (std::size_t i = 0; i < props.types.size() && i < 32; ++i) {
+        if ((created.mem_type_bits & (std::uint64_t{1} << i)) != 0) {
+            type = static_cast<int>(i);
+            break;
+        }
+    }
+    VKR_CHECK(type >= 0);
+    vkrpc::AllocateMemoryRequest allocate;
+    allocate.device = device;
+    allocate.allocation_size = created.mem_size;
+    allocate.memory_type_index = type;
+    const auto memory = backend.allocate_memory(allocate);
+    VKR_CHECK(memory.ok);
+    vkrpc::BindBufferMemoryRequest bind_request;
+    bind_request.buffer = created.buffer;
+    bind_request.memory = memory.memory;
+    VKR_CHECK(backend.bind_buffer_memory(bind_request).ok);
+    result.memory = memory.memory;
+    return result;
+}
+
+void destroy_mock_test_buffer(vkrpc::MockVulkanBackend& backend, const MockTestBuffer& buffer,
+                              bool already_destroyed = false) {
+    if (buffer.buffer != 0 && !already_destroyed) {
+        VKR_CHECK(backend.destroy_buffer({buffer.buffer}).ok);
+    }
+    if (buffer.memory != 0) {
+        VKR_CHECK(backend.free_memory({buffer.memory}).ok);
+    }
+}
+
+vkrpc::StatusResponse record_mock_draw(vkrpc::MockVulkanBackend& backend,
+                                       const MockDrawFixture& fixture, vkrpc::RecordedCommand draw,
+                                       std::uint64_t index_buffer = 0) {
+    vkrpc::RecordedCommand begin;
+    begin.kind = "begin_render_pass";
+    begin.render_pass = fixture.render_pass.render_pass;
+    begin.framebuffer = fixture.framebuffer.framebuffer;
+    begin.render_area_w = fixture.extent;
+    begin.render_area_h = fixture.extent;
+    vkrpc::RecordedCommand bind;
+    bind.kind = "bind_pipeline";
+    bind.pipeline = fixture.pipeline.pipeline;
+    vkrpc::RecordedCommand viewport;
+    viewport.kind = "set_viewport";
+    viewport.vp_w = fixture.extent;
+    viewport.vp_h = fixture.extent;
+    viewport.vp_max_depth = 1;
+    vkrpc::RecordedCommand scissor;
+    scissor.kind = "set_scissor";
+    scissor.sc_w = fixture.extent;
+    scissor.sc_h = fixture.extent;
+    vkrpc::RecordedCommand end;
+    end.kind = "end_render_pass";
+    vkrpc::RecordCommandBufferRequest request;
+    request.command_buffer = fixture.command_buffer;
+    request.commands = {begin, bind, viewport, scissor};
+    if (index_buffer != 0) {
+        vkrpc::RecordedCommand bind_index;
+        bind_index.kind = "bind_index_buffer";
+        bind_index.args_u64 = {index_buffer, 0};
+        bind_index.args_i64 = {0};
+        request.commands.push_back(std::move(bind_index));
+    }
+    request.commands.push_back(std::move(draw));
+    request.commands.push_back(std::move(end));
+    return backend.record_command_buffer(request);
+}
+
 // Core indirect draws need full draw readiness in addition to their buffer/stride/range rules.
 // Build the smallest real mock object graph twice so both feature states are exercised at the
 // backend boundary (the pure ICD/shared predicate has its own exhaustive pins).
@@ -3002,47 +3091,13 @@ void test_core_indirect_draw_mock_case(bool multi_draw_indirect) {
     mpr.physical_device = phys;
     const auto memory_props = backend.get_physical_device_memory_properties(mpr);
     VKR_CHECK(memory_props.ok);
-    struct TestBuffer {
-        std::uint64_t buffer = 0;
-        std::uint64_t memory = 0;
-    };
     auto make_buffer = [&](std::uint64_t usage, bool bind) {
-        vkrpc::CreateBufferRequest req;
-        req.device = cd.device;
-        req.size = 64;
-        req.usage = usage;
-        req.sharing_mode = 0;
-        const auto created = backend.create_buffer(req);
-        VKR_CHECK(created.ok);
-        TestBuffer result{created.buffer, 0};
-        if (!bind) {
-            return result;
-        }
-        int type = -1;
-        for (std::size_t i = 0; i < memory_props.types.size() && i < 32; ++i) {
-            if ((created.mem_type_bits & (std::uint64_t{1} << i)) != 0) {
-                type = static_cast<int>(i);
-                break;
-            }
-        }
-        VKR_CHECK(type >= 0);
-        vkrpc::AllocateMemoryRequest amr;
-        amr.device = cd.device;
-        amr.allocation_size = created.mem_size;
-        amr.memory_type_index = type;
-        const auto memory = backend.allocate_memory(amr);
-        VKR_CHECK(memory.ok);
-        vkrpc::BindBufferMemoryRequest bmr;
-        bmr.buffer = created.buffer;
-        bmr.memory = memory.memory;
-        VKR_CHECK(backend.bind_buffer_memory(bmr).ok);
-        result.memory = memory.memory;
-        return result;
+        return make_mock_test_buffer(backend, cd.device, memory_props, usage, bind);
     };
-    const TestBuffer indirect = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
-    const TestBuffer wrong_usage = make_buffer(vkrpc::kBufferUsageVertexBuffer, true);
-    const TestBuffer index = make_buffer(vkrpc::kBufferUsageIndexBuffer, true);
-    const TestBuffer unbound = make_buffer(vkrpc::kBufferUsageIndirectBuffer, false);
+    const MockTestBuffer indirect = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
+    const MockTestBuffer wrong_usage = make_buffer(vkrpc::kBufferUsageVertexBuffer, true);
+    const MockTestBuffer index = make_buffer(vkrpc::kBufferUsageIndexBuffer, true);
+    const MockTestBuffer unbound = make_buffer(vkrpc::kBufferUsageIndirectBuffer, false);
 
     auto indirect_command = [&](bool indexed, std::uint64_t buffer, std::uint64_t offset,
                                 long long count, long long stride) {
@@ -3055,39 +3110,7 @@ void test_core_indirect_draw_mock_case(bool multi_draw_indirect) {
         return c;
     };
     auto record = [&](vkrpc::RecordedCommand draw, bool bind_index) {
-        vkrpc::RecordedCommand begin;
-        begin.kind = "begin_render_pass";
-        begin.render_pass = render_pass.render_pass;
-        begin.framebuffer = framebuffer.framebuffer;
-        begin.render_area_w = 64;
-        begin.render_area_h = 64;
-        vkrpc::RecordedCommand bind;
-        bind.kind = "bind_pipeline";
-        bind.pipeline = pipeline.pipeline;
-        vkrpc::RecordedCommand viewport;
-        viewport.kind = "set_viewport";
-        viewport.vp_w = 64;
-        viewport.vp_h = 64;
-        viewport.vp_max_depth = 1;
-        vkrpc::RecordedCommand scissor;
-        scissor.kind = "set_scissor";
-        scissor.sc_w = 64;
-        scissor.sc_h = 64;
-        vkrpc::RecordedCommand bind_ib;
-        bind_ib.kind = "bind_index_buffer";
-        bind_ib.args_u64 = {index.buffer, 0};
-        bind_ib.args_i64 = {0};
-        vkrpc::RecordedCommand end;
-        end.kind = "end_render_pass";
-        vkrpc::RecordCommandBufferRequest req;
-        req.command_buffer = command_buffer;
-        req.commands = {begin, bind, viewport, scissor};
-        if (bind_index) {
-            req.commands.push_back(bind_ib);
-        }
-        req.commands.push_back(std::move(draw));
-        req.commands.push_back(end);
-        return backend.record_command_buffer(req);
+        return record_mock_draw(backend, fixture, std::move(draw), bind_index ? index.buffer : 0);
     };
 
     VKR_CHECK(record(indirect_command(false, indirect.buffer, 0, 1, 16), false).ok);
@@ -3130,18 +3153,10 @@ void test_core_indirect_draw_mock_case(bool multi_draw_indirect) {
     submit.command_buffers = {command_buffer};
     VKR_CHECK(!backend.queue_submit(submit).ok);
 
-    auto destroy_buffer = [&](const TestBuffer& buffer) {
-        if (buffer.buffer != indirect.buffer) {
-            VKR_CHECK(backend.destroy_buffer({buffer.buffer}).ok);
-        }
-        if (buffer.memory != 0) {
-            VKR_CHECK(backend.free_memory({buffer.memory}).ok);
-        }
-    };
-    destroy_buffer(indirect);
-    destroy_buffer(wrong_usage);
-    destroy_buffer(index);
-    destroy_buffer(unbound);
+    destroy_mock_test_buffer(backend, indirect, /*already_destroyed=*/true);
+    destroy_mock_test_buffer(backend, wrong_usage);
+    destroy_mock_test_buffer(backend, index);
+    destroy_mock_test_buffer(backend, unbound);
     VKR_CHECK(backend.destroy_pipeline({pipeline.pipeline}).ok);
     VKR_CHECK(backend.destroy_pipeline_layout({layout.pipeline_layout}).ok);
     VKR_CHECK(backend.destroy_framebuffer({framebuffer.framebuffer}).ok);
@@ -3162,6 +3177,19 @@ void test_core_indirect_draw_mock() {
 }
 
 void test_core_indirect_count_validation() {
+    bool scalar_enabled = false;
+    std::string scalar_reason;
+    VKR_CHECK(vkrpc::decode_three_state_scalar(vkrpc::kThreeStateScalarOmitted, true, "field",
+                                               scalar_enabled, scalar_reason) &&
+              scalar_enabled);
+    VKR_CHECK(vkrpc::decode_three_state_scalar(0, true, "field", scalar_enabled, scalar_reason) &&
+              !scalar_enabled);
+    VKR_CHECK(vkrpc::decode_three_state_scalar(1, false, "field", scalar_enabled, scalar_reason) &&
+              scalar_enabled);
+    VKR_CHECK(!vkrpc::decode_three_state_scalar(vkrpc::kThreeStateScalarInvalid, false, "field",
+                                                scalar_enabled, scalar_reason));
+    VKR_CHECK(scalar_reason.find("field must be 0 or 1") != std::string::npos);
+
     const vkrpc::IndirectBufferState good{true, true, true, 64};
     const char* why = "";
     const auto ok = [&](bool enabled, vkrpc::IndirectBufferState main,
@@ -3220,50 +3248,16 @@ void test_core_indirect_count_draw_mock_case(bool enabled) {
     mpr.physical_device = fixture.physical_device;
     const auto memory_props = backend.get_physical_device_memory_properties(mpr);
     VKR_CHECK(memory_props.ok);
-    struct TestBuffer {
-        std::uint64_t buffer = 0;
-        std::uint64_t memory = 0;
-    };
     auto make_buffer = [&](std::uint64_t usage, bool bind) {
-        vkrpc::CreateBufferRequest req;
-        req.device = fixture.device.device;
-        req.size = 64;
-        req.usage = usage;
-        req.sharing_mode = 0;
-        const auto made = backend.create_buffer(req);
-        VKR_CHECK(made.ok);
-        TestBuffer result{made.buffer, 0};
-        if (!bind) {
-            return result;
-        }
-        int type = -1;
-        for (std::size_t i = 0; i < memory_props.types.size() && i < 32; ++i) {
-            if ((made.mem_type_bits & (std::uint64_t{1} << i)) != 0) {
-                type = static_cast<int>(i);
-                break;
-            }
-        }
-        VKR_CHECK(type >= 0);
-        vkrpc::AllocateMemoryRequest ar;
-        ar.device = fixture.device.device;
-        ar.allocation_size = made.mem_size;
-        ar.memory_type_index = type;
-        const auto memory = backend.allocate_memory(ar);
-        VKR_CHECK(memory.ok);
-        vkrpc::BindBufferMemoryRequest br;
-        br.buffer = made.buffer;
-        br.memory = memory.memory;
-        VKR_CHECK(backend.bind_buffer_memory(br).ok);
-        result.memory = memory.memory;
-        return result;
+        return make_mock_test_buffer(backend, fixture.device.device, memory_props, usage, bind);
     };
-    const TestBuffer main0 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
-    const TestBuffer count0 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
-    const TestBuffer main1 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
-    const TestBuffer count1 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
-    const TestBuffer wrong = make_buffer(vkrpc::kBufferUsageVertexBuffer, true);
-    const TestBuffer unbound = make_buffer(vkrpc::kBufferUsageIndirectBuffer, false);
-    const TestBuffer index = make_buffer(vkrpc::kBufferUsageIndexBuffer, true);
+    const MockTestBuffer main0 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
+    const MockTestBuffer count0 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
+    const MockTestBuffer main1 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
+    const MockTestBuffer count1 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
+    const MockTestBuffer wrong = make_buffer(vkrpc::kBufferUsageVertexBuffer, true);
+    const MockTestBuffer unbound = make_buffer(vkrpc::kBufferUsageIndirectBuffer, false);
+    const MockTestBuffer index = make_buffer(vkrpc::kBufferUsageIndexBuffer, true);
 
     auto draw = [&](bool indexed, std::uint64_t main, std::uint64_t count,
                     std::uint64_t count_offset = 0) {
@@ -3273,39 +3267,7 @@ void test_core_indirect_count_draw_mock_case(bool enabled) {
         return c;
     };
     auto record = [&](vkrpc::RecordedCommand d, bool bind_index) {
-        vkrpc::RecordedCommand begin;
-        begin.kind = "begin_render_pass";
-        begin.render_pass = fixture.render_pass.render_pass;
-        begin.framebuffer = fixture.framebuffer.framebuffer;
-        begin.render_area_w = 64;
-        begin.render_area_h = 64;
-        vkrpc::RecordedCommand bind;
-        bind.kind = "bind_pipeline";
-        bind.pipeline = fixture.pipeline.pipeline;
-        vkrpc::RecordedCommand viewport;
-        viewport.kind = "set_viewport";
-        viewport.vp_w = 64;
-        viewport.vp_h = 64;
-        viewport.vp_max_depth = 1;
-        vkrpc::RecordedCommand scissor;
-        scissor.kind = "set_scissor";
-        scissor.sc_w = 64;
-        scissor.sc_h = 64;
-        vkrpc::RecordedCommand ib;
-        ib.kind = "bind_index_buffer";
-        ib.args_u64 = {index.buffer, 0};
-        ib.args_i64 = {0};
-        vkrpc::RecordedCommand end;
-        end.kind = "end_render_pass";
-        vkrpc::RecordCommandBufferRequest req;
-        req.command_buffer = fixture.command_buffer;
-        req.commands = {begin, bind, viewport, scissor};
-        if (bind_index) {
-            req.commands.push_back(ib);
-        }
-        req.commands.push_back(std::move(d));
-        req.commands.push_back(end);
-        return backend.record_command_buffer(req);
+        return record_mock_draw(backend, fixture, std::move(d), bind_index ? index.buffer : 0);
     };
 
     if (!enabled) {
@@ -3336,23 +3298,13 @@ void test_core_indirect_count_draw_mock_case(bool enabled) {
         VKR_CHECK(!backend.queue_submit(submit).ok);
     }
 
-    const auto destroy_buffer = [&](const TestBuffer& b) {
-        const bool already_destroyed =
-            enabled && (b.buffer == count0.buffer || b.buffer == main1.buffer);
-        if (b.buffer != 0 && !already_destroyed) {
-            VKR_CHECK(backend.destroy_buffer({b.buffer}).ok);
-        }
-        if (b.memory != 0) {
-            VKR_CHECK(backend.free_memory({b.memory}).ok);
-        }
-    };
-    destroy_buffer(main0);
-    destroy_buffer(count0);
-    destroy_buffer(main1);
-    destroy_buffer(count1);
-    destroy_buffer(wrong);
-    destroy_buffer(unbound);
-    destroy_buffer(index);
+    destroy_mock_test_buffer(backend, main0);
+    destroy_mock_test_buffer(backend, count0, enabled);
+    destroy_mock_test_buffer(backend, main1, enabled);
+    destroy_mock_test_buffer(backend, count1);
+    destroy_mock_test_buffer(backend, wrong);
+    destroy_mock_test_buffer(backend, unbound);
+    destroy_mock_test_buffer(backend, index);
     VKR_CHECK(backend.destroy_pipeline({fixture.pipeline.pipeline}).ok);
     VKR_CHECK(backend.destroy_pipeline_layout({fixture.pipeline_layout.pipeline_layout}).ok);
     VKR_CHECK(backend.destroy_framebuffer({fixture.framebuffer.framebuffer}).ok);

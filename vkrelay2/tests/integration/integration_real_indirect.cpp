@@ -543,46 +543,48 @@ int main() {
     if (count_supported) {
         // Real-backend negative admission checks: the shared predicate is reached after full draw
         // readiness and rejects every count-buffer class before a host command is recorded.
-        const auto dead = record_draw(counted_draw(0xDEAD, 0, 2));
-        VKR_CHECK(!dead.ok && dead.reason.find("not live") != std::string::npos);
-        const auto not_bound = record_draw(counted_draw(unbound_count.buffer, 0, 2));
-        VKR_CHECK(!not_bound.ok && not_bound.reason.find("not bound") != std::string::npos);
-        const auto wrong_usage = record_draw(counted_draw(vertex.buffer, 0, 2));
-        VKR_CHECK(!wrong_usage.ok &&
-                  wrong_usage.reason.find("INDIRECT_BUFFER") != std::string::npos);
-        const auto misaligned = record_draw(counted_draw(count_one.buffer, 2, 2));
-        VKR_CHECK(!misaligned.ok && misaligned.reason.find("aligned") != std::string::npos);
-        const auto out_of_range = record_draw(counted_draw(count_one.buffer, 4, 2));
-        VKR_CHECK(!out_of_range.ok && out_of_range.reason.find("count slot") != std::string::npos);
+        struct NegativeCase {
+            std::uint64_t count_buffer;
+            std::uint64_t offset;
+            const char* reason;
+        };
+        const NegativeCase negative_cases[] = {
+            {0xDEAD, 0, "not live"},
+            {unbound_count.buffer, 0, "not bound"},
+            {vertex.buffer, 0, "INDIRECT_BUFFER"},
+            {count_one.buffer, 2, "aligned"},
+            {count_one.buffer, 4, "count slot"},
+        };
+        for (const NegativeCase& test : negative_cases) {
+            const auto rejected = record_draw(counted_draw(test.count_buffer, test.offset, 2));
+            VKR_CHECK(!rejected.ok && rejected.reason.find(test.reason) != std::string::npos);
+        }
 
-        reset_fence();
-        const std::string count_one_pixels = render(counted_draw(count_one.buffer, 0, 2));
-        VKR_CHECK(pixel(count_one_pixels, 16, 32, 0) > 200 &&
-                  pixel(count_one_pixels, 16, 32, 1) < 40);
-        VKR_CHECK(pixel(count_one_pixels, 48, 32, 0) < 40 &&
-                  pixel(count_one_pixels, 48, 32, 1) < 40);
-
-        reset_fence();
-        const std::string count_two_pixels = render(counted_draw(count_two.buffer, 0, 2));
-        VKR_CHECK(pixel(count_two_pixels, 16, 32, 0) > 200 &&
-                  pixel(count_two_pixels, 16, 32, 1) < 40);
-        VKR_CHECK(pixel(count_two_pixels, 48, 32, 0) < 40 &&
-                  pixel(count_two_pixels, 48, 32, 1) > 200);
-
-        reset_fence();
-        const std::string clamped_pixels = render(counted_draw(count_two.buffer, 0, 1));
-        VKR_CHECK(pixel(clamped_pixels, 16, 32, 0) > 200 && pixel(clamped_pixels, 16, 32, 1) < 40);
-        VKR_CHECK(pixel(clamped_pixels, 48, 32, 0) < 40 && pixel(clamped_pixels, 48, 32, 1) < 40);
-
-        reset_fence();
-        const std::string zero_pixels = render(counted_draw(count_zero.buffer, 0, 2));
-        VKR_CHECK(pixel(zero_pixels, 16, 32, 0) < 40 && pixel(zero_pixels, 16, 32, 1) < 40);
-        VKR_CHECK(pixel(zero_pixels, 48, 32, 0) < 40 && pixel(zero_pixels, 48, 32, 1) < 40);
-
-        reset_fence();
-        const std::string offset_pixels = render(counted_draw(count_offset.buffer, 8, 2));
-        VKR_CHECK(pixel(offset_pixels, 16, 32, 0) > 200 && pixel(offset_pixels, 16, 32, 1) < 40);
-        VKR_CHECK(pixel(offset_pixels, 48, 32, 0) < 40 && pixel(offset_pixels, 48, 32, 1) < 40);
+        struct PixelCase {
+            std::uint64_t count_buffer;
+            std::uint64_t offset;
+            long long max_draw_count;
+            bool left_red;
+            bool right_green;
+        };
+        const PixelCase pixel_cases[] = {
+            {count_one.buffer, 0, 2, true, false},    {count_two.buffer, 0, 2, true, true},
+            {count_two.buffer, 0, 1, true, false},    {count_zero.buffer, 0, 2, false, false},
+            {count_offset.buffer, 8, 2, true, false},
+        };
+        for (const PixelCase& test : pixel_cases) {
+            reset_fence();
+            const std::string pixels =
+                render(counted_draw(test.count_buffer, test.offset, test.max_draw_count));
+            const bool left_matches =
+                test.left_red ? pixel(pixels, 16, 32, 0) > 200 && pixel(pixels, 16, 32, 1) < 40
+                              : pixel(pixels, 16, 32, 0) < 40 && pixel(pixels, 16, 32, 1) < 40;
+            const bool right_matches =
+                test.right_green ? pixel(pixels, 48, 32, 0) < 40 && pixel(pixels, 48, 32, 1) > 200
+                                 : pixel(pixels, 48, 32, 0) < 40 && pixel(pixels, 48, 32, 1) < 40;
+            VKR_CHECK(left_matches);
+            VKR_CHECK(right_matches);
+        }
         std::fprintf(stderr, "integration_real_indirect: indexed indirect-count pixels verified "
                              "(count 0/1/2, max clamp, offset-8 decoy)\n");
     } else {

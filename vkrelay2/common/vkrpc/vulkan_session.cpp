@@ -688,6 +688,13 @@ int get_int(const json::Value& obj, const std::string& key, int fallback) {
     const json::Value* v = obj.find(key);
     return (v != nullptr && v->is_integer()) ? static_cast<int>(v->as_int()) : fallback;
 }
+int get_three_state_scalar(const json::Value& obj, const std::string& key) {
+    if (obj.find(key) == nullptr) {
+        return kThreeStateScalarOmitted;
+    }
+    const int value = get_int(obj, key, kThreeStateScalarInvalid);
+    return value == 0 || value == 1 ? value : kThreeStateScalarInvalid;
+}
 long long get_i64(const json::Value& obj, const std::string& key, long long fallback) {
     const json::Value* v = obj.find(key);
     return (v != nullptr && v->is_integer()) ? v->as_int() : fallback;
@@ -1618,20 +1625,9 @@ CreateDeviceRequest CreateDeviceRequest::from_body(const json::Value& body) {
     // (a forged -1 claiming legacy status, a wrong type, out-of-range) decodes INVALID and
     // create_device rejects it by name -- a hostile client cannot transmit its way past the
     // scalar/chain agreement check.
-    if (body.find("geometry_streams_feature_enabled") == nullptr) {
-        r.geometry_streams_feature_enabled = kGeometryStreamsScalarOmitted;
-    } else {
-        const int gs_v = get_int(body, "geometry_streams_feature_enabled",
-                                 kGeometryStreamsScalarInvalid); // wrong type -> invalid
-        r.geometry_streams_feature_enabled =
-            (gs_v == 0 || gs_v == 1) ? gs_v : kGeometryStreamsScalarInvalid;
-    }
-    if (body.find("draw_indirect_count_enabled") == nullptr) {
-        r.draw_indirect_count_enabled = kDrawIndirectCountScalarOmitted;
-    } else {
-        const int v = get_int(body, "draw_indirect_count_enabled", kDrawIndirectCountScalarInvalid);
-        r.draw_indirect_count_enabled = (v == 0 || v == 1) ? v : kDrawIndirectCountScalarInvalid;
-    }
+    r.geometry_streams_feature_enabled =
+        get_three_state_scalar(body, "geometry_streams_feature_enabled");
+    r.draw_indirect_count_enabled = get_three_state_scalar(body, "draw_indirect_count_enabled");
     r.descriptor_indexing_feature_bits = get_handle(body, "descriptor_indexing_feature_bits");
     r.vk13_feature_bits = get_handle(body, "vk13_feature_bits");
     r.vk13_device_enabled = get_int(body, "vk13_device_enabled", 0);
@@ -2877,13 +2873,14 @@ std::string RecordCommandBufferRequest::to_wire() const {
         if (!c.deps2.empty()) {
             mask |= kRecDeps2;
         }
-        const CmdKind kind = recorded_command_kind(c);
-        const bool count_kind =
-            kind == CmdKind::DrawIndirectCount || kind == CmdKind::DrawIndexedIndirectCount;
-        if (count_kind || c.indirect_draw_count != -1 || c.indirect_stride != -1) {
+        // The producer hint and dedicated fields are sufficient to select the frozen indirect
+        // groups; avoid hashing every ordinary command kind on this per-frame serialization path.
+        const bool count_payload = c.indirect_counted || c.indirect_count_buffer != 0 ||
+                                   c.indirect_count_buffer_offset != 0;
+        if (count_payload || c.indirect_draw_count != -1 || c.indirect_stride != -1) {
             mask |= kRecIndirectDraw;
         }
-        if (count_kind || c.indirect_count_buffer != 0 || c.indirect_count_buffer_offset != 0) {
+        if (count_payload) {
             mask |= kRecIndirectCount;
         }
         wire_put_str(out, recorded_command_kind_name(c));
@@ -3169,18 +3166,22 @@ RecordCommandBufferRequest RecordCommandBufferRequest::from_wire(const std::stri
             c.indirect_count_buffer = rd.get_u64();
             c.indirect_count_buffer_offset = rd.get_u64();
         }
-        const CmdKind decoded_kind = cmd_kind_from_string(c.kind);
-        const bool count_kind = decoded_kind == CmdKind::DrawIndirectCount ||
-                                decoded_kind == CmdKind::DrawIndexedIndirectCount;
-        const bool base_indirect_kind =
-            decoded_kind == CmdKind::DrawIndirect || decoded_kind == CmdKind::DrawIndexedIndirect;
-        if (base_indirect_kind && (mask & kRecIndirectCount) != 0) {
-            err = "base indirect draw carries count-only field group";
-            return RecordCommandBufferRequest{};
-        }
-        if (count_kind && ((mask & kRecIndirectDraw) == 0 || (mask & kRecIndirectCount) == 0)) {
-            err = "indirect-count draw is missing required field groups";
-            return RecordCommandBufferRequest{};
+        if ((mask & (kRecIndirectDraw | kRecIndirectCount)) != 0) {
+            // Only indirect records need kind-aware group-shape policing. Ordinary commands avoid
+            // the string hash entirely on this per-frame decode path.
+            const CmdKind decoded_kind = cmd_kind_from_string(c.kind);
+            const bool count_kind = decoded_kind == CmdKind::DrawIndirectCount ||
+                                    decoded_kind == CmdKind::DrawIndexedIndirectCount;
+            const bool base_indirect_kind = decoded_kind == CmdKind::DrawIndirect ||
+                                            decoded_kind == CmdKind::DrawIndexedIndirect;
+            if (base_indirect_kind && (mask & kRecIndirectCount) != 0) {
+                err = "base indirect draw carries count-only field group";
+                return RecordCommandBufferRequest{};
+            }
+            if (count_kind && ((mask & kRecIndirectDraw) == 0 || (mask & kRecIndirectCount) == 0)) {
+                err = "indirect-count draw is missing required field groups";
+                return RecordCommandBufferRequest{};
+            }
         }
         r.commands.push_back(std::move(c));
     }
@@ -6249,47 +6250,43 @@ CreateDeviceResponse MockVulkanBackend::create_device(const CreateDeviceRequest&
     dev.vertex_attr_zero_divisor_feature_enabled =
         req.vertex_attr_zero_divisor_feature_enabled != 0;
     // geometry-stream: the scalar oracle (the WORKER re-derives from the chain + agreement-checks;
-    // the mock records the scalar, like multiview/divisor). `> 0` deliberately --
-    // the -1 omitted sentinel (an older ICD has no scalar) reads as DISABLED here because the
-    // mock does not interpret feature-chain blobs; the real worker is the derive-from-chain site.
+    // the mock records the scalar, like multiview/divisor). The shared three-state decoder gets a
+    // false derived value deliberately: an older ICD's omitted scalar reads as DISABLED here
+    // because the mock does not interpret feature-chain blobs; the real worker is the
+    // derive-from-chain site.
     // The structural extension invariant IS mirrored (mock == real): a true scalar without
     // VK_EXT_transform_feedback is self-contradictory and rejects by the worker's exact reason.
     // (mirrored too): out-of-domain scalar values -- including the INVALID (-2) that a
     // forged/transmitted -1 decodes to -- reject by the worker's exact reason before anything else.
-    if (req.geometry_streams_feature_enabled != kGeometryStreamsScalarOmitted &&
-        req.geometry_streams_feature_enabled != 0 && req.geometry_streams_feature_enabled != 1) {
+    bool geometry_streams_enabled = false;
+    if (!decode_three_state_scalar(req.geometry_streams_feature_enabled, /*derived=*/false,
+                                   "geometry_streams_feature_enabled", geometry_streams_enabled,
+                                   resp.reason)) {
         resp.ok = false;
-        resp.reason = "geometry_streams_feature_enabled must be 0 or 1 when present (omission "
-                      "is wire-key absence, not a transmittable value)";
         it->second.devices.erase(device);
         return resp;
     }
-    if (req.geometry_streams_feature_enabled > 0 &&
-        dev.enabled_exts.count(kTransformFeedbackExtensionName) == 0) {
+    if (geometry_streams_enabled && dev.enabled_exts.count(kTransformFeedbackExtensionName) == 0) {
         resp.ok = false;
         resp.reason = "geometryStreams enabled without VK_EXT_transform_feedback";
         it->second.devices.erase(device);
         return resp;
     }
-    dev.geometry_streams_feature_enabled = req.geometry_streams_feature_enabled > 0;
+    dev.geometry_streams_feature_enabled = geometry_streams_enabled;
     dev.multi_draw_indirect_feature_enabled =
         (req.enabled_feature_bits & kFeatureMultiDrawIndirect) != 0;
-    if (req.draw_indirect_count_enabled != kDrawIndirectCountScalarOmitted &&
-        req.draw_indirect_count_enabled != 0 && req.draw_indirect_count_enabled != 1) {
-        resp.ok = false;
-        resp.reason = "draw_indirect_count_enabled must be 0 or 1 when present (omission is "
-                      "wire-key absence, not a transmittable value)";
-        it->second.devices.erase(device);
-        return resp;
-    }
     // Vulkan-free mock policy: it does not interpret ABI-dependent Vulkan12Features blobs. New
     // ICDs always send the explicit scalar; for an old-ICD omitted scalar, derive the only fact
     // this oracle owns -- whether the featureless KHR extension was enabled. The real worker
     // additionally derives and host-validates the promoted f12 feature path.
-    dev.draw_indirect_count_enabled =
-        req.draw_indirect_count_enabled < 0
-            ? dev.enabled_exts.count(kDrawIndirectCountExtensionName) != 0
-            : req.draw_indirect_count_enabled != 0;
+    if (!decode_three_state_scalar(req.draw_indirect_count_enabled,
+                                   dev.enabled_exts.count(kDrawIndirectCountExtensionName) != 0,
+                                   "draw_indirect_count_enabled", dev.draw_indirect_count_enabled,
+                                   resp.reason)) {
+        resp.ok = false;
+        it->second.devices.erase(device);
+        return resp;
+    }
     // descriptorIndexing: CreateDevice POLICY clamps to the SERVED buffer-only
     // subset -- a deferred-but-known bit (an image/texel UAB class) is rejected exactly like an
     // unknown one, so a skewed/custom client can never enable an unproven class past the ICD.

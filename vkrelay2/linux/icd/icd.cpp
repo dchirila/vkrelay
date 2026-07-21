@@ -2045,7 +2045,21 @@ VKAPI_ATTR VkBool32 VKAPI_CALL GetPhysicalDeviceXlibPresentationSupportKHR(VkPhy
 // worker further intersects this with the real host support at create_device. Grow this list one
 // wired extension at a time as the GL proof ladder demands. (maintenance1 is zink's flipped-Y
 // baseline.)
-const char* const kDeviceExtAllowlist[] = {
+enum class RequiredWorkerCapability : unsigned char {
+    None,
+    CoreIndirectDrawCount,
+};
+
+struct DeviceExtensionRule {
+    const char* name = nullptr;
+    RequiredWorkerCapability required_worker_capability = RequiredWorkerCapability::None;
+
+    constexpr DeviceExtensionRule(const char* extension_name, RequiredWorkerCapability required =
+                                                                  RequiredWorkerCapability::None)
+        : name(extension_name), required_worker_capability(required) {}
+};
+
+const DeviceExtensionRule kDeviceExtAllowlist[] = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     VK_KHR_MAINTENANCE1_EXTENSION_NAME,
     VK_KHR_MAINTENANCE2_EXTENSION_NAME,
@@ -2116,7 +2130,7 @@ const char* const kDeviceExtAllowlist[] = {
     VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
     // Featureless promoted extension. Unlike legacy allowlist entries, advertisement also needs
     // the additive worker vocabulary bit; an empty old-worker host list must not uncap it.
-    VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME,
+    {VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME, RequiredWorkerCapability::CoreIndirectDrawCount},
     // (GL/zink): VK_EXT_extended_dynamic_state(2) stays DELIBERATELY NOT advertised -- it
     // pulls zink onto the dynamic-state command surface (vkCmdSetCullMode / SetPatchControlPoints
     // ...) for EVERY pipeline. Without it (and on a reported 1.2 device, where it is not core),
@@ -2152,25 +2166,32 @@ constexpr std::uint32_t kNativeLaneDeviceExtAllowlistCount = static_cast<std::ui
 std::vector<const char*> advertised_device_extensions(const PhysicalDeviceImpl* pd) {
     std::vector<const char*> out;
     out.reserve(kDeviceExtAllowlistCount + kNativeLaneDeviceExtAllowlistCount);
-    const auto host_has = [&](const char* name) {
-        return pd->host_device_extensions.empty() ||
-               std::find(pd->host_device_extensions.begin(), pd->host_device_extensions.end(),
+    const bool host_list_empty = pd->host_device_extensions.empty();
+    const auto host_lists = [&](const char* name) {
+        return std::find(pd->host_device_extensions.begin(), pd->host_device_extensions.end(),
                          name) != pd->host_device_extensions.end();
     };
     for (std::uint32_t i = 0; i < kDeviceExtAllowlistCount; ++i) {
-        if (std::strcmp(kDeviceExtAllowlist[i], VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) == 0 &&
-            !vkr::icd_policy::indirect_count_extension_advertised(
-                pd->caps.core_indirect_draw_count != 0, pd->host_device_extensions.empty(),
-                host_has(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME))) {
-            continue;
+        const DeviceExtensionRule& rule = kDeviceExtAllowlist[i];
+        bool advertise = false;
+        switch (rule.required_worker_capability) {
+        case RequiredWorkerCapability::None:
+            // Compatibility for pre-host-list workers and the Vulkan-free mock.
+            advertise = host_list_empty || host_lists(rule.name);
+            break;
+        case RequiredWorkerCapability::CoreIndirectDrawCount:
+            // New vocabulary-gated extensions never inherit the old unknown-list fallback.
+            advertise = vkr::icd_policy::indirect_count_extension_advertised(
+                pd->caps.core_indirect_draw_count != 0, host_list_empty, host_lists(rule.name));
+            break;
         }
-        if (host_has(kDeviceExtAllowlist[i])) {
-            out.push_back(kDeviceExtAllowlist[i]);
+        if (advertise) {
+            out.push_back(rule.name);
         }
     }
     if (native_lane()) {
         for (std::uint32_t i = 0; i < kNativeLaneDeviceExtAllowlistCount; ++i) {
-            if (host_has(kNativeLaneDeviceExtAllowlist[i])) {
+            if (host_list_empty || host_lists(kNativeLaneDeviceExtAllowlist[i])) {
                 out.push_back(kNativeLaneDeviceExtAllowlist[i]);
             }
         }

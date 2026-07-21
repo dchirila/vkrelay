@@ -819,11 +819,32 @@ constexpr bool kMockTransformFeedbackStreamSelect = true;
 // scalar/chain agreement check) decodes INVALID, which create_device rejects by name (mock ==
 // real). Presence is decided at from_body; a hostile client cannot transmit its way into the
 // omitted state.
-constexpr int kGeometryStreamsScalarOmitted = -1;
-constexpr int kGeometryStreamsScalarInvalid = -2;
-constexpr int kDrawIndirectCountScalarOmitted = -1;
-constexpr int kDrawIndirectCountScalarInvalid = -2;
+constexpr int kThreeStateScalarOmitted = -1;
+constexpr int kThreeStateScalarInvalid = -2;
+constexpr int kGeometryStreamsScalarOmitted = kThreeStateScalarOmitted;
+constexpr int kGeometryStreamsScalarInvalid = kThreeStateScalarInvalid;
+constexpr int kDrawIndirectCountScalarOmitted = kThreeStateScalarOmitted;
+constexpr int kDrawIndirectCountScalarInvalid = kThreeStateScalarInvalid;
 constexpr const char* kDrawIndirectCountExtensionName = "VK_KHR_draw_indirect_count";
+
+// Decode an additive absent/false/true scalar and centralize the hostile-domain rejection shared
+// by the mock and real workers. `derived` is the backend-owned truth used only for an omitted key;
+// explicit 0/1 agreement with a feature chain remains the caller's responsibility.
+inline bool decode_three_state_scalar(int encoded, bool derived, const char* field_name,
+                                      bool& enabled, std::string& reason) {
+    if (encoded == kThreeStateScalarOmitted) {
+        enabled = derived;
+        return true;
+    }
+    if (encoded == 0 || encoded == 1) {
+        enabled = encoded != 0;
+        return true;
+    }
+    reason = std::string(field_name) +
+             " must be 0 or 1 when present (omission is wire-key absence, not a transmittable "
+             "value)";
+    return false;
+}
 
 // One recorded command. The subset is the minimum a clear frame needs:
 // a single image-memory pipeline barrier and a full-subresource color clear. `kind`

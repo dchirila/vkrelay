@@ -37,10 +37,8 @@ live_device_buffer(const BufferMap& buffers, std::uint64_t handle, const Device&
     return it != buffers.end() && it->second.device == device ? &it->second : nullptr;
 }
 
-template <typename BufferMap, typename Device, typename Usage>
-IndirectBufferState indirect_buffer_state(const BufferMap& buffers, std::uint64_t handle,
-                                          const Device& device, Usage indirect_usage) {
-    const auto* buffer = live_device_buffer(buffers, handle, device);
+template <typename Buffer, typename Usage>
+IndirectBufferState indirect_buffer_state(const Buffer* buffer, Usage indirect_usage) {
     IndirectBufferState state;
     state.live = buffer != nullptr;
     state.bound = buffer != nullptr && buffer->bound_memory != 0;
@@ -49,6 +47,50 @@ IndirectBufferState indirect_buffer_state(const BufferMap& buffers, std::uint64_
         (buffer->usage & static_cast<decltype(buffer->usage)>(indirect_usage)) != 0;
     state.size = buffer != nullptr ? static_cast<std::uint64_t>(buffer->size) : 0;
     return state;
+}
+
+template <typename BufferMap, typename Device, typename Usage>
+IndirectBufferState indirect_buffer_state(const BufferMap& buffers, std::uint64_t handle,
+                                          const Device& device, Usage indirect_usage) {
+    return indirect_buffer_state(live_device_buffer(buffers, handle, device), indirect_usage);
+}
+
+inline bool indirect_buffer_ok(const IndirectBufferState& buffer, const char* live_reason,
+                               const char* bound_reason, const char* usage_reason,
+                               const char** reason) {
+    if (!buffer.live) {
+        *reason = live_reason;
+        return false;
+    }
+    if (!buffer.bound) {
+        *reason = bound_reason;
+        return false;
+    }
+    if (!buffer.has_indirect_usage) {
+        *reason = usage_reason;
+        return false;
+    }
+    return true;
+}
+
+inline bool indirect_range_ok(std::uint64_t buffer_size, std::uint64_t offset,
+                              std::uint64_t repeats, std::uint64_t stride,
+                              std::uint64_t command_size, const char* overflow_reason,
+                              const char* range_reason, const char** reason) {
+    if (repeats != 0 && stride > (std::numeric_limits<std::uint64_t>::max() - offset) / repeats) {
+        *reason = overflow_reason;
+        return false;
+    }
+    const std::uint64_t last = offset + repeats * stride;
+    if (command_size > std::numeric_limits<std::uint64_t>::max() - last) {
+        *reason = overflow_reason;
+        return false;
+    }
+    if (last + command_size > buffer_size) {
+        *reason = range_reason;
+        return false;
+    }
+    return true;
 }
 
 inline bool dispatch_indirect_ok(const IndirectBufferState& buffer, std::uint64_t offset,
@@ -78,16 +120,10 @@ inline bool core_indirect_draw_ok(bool buffer_live, bool buffer_bound, bool has_
                                   long long draw_count, long long stride,
                                   std::uint64_t command_size, bool multi_draw_indirect_enabled,
                                   const char** reason) {
-    if (!buffer_live) {
-        *reason = "indirect draw buffer is not live on the device";
-        return false;
-    }
-    if (!buffer_bound) {
-        *reason = "indirect draw buffer is not bound to memory";
-        return false;
-    }
-    if (!has_indirect_usage) {
-        *reason = "indirect draw buffer lacks INDIRECT_BUFFER usage";
+    const IndirectBufferState buffer{buffer_live, buffer_bound, has_indirect_usage, buffer_size};
+    if (!indirect_buffer_ok(buffer, "indirect draw buffer is not live on the device",
+                            "indirect draw buffer is not bound to memory",
+                            "indirect draw buffer lacks INDIRECT_BUFFER usage", reason)) {
         return false;
     }
     if (draw_count < 0 ||
@@ -120,21 +156,9 @@ inline bool core_indirect_draw_ok(bool buffer_live, bool buffer_bound, bool has_
 
     // end = offset + (drawCount - 1) * stride + sizeof(command), with every operation proven
     // before it is performed. This is the exact byte range the host command may read.
-    const std::uint64_t repeats = ucount - 1;
-    if (repeats != 0 && ustride > (std::numeric_limits<std::uint64_t>::max() - offset) / repeats) {
-        *reason = "indirect draw range overflows";
-        return false;
-    }
-    const std::uint64_t last = offset + repeats * ustride;
-    if (command_size > std::numeric_limits<std::uint64_t>::max() - last) {
-        *reason = "indirect draw range overflows";
-        return false;
-    }
-    if (last + command_size > buffer_size) {
-        *reason = "indirect draw range exceeds the buffer";
-        return false;
-    }
-    return true;
+    return indirect_range_ok(buffer_size, offset, ucount - 1, ustride, command_size,
+                             "indirect draw range overflows",
+                             "indirect draw range exceeds the buffer", reason);
 }
 
 inline bool core_indirect_count_draw_ok(bool command_enabled, const IndirectBufferState& buffer,
@@ -146,28 +170,12 @@ inline bool core_indirect_count_draw_ok(bool command_enabled, const IndirectBuff
         *reason = "indirect-count draw requires the enabled core feature or KHR extension";
         return false;
     }
-    if (!buffer.live) {
-        *reason = "indirect-count draw buffer is not live on the device";
-        return false;
-    }
-    if (!buffer.bound) {
-        *reason = "indirect-count draw buffer is not bound to memory";
-        return false;
-    }
-    if (!buffer.has_indirect_usage) {
-        *reason = "indirect-count draw buffer lacks INDIRECT_BUFFER usage";
-        return false;
-    }
-    if (!count_buffer.live) {
-        *reason = "indirect-count count buffer is not live on the device";
-        return false;
-    }
-    if (!count_buffer.bound) {
-        *reason = "indirect-count count buffer is not bound to memory";
-        return false;
-    }
-    if (!count_buffer.has_indirect_usage) {
-        *reason = "indirect-count count buffer lacks INDIRECT_BUFFER usage";
+    if (!indirect_buffer_ok(buffer, "indirect-count draw buffer is not live on the device",
+                            "indirect-count draw buffer is not bound to memory",
+                            "indirect-count draw buffer lacks INDIRECT_BUFFER usage", reason) ||
+        !indirect_buffer_ok(count_buffer, "indirect-count count buffer is not live on the device",
+                            "indirect-count count buffer is not bound to memory",
+                            "indirect-count count buffer lacks INDIRECT_BUFFER usage", reason)) {
         return false;
     }
     if ((offset % 4) != 0) {
@@ -201,21 +209,9 @@ inline bool core_indirect_count_draw_ok(bool command_enabled, const IndirectBuff
         return true;
     }
 
-    const std::uint64_t repeats = static_cast<std::uint64_t>(max_draw_count) - 1;
-    if (repeats != 0 && ustride > (std::numeric_limits<std::uint64_t>::max() - offset) / repeats) {
-        *reason = "indirect-count draw range overflows";
-        return false;
-    }
-    const std::uint64_t last = offset + repeats * ustride;
-    if (command_size > std::numeric_limits<std::uint64_t>::max() - last) {
-        *reason = "indirect-count draw range overflows";
-        return false;
-    }
-    if (last + command_size > buffer.size) {
-        *reason = "indirect-count draw range exceeds the buffer";
-        return false;
-    }
-    return true;
+    return indirect_range_ok(buffer.size, offset, static_cast<std::uint64_t>(max_draw_count) - 1,
+                             ustride, command_size, "indirect-count draw range overflows",
+                             "indirect-count draw range exceeds the buffer", reason);
 }
 
 inline bool core_indirect_draw_ok(const IndirectBufferState& buffer, std::uint64_t offset,

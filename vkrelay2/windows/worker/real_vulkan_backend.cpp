@@ -2431,12 +2431,10 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
         // out-of-domain value -- including the INVALID (-2) that a transmitted -1/2/wrong-type
         // decodes to -- rejects by name BEFORE the agreement/derive logic, so a hostile client
         // cannot claim legacy status to dodge the scalar/chain agreement check.
-        if (req.geometry_streams_feature_enabled != vkrpc::kGeometryStreamsScalarOmitted &&
-            req.geometry_streams_feature_enabled != 0 &&
-            req.geometry_streams_feature_enabled != 1) {
+        if (!vkrpc::decode_three_state_scalar(
+                req.geometry_streams_feature_enabled, chain_geometry_streams,
+                "geometry_streams_feature_enabled", geometry_streams_enabled, resp.reason)) {
             resp.ok = false;
-            resp.reason = "geometry_streams_feature_enabled must be 0 or 1 when present (omission "
-                          "is wire-key absence, not a transmittable value)";
             return resp;
         }
         if (req.geometry_streams_feature_enabled >= 0 &&
@@ -2453,19 +2451,9 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
             resp.reason = "geometryStreams enabled without VK_EXT_transform_feedback";
             return resp;
         }
-        geometry_streams_enabled = req.geometry_streams_feature_enabled < 0
-                                       ? chain_geometry_streams
-                                       : req.geometry_streams_feature_enabled != 0;
         // Indirect-count has two legal enable paths: the featureless KHR extension or the promoted
         // Vulkan-1.2 feature. The additive scalar mirrors their OR. An old ICD omits the key, so
         // derive from the actual extension/chain instead of rejecting an otherwise valid request.
-        if (req.draw_indirect_count_enabled != vkrpc::kDrawIndirectCountScalarOmitted &&
-            req.draw_indirect_count_enabled != 0 && req.draw_indirect_count_enabled != 1) {
-            resp.ok = false;
-            resp.reason = "draw_indirect_count_enabled must be 0 or 1 when present (omission is "
-                          "wire-key absence, not a transmittable value)";
-            return resp;
-        }
         const bool extension_draw_indirect_count =
             std::find(ext_storage.begin(), ext_storage.end(),
                       VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) != ext_storage.end();
@@ -2488,6 +2476,12 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
         }
         const bool derived_draw_indirect_count =
             extension_draw_indirect_count || chain_draw_indirect_count;
+        if (!vkrpc::decode_three_state_scalar(
+                req.draw_indirect_count_enabled, derived_draw_indirect_count,
+                "draw_indirect_count_enabled", draw_indirect_count_enabled, resp.reason)) {
+            resp.ok = false;
+            return resp;
+        }
         if (req.draw_indirect_count_enabled >= 0 &&
             (req.draw_indirect_count_enabled != 0) != derived_draw_indirect_count) {
             resp.ok = false;
@@ -2495,9 +2489,6 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
                           "bit and enabled surface must agree)";
             return resp;
         }
-        draw_indirect_count_enabled = req.draw_indirect_count_enabled < 0
-                                          ? derived_draw_indirect_count
-                                          : req.draw_indirect_count_enabled != 0;
     }
     // Descriptor indexing: the same normalization for the DI feature bits --
     // derive what the chain enables (the standalone DescriptorIndexingFeatures struct, exact-size
@@ -6722,8 +6713,10 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                     resp.reason = why;
                     return resp;
                 }
+                const auto* indirect_buffer =
+                    vkrpc::live_device_buffer(buffers_, c.src_buffer, device);
                 const vkrpc::IndirectBufferState buffer = vkrpc::indirect_buffer_state(
-                    buffers_, c.src_buffer, device, vkrpc::kBufferUsageIndirectBuffer);
+                    indirect_buffer, vkrpc::kBufferUsageIndirectBuffer);
                 if (!vkrpc::core_indirect_draw_ok(buffer, args.offset, args.draw_count, args.stride,
                                                   k == vkrpc::CmdKind::DrawIndexedIndirect
                                                       ? vkrpc::kDrawIndexedIndirectCommandBytes
@@ -6734,8 +6727,6 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                     resp.reason = why;
                     return resp;
                 }
-                const auto* indirect_buffer =
-                    vkrpc::live_device_buffer(buffers_, c.src_buffer, device);
                 r.src_buffer = indirect_buffer->vk;
                 r.indirect_draw = args;
                 referenced_draw_objects.insert(c.src_buffer);
@@ -6748,10 +6739,14 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                     resp.reason = why;
                     return resp;
                 }
+                const auto* indirect_buffer =
+                    vkrpc::live_device_buffer(buffers_, c.src_buffer, device);
+                const auto* resolved_count_buffer =
+                    vkrpc::live_device_buffer(buffers_, args.count_buffer, device);
                 const vkrpc::IndirectBufferState buffer = vkrpc::indirect_buffer_state(
-                    buffers_, c.src_buffer, device, vkrpc::kBufferUsageIndirectBuffer);
+                    indirect_buffer, vkrpc::kBufferUsageIndirectBuffer);
                 const vkrpc::IndirectBufferState count_buffer = vkrpc::indirect_buffer_state(
-                    buffers_, args.count_buffer, device, vkrpc::kBufferUsageIndirectBuffer);
+                    resolved_count_buffer, vkrpc::kBufferUsageIndirectBuffer);
                 if (!vkrpc::core_indirect_count_draw_ok(
                         dev->second.draw_indirect_count_enabled, buffer, count_buffer, args.offset,
                         args.count_buffer_offset, args.max_draw_count, args.stride,
@@ -6763,10 +6758,6 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                     resp.reason = why;
                     return resp;
                 }
-                const auto* indirect_buffer =
-                    vkrpc::live_device_buffer(buffers_, c.src_buffer, device);
-                const auto* resolved_count_buffer =
-                    vkrpc::live_device_buffer(buffers_, args.count_buffer, device);
                 r.src_buffer = indirect_buffer->vk;
                 r.count_buffer = resolved_count_buffer->vk;
                 r.indirect_count_draw = args;
@@ -6829,16 +6820,16 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                     return resp;
                 }
                 const std::uint64_t off = c.args_u64[0];
+                const auto* indirect_buffer =
+                    vkrpc::live_device_buffer(buffers_, c.src_buffer, device);
                 const vkrpc::IndirectBufferState buffer = vkrpc::indirect_buffer_state(
-                    buffers_, c.src_buffer, device, vkrpc::kBufferUsageIndirectBuffer);
+                    indirect_buffer, vkrpc::kBufferUsageIndirectBuffer);
                 const char* why = "";
                 if (!vkrpc::dispatch_indirect_ok(buffer, off, &why)) {
                     resp.ok = false;
                     resp.reason = why;
                     return resp;
                 }
-                const auto* indirect_buffer =
-                    vkrpc::live_device_buffer(buffers_, c.src_buffer, device);
                 r.src_buffer = indirect_buffer->vk;
                 referenced_draw_objects.insert(c.src_buffer);
             }
