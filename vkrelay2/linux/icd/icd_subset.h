@@ -531,6 +531,15 @@ inline bool core_indirect_worker_ok(bool supported, const char** reason) {
     return true;
 }
 
+inline bool core_indirect_count_worker_ok(bool supported, const char** reason) {
+    if (!supported) {
+        *reason = "indirect-count draw requires a worker advertising "
+                  "core_indirect_draw_count support";
+        return false;
+    }
+    return true;
+}
+
 inline bool draw_indirect_ok(bool buffer_live, bool buffer_bound, VkBufferUsageFlags usage,
                              VkDeviceSize buffer_size, VkDeviceSize offset,
                              std::uint32_t draw_count, std::uint32_t stride, bool indexed,
@@ -542,6 +551,33 @@ inline bool draw_indirect_ok(bool buffer_live, bool buffer_bound, VkBufferUsageF
         indexed ? vkr::vkrpc::kDrawIndexedIndirectCommandBytes
                 : vkr::vkrpc::kDrawIndirectCommandBytes,
         multi_draw_indirect_enabled, reason);
+}
+
+inline bool draw_indirect_count_ok(bool command_enabled, bool buffer_live, bool buffer_bound,
+                                   VkBufferUsageFlags usage, VkDeviceSize buffer_size,
+                                   bool count_buffer_live, bool count_buffer_bound,
+                                   VkBufferUsageFlags count_buffer_usage,
+                                   VkDeviceSize count_buffer_size, VkDeviceSize offset,
+                                   VkDeviceSize count_buffer_offset, std::uint32_t max_draw_count,
+                                   std::uint32_t stride, bool indexed, const char** reason) {
+    vkr::vkrpc::IndirectBufferState buffer;
+    buffer.live = buffer_live;
+    buffer.bound = buffer_bound;
+    buffer.has_indirect_usage = (usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
+    buffer.size = static_cast<std::uint64_t>(buffer_size);
+    vkr::vkrpc::IndirectBufferState count_buffer;
+    count_buffer.live = count_buffer_live;
+    count_buffer.bound = count_buffer_bound;
+    count_buffer.has_indirect_usage =
+        (count_buffer_usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
+    count_buffer.size = static_cast<std::uint64_t>(count_buffer_size);
+    return vkr::vkrpc::core_indirect_count_draw_ok(
+        command_enabled, buffer, count_buffer, static_cast<std::uint64_t>(offset),
+        static_cast<std::uint64_t>(count_buffer_offset), static_cast<long long>(max_draw_count),
+        static_cast<long long>(stride),
+        indexed ? vkr::vkrpc::kDrawIndexedIndirectCommandBytes
+                : vkr::vkrpc::kDrawIndirectCommandBytes,
+        reason);
 }
 
 // bufferDeviceAddress: the ONE admitted pNext is a VkMemoryAllocateFlagsInfo carrying

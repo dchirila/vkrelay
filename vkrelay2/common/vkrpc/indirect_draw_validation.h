@@ -1,4 +1,5 @@
-// Shared structural validation for core vkCmdDrawIndirect / vkCmdDrawIndexedIndirect.
+// Shared structural validation for the core indirect-draw family, including the Vulkan-1.2/KHR
+// count-sourced variants.
 //
 // This header deliberately has no Vulkan dependency: the Linux ICD, mock backend, and real
 // backend call the same predicate, so malformed or version-skewed streams fail identically before
@@ -131,6 +132,87 @@ inline bool core_indirect_draw_ok(bool buffer_live, bool buffer_bound, bool has_
     }
     if (last + command_size > buffer_size) {
         *reason = "indirect draw range exceeds the buffer";
+        return false;
+    }
+    return true;
+}
+
+inline bool core_indirect_count_draw_ok(bool command_enabled, const IndirectBufferState& buffer,
+                                        const IndirectBufferState& count_buffer,
+                                        std::uint64_t offset, std::uint64_t count_buffer_offset,
+                                        long long max_draw_count, long long stride,
+                                        std::uint64_t command_size, const char** reason) {
+    if (!command_enabled) {
+        *reason = "indirect-count draw requires the enabled core feature or KHR extension";
+        return false;
+    }
+    if (!buffer.live) {
+        *reason = "indirect-count draw buffer is not live on the device";
+        return false;
+    }
+    if (!buffer.bound) {
+        *reason = "indirect-count draw buffer is not bound to memory";
+        return false;
+    }
+    if (!buffer.has_indirect_usage) {
+        *reason = "indirect-count draw buffer lacks INDIRECT_BUFFER usage";
+        return false;
+    }
+    if (!count_buffer.live) {
+        *reason = "indirect-count count buffer is not live on the device";
+        return false;
+    }
+    if (!count_buffer.bound) {
+        *reason = "indirect-count count buffer is not bound to memory";
+        return false;
+    }
+    if (!count_buffer.has_indirect_usage) {
+        *reason = "indirect-count count buffer lacks INDIRECT_BUFFER usage";
+        return false;
+    }
+    if ((offset % 4) != 0) {
+        *reason = "indirect-count draw offset is not 4-byte aligned";
+        return false;
+    }
+    if ((count_buffer_offset % 4) != 0) {
+        *reason = "indirect-count countBufferOffset is not 4-byte aligned";
+        return false;
+    }
+    if (count_buffer_offset > count_buffer.size || 4 > count_buffer.size - count_buffer_offset) {
+        *reason = "indirect-count four-byte count slot exceeds the count buffer";
+        return false;
+    }
+    if (max_draw_count < 0 || static_cast<unsigned long long>(max_draw_count) >
+                                  std::numeric_limits<std::uint32_t>::max()) {
+        *reason = "indirect-count maxDrawCount is outside the uint32 range";
+        return false;
+    }
+    if (stride < 0 ||
+        static_cast<unsigned long long>(stride) > std::numeric_limits<std::uint32_t>::max()) {
+        *reason = "indirect-count stride is outside the uint32 range";
+        return false;
+    }
+    const std::uint64_t ustride = static_cast<std::uint64_t>(stride);
+    if ((ustride % 4) != 0 || ustride < command_size) {
+        *reason = "indirect-count stride is misaligned or smaller than the command";
+        return false;
+    }
+    if (max_draw_count == 0) {
+        return true;
+    }
+
+    const std::uint64_t repeats = static_cast<std::uint64_t>(max_draw_count) - 1;
+    if (repeats != 0 && ustride > (std::numeric_limits<std::uint64_t>::max() - offset) / repeats) {
+        *reason = "indirect-count draw range overflows";
+        return false;
+    }
+    const std::uint64_t last = offset + repeats * ustride;
+    if (command_size > std::numeric_limits<std::uint64_t>::max() - last) {
+        *reason = "indirect-count draw range overflows";
+        return false;
+    }
+    if (last + command_size > buffer.size) {
+        *reason = "indirect-count draw range exceeds the buffer";
         return false;
     }
     return true;

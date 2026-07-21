@@ -416,6 +416,8 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
         PFN_vkCmdBeginTransformFeedbackEXT pfn_begin_tf = nullptr;
         PFN_vkCmdEndTransformFeedbackEXT pfn_end_tf = nullptr;
         PFN_vkCmdDrawIndirectByteCountEXT pfn_draw_indirect_byte_count = nullptr;
+        PFN_vkCmdDrawIndirectCount pfn_draw_indirect_count = nullptr;
+        PFN_vkCmdDrawIndexedIndirectCount pfn_draw_indexed_indirect_count = nullptr;
         PFN_vkCmdBeginConditionalRenderingEXT pfn_begin_cond_render = nullptr;
         PFN_vkCmdEndConditionalRenderingEXT pfn_end_cond_render = nullptr;
         // (native lane -- EDS1): VK_EXT_extended_dynamic_state's setters replay through the
@@ -495,6 +497,9 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
         // Core indirect draws: single-draw indirect needs no feature; drawCount > 1 requires the
         // enabled VkPhysicalDeviceFeatures::multiDrawIndirect bit.
         bool multi_draw_indirect_feature_enabled = false;
+        // Core-1.2 feature OR enabled VK_KHR_draw_indirect_count. The two host PFNs above are
+        // non-null whenever this is true (resolved/fail-closed at device creation).
+        bool draw_indirect_count_enabled = false;
         std::uint32_t max_transform_feedback_streams = 0;
         bool transform_feedback_rasterization_stream_select = false;
         // Descriptor indexing: the enabled kDIFeature* bits, NORMALIZED against the

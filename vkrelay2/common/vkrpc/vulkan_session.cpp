@@ -553,6 +553,7 @@ class DecodedOpTrace {
         h.add(c.indirect_offset);
         h.add(c.indirect_draw_count);
         h.add(c.indirect_stride);
+        h.add(c.indirect_count_buffer_offset);
         h.add(c.barrier_base_mip);
         h.add(c.barrier_level_count);
         h.add(c.barrier_base_layer);
@@ -657,6 +658,7 @@ class DecodedOpTrace {
             }
         }
         one("buffer", c.src_buffer);
+        one("buffer", c.indirect_count_buffer);
         return out.str();
     }
 
@@ -1401,6 +1403,8 @@ json::Value DeviceCaps::to_body() const {
     b.set("core_indirect_draw", json::Value(static_cast<long long>(core_indirect_draw)));
     b.set("core_indirect_draw_scalar_payload",
           json::Value(static_cast<long long>(core_indirect_draw_scalar_payload)));
+    b.set("core_indirect_draw_count",
+          json::Value(static_cast<long long>(core_indirect_draw_count)));
     return b;
 }
 
@@ -1424,6 +1428,8 @@ DeviceCaps DeviceCaps::from_body(const json::Value& body) {
         static_cast<std::uint32_t>(get_i64(body, "core_indirect_draw", 0)); // absent -> 0
     d.core_indirect_draw_scalar_payload = static_cast<std::uint32_t>(
         get_i64(body, "core_indirect_draw_scalar_payload", 0)); // absent -> 0
+    d.core_indirect_draw_count =
+        static_cast<std::uint32_t>(get_i64(body, "core_indirect_draw_count", 0)); // absent -> 0
     return d;
 }
 
@@ -1570,6 +1576,7 @@ json::Value CreateDeviceRequest::to_body() const {
     b.set("vertex_attr_zero_divisor_feature_enabled",
           json::Value(vertex_attr_zero_divisor_feature_enabled));
     b.set("geometry_streams_feature_enabled", json::Value(geometry_streams_feature_enabled));
+    b.set("draw_indirect_count_enabled", json::Value(draw_indirect_count_enabled));
     b.set("descriptor_indexing_feature_bits", handle_value(descriptor_indexing_feature_bits));
     b.set("vk13_feature_bits", handle_value(vk13_feature_bits));
     b.set("vk13_device_enabled", json::Value(vk13_device_enabled));
@@ -1618,6 +1625,12 @@ CreateDeviceRequest CreateDeviceRequest::from_body(const json::Value& body) {
                                  kGeometryStreamsScalarInvalid); // wrong type -> invalid
         r.geometry_streams_feature_enabled =
             (gs_v == 0 || gs_v == 1) ? gs_v : kGeometryStreamsScalarInvalid;
+    }
+    if (body.find("draw_indirect_count_enabled") == nullptr) {
+        r.draw_indirect_count_enabled = kDrawIndirectCountScalarOmitted;
+    } else {
+        const int v = get_int(body, "draw_indirect_count_enabled", kDrawIndirectCountScalarInvalid);
+        r.draw_indirect_count_enabled = (v == 0 || v == 1) ? v : kDrawIndirectCountScalarInvalid;
     }
     r.descriptor_indexing_feature_bits = get_handle(body, "descriptor_indexing_feature_bits");
     r.vk13_feature_bits = get_handle(body, "vk13_feature_bits");
@@ -2238,6 +2251,8 @@ json::Value RecordCommandBufferRequest::to_body() const {
         cv.set("indirect_offset", handle_value(c.indirect_offset));
         cv.set("indirect_draw_count", json::Value(c.indirect_draw_count));
         cv.set("indirect_stride", json::Value(c.indirect_stride));
+        cv.set("indirect_count_buffer", handle_value(c.indirect_count_buffer));
+        cv.set("indirect_count_buffer_offset", handle_value(c.indirect_count_buffer_offset));
         cv.set("copy_width", json::Value(c.copy_width));
         cv.set("copy_height", json::Value(c.copy_height));
         cv.set("copy_depth", json::Value(c.copy_depth));
@@ -2397,6 +2412,8 @@ RecordCommandBufferRequest RecordCommandBufferRequest::from_body(const json::Val
             c.indirect_offset = get_handle(e, "indirect_offset");
             c.indirect_draw_count = get_i64(e, "indirect_draw_count", -1);
             c.indirect_stride = get_i64(e, "indirect_stride", -1);
+            c.indirect_count_buffer = get_handle(e, "indirect_count_buffer");
+            c.indirect_count_buffer_offset = get_handle(e, "indirect_count_buffer_offset");
             c.copy_width = get_i64(e, "copy_width", -1);
             c.copy_height = get_i64(e, "copy_height", -1);
             c.copy_depth = get_i64(e, "copy_depth", -1);
@@ -2595,6 +2612,8 @@ CmdKind cmd_kind_from_string(const std::string& kind) {
         {"fill_buffer", CmdKind::FillBuffer},
         {"draw_indirect", CmdKind::DrawIndirect},
         {"draw_indexed_indirect", CmdKind::DrawIndexedIndirect},
+        {"draw_indirect_count", CmdKind::DrawIndirectCount},
+        {"draw_indexed_indirect_count", CmdKind::DrawIndexedIndirectCount},
     };
     const auto it = kMap.find(std::string_view(kind));
     return it != kMap.end() ? it->second : CmdKind::Unknown;
@@ -2603,6 +2622,10 @@ CmdKind cmd_kind_from_string(const std::string& kind) {
 CmdKind recorded_command_kind(const RecordedCommand& command) {
     if (command.kind.empty() &&
         (command.indirect_draw_count != -1 || command.indirect_stride != -1)) {
+        if (command.indirect_counted) {
+            return command.indirect_indexed ? CmdKind::DrawIndexedIndirectCount
+                                            : CmdKind::DrawIndirectCount;
+        }
         return command.indirect_indexed ? CmdKind::DrawIndexedIndirect : CmdKind::DrawIndirect;
     }
     return cmd_kind_from_string(command.kind);
@@ -2611,6 +2634,9 @@ CmdKind recorded_command_kind(const RecordedCommand& command) {
 std::string_view recorded_command_kind_name(const RecordedCommand& command) {
     if (command.kind.empty() &&
         (command.indirect_draw_count != -1 || command.indirect_stride != -1)) {
+        if (command.indirect_counted) {
+            return command.indirect_indexed ? "draw_indexed_indirect_count" : "draw_indirect_count";
+        }
         return command.indirect_indexed ? "draw_indexed_indirect" : "draw_indirect";
     }
     return command.kind;
@@ -2637,6 +2663,11 @@ RecordedCommand make_core_indirect_draw_command(std::uint64_t buffer, std::uint6
 
 bool core_indirect_draw_args(const RecordedCommand& command, CoreIndirectDrawArgs& args,
                              const char** reason) {
+    if (command.indirect_counted || command.indirect_count_buffer != 0 ||
+        command.indirect_count_buffer_offset != 0) {
+        *reason = "base indirect draw carries count-buffer fields";
+        return false;
+    }
     const bool has_scalars = command.indirect_draw_count != -1 || command.indirect_stride != -1;
     const bool has_legacy = !command.args_u64.empty() || !command.args_i64.empty();
     if (has_scalars == has_legacy) {
@@ -2657,6 +2688,42 @@ bool core_indirect_draw_args(const RecordedCommand& command, CoreIndirectDrawArg
     args.offset = command.args_u64[0];
     args.draw_count = command.args_i64[0];
     args.stride = command.args_i64[1];
+    return true;
+}
+
+RecordedCommand make_core_indirect_count_draw_command(std::uint64_t buffer, std::uint64_t offset,
+                                                      std::uint64_t count_buffer,
+                                                      std::uint64_t count_buffer_offset,
+                                                      std::uint32_t max_draw_count,
+                                                      std::uint32_t stride, bool indexed) {
+    RecordedCommand command;
+    command.src_buffer = buffer;
+    command.indirect_offset = offset;
+    command.indirect_draw_count = static_cast<long long>(max_draw_count);
+    command.indirect_stride = static_cast<long long>(stride);
+    command.indirect_count_buffer = count_buffer;
+    command.indirect_count_buffer_offset = count_buffer_offset;
+    command.indirect_indexed = indexed;
+    command.indirect_counted = true;
+    return command;
+}
+
+bool core_indirect_count_draw_args(const RecordedCommand& command, CoreIndirectCountDrawArgs& args,
+                                   const char** reason) {
+    if (!command.args_u64.empty() || !command.args_i64.empty()) {
+        *reason = "indirect-count draw carries a legacy or mixed positional payload";
+        return false;
+    }
+    if (command.indirect_draw_count == -1 || command.indirect_stride == -1 ||
+        command.indirect_count_buffer == 0) {
+        *reason = "indirect-count draw payload is missing or partial";
+        return false;
+    }
+    args.offset = command.indirect_offset;
+    args.max_draw_count = command.indirect_draw_count;
+    args.stride = command.indirect_stride;
+    args.count_buffer = command.indirect_count_buffer;
+    args.count_buffer_offset = command.indirect_count_buffer_offset;
     return true;
 }
 
@@ -2734,8 +2801,9 @@ enum : std::uint64_t {
     kRecArgsF64 = 1ull << 13,
     kRecArgsBlob = 1ull << 14,
     kRecDeps2 = 1ull << 15,           // the typed DependencyInfo2 vector
-    kRecIndirectDraw = 1ull << 16,    // offset, drawCount, stride dedicated scalars
-    kRecKnownMask = (1ull << 17) - 1, // decode rejects any bit beyond the known set (fail-closed)
+    kRecIndirectDraw = 1ull << 16,    // offset, drawCount/maxDrawCount, stride dedicated scalars
+    kRecIndirectCount = 1ull << 17,   // count buffer handle + countBufferOffset
+    kRecKnownMask = (1ull << 18) - 1, // decode rejects any bit beyond the known set (fail-closed)
 };
 } // namespace
 
@@ -2809,8 +2877,14 @@ std::string RecordCommandBufferRequest::to_wire() const {
         if (!c.deps2.empty()) {
             mask |= kRecDeps2;
         }
-        if (c.indirect_draw_count != -1 || c.indirect_stride != -1) {
+        const CmdKind kind = recorded_command_kind(c);
+        const bool count_kind =
+            kind == CmdKind::DrawIndirectCount || kind == CmdKind::DrawIndexedIndirectCount;
+        if (count_kind || c.indirect_draw_count != -1 || c.indirect_stride != -1) {
             mask |= kRecIndirectDraw;
+        }
+        if (count_kind || c.indirect_count_buffer != 0 || c.indirect_count_buffer_offset != 0) {
+            mask |= kRecIndirectCount;
         }
         wire_put_str(out, recorded_command_kind_name(c));
         wire_put_u64(out, mask);
@@ -2914,6 +2988,10 @@ std::string RecordCommandBufferRequest::to_wire() const {
             wire_put_u64(out, c.indirect_offset);
             wire_put_i64(out, c.indirect_draw_count);
             wire_put_i64(out, c.indirect_stride);
+        }
+        if (mask & kRecIndirectCount) {
+            wire_put_u64(out, c.indirect_count_buffer);
+            wire_put_u64(out, c.indirect_count_buffer_offset);
         }
     }
     return out;
@@ -3086,6 +3164,23 @@ RecordCommandBufferRequest RecordCommandBufferRequest::from_wire(const std::stri
             c.indirect_offset = rd.get_u64();
             c.indirect_draw_count = rd.get_i64();
             c.indirect_stride = rd.get_i64();
+        }
+        if (mask & kRecIndirectCount) {
+            c.indirect_count_buffer = rd.get_u64();
+            c.indirect_count_buffer_offset = rd.get_u64();
+        }
+        const CmdKind decoded_kind = cmd_kind_from_string(c.kind);
+        const bool count_kind = decoded_kind == CmdKind::DrawIndirectCount ||
+                                decoded_kind == CmdKind::DrawIndexedIndirectCount;
+        const bool base_indirect_kind =
+            decoded_kind == CmdKind::DrawIndirect || decoded_kind == CmdKind::DrawIndexedIndirect;
+        if (base_indirect_kind && (mask & kRecIndirectCount) != 0) {
+            err = "base indirect draw carries count-only field group";
+            return RecordCommandBufferRequest{};
+        }
+        if (count_kind && ((mask & kRecIndirectDraw) == 0 || (mask & kRecIndirectCount) == 0)) {
+            err = "indirect-count draw is missing required field groups";
+            return RecordCommandBufferRequest{};
         }
         r.commands.push_back(std::move(c));
     }
@@ -6064,6 +6159,7 @@ DeviceCaps MockVulkanBackend::device_caps() const {
     caps.rasterization_stream_state = 1;
     caps.core_indirect_draw = 1;
     caps.core_indirect_draw_scalar_payload = 1;
+    caps.core_indirect_draw_count = 1;
     return caps;
 }
 
@@ -6178,6 +6274,18 @@ CreateDeviceResponse MockVulkanBackend::create_device(const CreateDeviceRequest&
     dev.geometry_streams_feature_enabled = req.geometry_streams_feature_enabled > 0;
     dev.multi_draw_indirect_feature_enabled =
         (req.enabled_feature_bits & kFeatureMultiDrawIndirect) != 0;
+    if (req.draw_indirect_count_enabled != kDrawIndirectCountScalarOmitted &&
+        req.draw_indirect_count_enabled != 0 && req.draw_indirect_count_enabled != 1) {
+        resp.ok = false;
+        resp.reason = "draw_indirect_count_enabled must be 0 or 1 when present (omission is "
+                      "wire-key absence, not a transmittable value)";
+        it->second.devices.erase(device);
+        return resp;
+    }
+    dev.draw_indirect_count_enabled =
+        req.draw_indirect_count_enabled < 0
+            ? dev.enabled_exts.count(kDrawIndirectCountExtensionName) != 0
+            : req.draw_indirect_count_enabled != 0;
     // descriptorIndexing: CreateDevice POLICY clamps to the SERVED buffer-only
     // subset -- a deferred-but-known bit (an image/texel UAB class) is rejected exactly like an
     // unknown one, so a skewed/custom client can never enable an unproven class past the ICD.
@@ -8244,15 +8352,19 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
             referenced_draw_objects.insert(c.args_u64[0]);
             index_bound = true;
         } else if (k == CmdKind::Draw || k == CmdKind::DrawIndirectByteCount ||
-                   k == CmdKind::DrawIndirect || k == CmdKind::DrawIndexedIndirect) {
+                   k == CmdKind::DrawIndirect || k == CmdKind::DrawIndexedIndirect ||
+                   k == CmdKind::DrawIndirectCount || k == CmdKind::DrawIndexedIndirectCount) {
             if (active_scope == RenderScope::None) {
                 resp.ok = false;
                 resp.reason = "draw outside an active render pass";
                 return resp;
             }
-            if (k == CmdKind::DrawIndexedIndirect && !index_bound) {
+            if ((k == CmdKind::DrawIndexedIndirect || k == CmdKind::DrawIndexedIndirectCount) &&
+                !index_bound) {
                 resp.ok = false;
-                resp.reason = "draw_indexed_indirect without a bound index buffer";
+                resp.reason = k == CmdKind::DrawIndexedIndirect
+                                  ? "draw_indexed_indirect without a bound index buffer"
+                                  : "draw_indexed_indirect_count without a bound index buffer";
                 return resp;
             }
             // (GL/zink): the byte-count draw (glDrawTransformFeedback) shares full
@@ -8375,6 +8487,30 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
                     return resp;
                 }
                 referenced_draw_objects.insert(c.src_buffer);
+            } else if (k == CmdKind::DrawIndirectCount || k == CmdKind::DrawIndexedIndirectCount) {
+                CoreIndirectCountDrawArgs args;
+                const char* why = "";
+                if (!core_indirect_count_draw_args(c, args, &why)) {
+                    resp.ok = false;
+                    resp.reason = why;
+                    return resp;
+                }
+                const IndirectBufferState buffer = indirect_buffer_state(
+                    buffers_, c.src_buffer, device, kBufferUsageIndirectBuffer);
+                const IndirectBufferState count_buffer = indirect_buffer_state(
+                    buffers_, args.count_buffer, device, kBufferUsageIndirectBuffer);
+                if (!core_indirect_count_draw_ok(
+                        mdev->second.draw_indirect_count_enabled, buffer, count_buffer, args.offset,
+                        args.count_buffer_offset, args.max_draw_count, args.stride,
+                        k == CmdKind::DrawIndexedIndirectCount ? kDrawIndexedIndirectCommandBytes
+                                                               : kDrawIndirectCommandBytes,
+                        &why)) {
+                    resp.ok = false;
+                    resp.reason = why;
+                    return resp;
+                }
+                referenced_draw_objects.insert(c.src_buffer);
+                referenced_draw_objects.insert(args.count_buffer);
             } else if (c.vertex_count < 0 || c.instance_count < 0 || c.first_vertex < 0 ||
                        c.first_instance < 0) {
                 // u32 draw args carried wide; a missing/negative value (-1 sentinel) is rejected.

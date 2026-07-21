@@ -12,6 +12,10 @@ between minor releases.
   closing the missing core-1.0 command surface. The implementation includes additive worker
   capability negotiation, `multiDrawIndirect` feature gating, overflow-safe buffer-range
   validation, and observable indexed-indirect GPU readback coverage.
+- Added core Vulkan 1.2 and `VK_KHR_draw_indirect_count` draw-count commands with host-intersected
+  feature/extension reporting, device-aware KHR aliases, additive worker negotiation, two-buffer
+  lifetime and range validation, and observable GPU coverage for count 0/1/2, max clamping, and a
+  nonzero count-buffer offset.
 - Fixed GPU-to-host readback bookkeeping for destination buffers bound through
   `vkBindBufferMemory2`; both core-equivalent buffer-memory binding spellings now enroll completed
   GPU writes for shadow-memory download.

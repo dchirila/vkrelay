@@ -187,6 +187,8 @@ struct DeviceImpl {
     bool worker_core_indirect_draw = false;
     bool worker_core_indirect_draw_scalar_payload = false;
     bool multi_draw_indirect_enabled = false;
+    bool worker_core_indirect_draw_count = false;
+    bool draw_indirect_count_enabled = false;
     // descriptorIndexing: the enabled kDIFeature* bits. CreateDevice folds the app's
     // enabled-feature chain into these (served subset only -- an unserved or off-lane enable is
     // FEATURE_NOT_PRESENT), and the per-binding flag admission, UAB pools, and variable-count
@@ -245,6 +247,8 @@ struct CommandBufferImpl {
     bool worker_core_indirect_draw = false;
     bool worker_core_indirect_draw_scalar_payload = false;
     bool multi_draw_indirect_enabled = false;
+    bool worker_core_indirect_draw_count = false;
+    bool draw_indirect_count_enabled = false;
 };
 
 template <class H> H to_handle(std::uint64_t v) {
@@ -1126,8 +1130,7 @@ void forward_capability_chain(PhysicalDeviceImpl* pd, std::uint32_t which, void*
                 // Required-feature audit: OPTIONAL f12 members the relay does NOT serve
                 // ride this same rollup pass-through as host-TRUE -- an advertise-then-fail. Mask
                 // them FALSE on BOTH lanes (they are not core-version blockers -- none is required
-                // for us, since we do not advertise their gating extensions): drawIndirectCount
-                // (VK_KHR_draw_indirect_count not advertised; vkCmdDraw*IndirectCount unwired),
+                // for us, since we do not advertise their gating extensions):
                 // shaderOutputViewportIndex + shaderOutputLayer (VK_EXT_shader_viewport_index_layer
                 // not advertised; the viewport-index/layer output path is not relayed). Zero code
                 // references any of these -> genuinely unserved; masking is honest + safe (an app
@@ -1137,7 +1140,14 @@ void forward_capability_chain(PhysicalDeviceImpl* pd, std::uint32_t which, void*
                 // through and its pipeline pNext is carried): the mask is on the REPORTED features,
                 // so a well-behaved app never enables them and create_device's chain never carries
                 // them.
-                f12->drawIndirectCount = VK_FALSE;
+                // drawIndirectCount is now served only when the worker advertises the additive
+                // vocabulary bit. Preserve the host's copied value as the authority; an old
+                // worker or host-false feature remains FALSE.
+                f12->drawIndirectCount =
+                    vkr::icd_policy::indirect_count_feature_reported(
+                        pd->caps.core_indirect_draw_count != 0, f12->drawIndirectCount != VK_FALSE)
+                        ? VK_TRUE
+                        : VK_FALSE;
                 f12->shaderOutputViewportIndex = VK_FALSE;
                 f12->shaderOutputLayer = VK_FALSE;
             }
@@ -2104,6 +2114,9 @@ const char* const kDeviceExtAllowlist[] = {
     // Mesa 23.2 emits zero-stage classic barriers whose validity is gated by synchronization2.
     // The relay serves the full sync2 command/submit surface, so expose it on the Zink lane too.
     VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+    // Featureless promoted extension. Unlike legacy allowlist entries, advertisement also needs
+    // the additive worker vocabulary bit; an empty old-worker host list must not uncap it.
+    VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME,
     // (GL/zink): VK_EXT_extended_dynamic_state(2) stays DELIBERATELY NOT advertised -- it
     // pulls zink onto the dynamic-state command surface (vkCmdSetCullMode / SetPatchControlPoints
     // ...) for EVERY pipeline. Without it (and on a reported 1.2 device, where it is not core),
@@ -2145,6 +2158,12 @@ std::vector<const char*> advertised_device_extensions(const PhysicalDeviceImpl* 
                          name) != pd->host_device_extensions.end();
     };
     for (std::uint32_t i = 0; i < kDeviceExtAllowlistCount; ++i) {
+        if (std::strcmp(kDeviceExtAllowlist[i], VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) == 0 &&
+            !vkr::icd_policy::indirect_count_extension_advertised(
+                pd->caps.core_indirect_draw_count != 0, pd->host_device_extensions.empty(),
+                host_has(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME))) {
+            continue;
+        }
         if (host_has(kDeviceExtAllowlist[i])) {
             out.push_back(kDeviceExtAllowlist[i]);
         }
@@ -2192,11 +2211,13 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
     bool wants_vertex_attr_divisor = false;         // vertex-attr-divisor: the ENABLED EXTENSION
     bool wants_vertex_attr_divisor_feature = false; // ... vertexAttributeInstanceRateDivisor
     bool wants_vertex_attr_zero_divisor_feature =
-        false;                                   // ... vertexAttributeInstanceRateZeroDivisor
-    bool wants_transform_feedback = false;       // geometry-stream: the ENABLED EXTENSION
-    bool wants_geometry_streams_feature = false; // ... and the ENABLED geometryStreams feature
-    bool wants_bda_feature = false;              // the ENABLED bufferDeviceAddress feature (no ext)
-    std::uint64_t wants_di_bits = 0;             // the ENABLED served descriptorIndexing bits
+        false;                                      // ... vertexAttributeInstanceRateZeroDivisor
+    bool wants_transform_feedback = false;          // geometry-stream: the ENABLED EXTENSION
+    bool wants_geometry_streams_feature = false;    // ... and the ENABLED geometryStreams feature
+    bool wants_draw_indirect_count = false;         // the ENABLED featureless KHR extension
+    bool wants_draw_indirect_count_feature = false; // ... or promoted core-1.2 feature
+    bool wants_bda_feature = false;    // the ENABLED bufferDeviceAddress feature (no ext)
+    std::uint64_t wants_di_bits = 0;   // the ENABLED served descriptorIndexing bits
     bool wants_unserved_di = false;    // ... and whether any UNSERVED DI member was requested
     std::uint64_t wants_vk13_bits = 0; // Vulkan 1.3 support: the ENABLED served kVk13Feature* bits
     bool wants_unserved_vk13 = false;  // ... and whether any UNSERVED vk13 member was requested
@@ -2243,6 +2264,10 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
                             VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME) == 0) {
                 wants_transform_feedback = true;
             }
+            if (std::strcmp(pCreateInfo->ppEnabledExtensionNames[i],
+                            VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) == 0) {
+                wants_draw_indirect_count = true;
+            }
         }
         // Features ride EITHER pEnabledFeatures (the vkcube path -> base bits) OR a
         // VkPhysicalDeviceFeatures2 + Vulkan11/12/13 + ext feature pNext chain (zink). Capture the
@@ -2274,6 +2299,33 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
             e.size = sz;
             e.blob.assign(reinterpret_cast<const char*>(node), sz); // the app's requested struct
             enabled_feature_chain.push_back(std::move(e));
+        }
+        // drawIndirectCount has only the Vulkan12Features rollup spelling. The KHR extension is
+        // featureless and is collected independently above; either path enables the commands.
+        const auto collect_draw_indirect_count = [&](const VkBaseInStructure* n) {
+            if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
+                wants_draw_indirect_count_feature =
+                    wants_draw_indirect_count_feature ||
+                    reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(n)
+                            ->drawIndirectCount != VK_FALSE;
+            }
+        };
+        for (auto* node = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext);
+             node != nullptr; node = node->pNext) {
+            collect_draw_indirect_count(node);
+            if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+                for (auto* n = static_cast<const VkBaseInStructure*>(
+                         reinterpret_cast<const VkPhysicalDeviceFeatures2*>(node)->pNext);
+                     n != nullptr; n = n->pNext) {
+                    collect_draw_indirect_count(n);
+                }
+            }
+        }
+        if ((wants_draw_indirect_count || wants_draw_indirect_count_feature) &&
+            pd->caps.core_indirect_draw_count == 0) {
+            std::fprintf(stderr, "vkrelay2-icd: rejecting device -- indirect-count drawing "
+                                 "requested but the worker lacks its command vocabulary\n");
+            return VK_ERROR_FEATURE_NOT_PRESENT;
         }
         // did the app enable the dynamicRendering FEATURE (not
         // merely the extension)? Detect it from the standalone
@@ -2740,6 +2792,11 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
         // geometry-stream: the ENABLED geometryStreams feature rides the scalar; the worker
         // re-derives it from the forwarded chain and rejects a mismatch (divisor pattern).
         req.geometry_streams_feature_enabled = wants_geometry_streams_feature ? 1 : 0;
+        req.draw_indirect_count_enabled =
+            vkr::icd_policy::indirect_count_device_enabled(wants_draw_indirect_count,
+                                                           wants_draw_indirect_count_feature)
+                ? 1
+                : 0;
         // the served DI bits ride the scalar; the worker re-derives them from the
         // forwarded chain and rejects a mismatch (normalization, same as BDA's). Off-lane /
         // unserved enables were already rejected above with FEATURE_NOT_PRESENT.
@@ -2810,6 +2867,9 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
             pd->caps.core_indirect_draw_scalar_payload != 0;
         dev->multi_draw_indirect_enabled =
             (enabled_feature_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
+        dev->worker_core_indirect_draw_count = pd->caps.core_indirect_draw_count != 0;
+        dev->draw_indirect_count_enabled = vkr::icd_policy::indirect_count_device_enabled(
+            wants_draw_indirect_count, wants_draw_indirect_count_feature);
         // (bufferDeviceAddress): native lane AND the enabled FEATURE (there is no
         // extension to require -- core 1.2). An off-lane enable was already rejected above with
         // FEATURE_NOT_PRESENT, so this equals wants_bda_feature; the && stays as defense in depth.
@@ -5423,6 +5483,8 @@ VKAPI_ATTR VkResult VKAPI_CALL AllocateCommandBuffers(VkDevice device,
             cb->worker_core_indirect_draw_scalar_payload =
                 dev->worker_core_indirect_draw_scalar_payload;
             cb->multi_draw_indirect_enabled = dev->multi_draw_indirect_enabled;
+            cb->worker_core_indirect_draw_count = dev->worker_core_indirect_draw_count;
+            cb->draw_indirect_count_enabled = dev->draw_indirect_count_enabled;
             pCommandBuffers[i] = reinterpret_cast<VkCommandBuffer>(cb);
         }
         return VK_SUCCESS;
@@ -7344,6 +7406,68 @@ VKAPI_ATTR void VKAPI_CALL CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
     record_core_indirect_draw(commandBuffer, buffer, offset, drawCount, stride, true);
 }
 
+// Vulkan-1.2 / VK_KHR_draw_indirect_count. Both public spellings share this recorder. The
+// worker-vocabulary and enabled-device facts are stamped into the command buffer at allocation,
+// allowing the void entry points to fail locally and deterministically.
+void record_core_indirect_count_draw(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                     VkDeviceSize offset, VkBuffer countBuffer,
+                                     VkDeviceSize countBufferOffset, std::uint32_t maxDrawCount,
+                                     std::uint32_t stride, bool indexed) {
+    auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
+    const char* why = "";
+    if (!vkr::icd_subset::core_indirect_count_worker_ok(cb->worker_core_indirect_draw_count,
+                                                        &why)) {
+        cb->local_invalid = true;
+        cb->invalid_reason = why;
+        return;
+    }
+    const std::uint64_t handle = from_handle(buffer);
+    const std::uint64_t count_handle = from_handle(countBuffer);
+    BufferInfo info;
+    BufferInfo count_info;
+    bool live = false;
+    bool count_live = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        const auto it = g_buffers.find(handle);
+        live = it != g_buffers.end();
+        if (live) {
+            info = it->second;
+        }
+        const auto count_it = g_buffers.find(count_handle);
+        count_live = count_it != g_buffers.end();
+        if (count_live) {
+            count_info = count_it->second;
+        }
+    }
+    if (!vkr::icd_subset::draw_indirect_count_ok(
+            cb->draw_indirect_count_enabled, live, live && info.memory != 0, info.usage, info.size,
+            count_live, count_live && count_info.memory != 0, count_info.usage, count_info.size,
+            offset, countBufferOffset, maxDrawCount, stride, indexed, &why)) {
+        cb->local_invalid = true;
+        cb->invalid_reason = why;
+        return;
+    }
+    cb->recording.push_back(vkrpc::make_core_indirect_count_draw_command(
+        handle, static_cast<std::uint64_t>(offset), count_handle,
+        static_cast<std::uint64_t>(countBufferOffset), maxDrawCount, stride, indexed));
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                                VkDeviceSize offset, VkBuffer countBuffer,
+                                                VkDeviceSize countBufferOffset,
+                                                std::uint32_t maxDrawCount, std::uint32_t stride) {
+    record_core_indirect_count_draw(commandBuffer, buffer, offset, countBuffer, countBufferOffset,
+                                    maxDrawCount, stride, false);
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdDrawIndexedIndirectCount(
+    VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer,
+    VkDeviceSize countBufferOffset, std::uint32_t maxDrawCount, std::uint32_t stride) {
+    record_core_indirect_count_draw(commandBuffer, buffer, offset, countBuffer, countBufferOffset,
+                                    maxDrawCount, stride, true);
+}
+
 // --- (GL/zink): VK_EXT_transform_feedback + VK_EXT_conditional_rendering ----------------
 // The two extensions gating zink's OpenGL 3.0 (see kDeviceExtAllowlist). zink only emits these
 // when the app actually drives GL transform feedback / conditional rendering; the steady-state
@@ -8402,6 +8526,7 @@ PFN_vkVoidFunction get_proc(const char* name) {
     RET(CmdSetScissor);
     RET(CmdDraw);
     RET(CmdDrawIndirect);
+    RET(CmdDrawIndirectCount);
     // Host-visible memory + buffers.
     RET(CreateBuffer);
     RET(DestroyBuffer);
@@ -8422,6 +8547,11 @@ PFN_vkVoidFunction get_proc(const char* name) {
     RET(CmdBindIndexBuffer); // (GL/zink): indexed draws
     RET(CmdDrawIndexed);
     RET(CmdDrawIndexedIndirect);
+    RET(CmdDrawIndexedIndirectCount);
+    if (std::strcmp(name, "vkCmdDrawIndirectCountKHR") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(&CmdDrawIndirectCount);
+    if (std::strcmp(name, "vkCmdDrawIndexedIndirectCountKHR") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(&CmdDrawIndexedIndirectCount);
     RET(CmdPushConstants);
     // (GL/zink): the wired VK_EXT_transform_feedback + VK_EXT_conditional_rendering command
     // surfaces (the vkCmdBegin/EndQueryIndexedEXT pair stays a named abort-stub: XFB-stream queries
@@ -8524,6 +8654,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetInstanceProcAddr(VkInstance, const c
 // extension's alias spellings resolve only where THAT extension was actually enabled. Returns
 // true when `name` must answer NULL for this device (call-time gates stay as defense in depth).
 bool device_proc_gated_off(const DeviceImpl* dev, const char* name) {
+    if (vkr::icd_policy::indirect_count_khr_proc_name(name)) {
+        return !vkr::icd_policy::indirect_count_khr_proc_available(
+            dev->enabled_extensions.count(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) != 0);
+    }
     // Device-level commands that exist ONLY at core 1.3 (no suffix): dynamic rendering, sync2,
     // copy_commands2, private data, maintenance4's queries, and the EDS1/EDS2-subset core names.
     static const char* const kVk13CoreOnly[] = {

@@ -1444,6 +1444,40 @@ void test_native_lane_policy() {
     VKR_CHECK(!native_lane_enabled("true"));
     VKR_CHECK(!native_lane_enabled("1 ")); // no trimming -- exact match only
     VKR_CHECK(!native_lane_enabled("yes"));
+
+    using vkr::icd_policy::indirect_count_device_enabled;
+    using vkr::icd_policy::indirect_count_extension_advertised;
+    using vkr::icd_policy::indirect_count_feature_reported;
+    using vkr::icd_policy::indirect_count_khr_proc_available;
+    VKR_CHECK(!indirect_count_extension_advertised(false, true, false));
+    VKR_CHECK(!indirect_count_extension_advertised(false, false, true));
+    // Unlike legacy allowlist entries, this new surface is strictly host-list-intersected: an
+    // empty/unknown list must not synthesize the KHR name.
+    VKR_CHECK(!indirect_count_extension_advertised(true, true, false));
+    VKR_CHECK(!indirect_count_extension_advertised(true, true, true));
+    VKR_CHECK(indirect_count_extension_advertised(true, false, true));
+    VKR_CHECK(!indirect_count_extension_advertised(true, false, false));
+    VKR_CHECK(indirect_count_feature_reported(true, true));
+    VKR_CHECK(!indirect_count_feature_reported(false, true));
+    VKR_CHECK(!indirect_count_feature_reported(true, false));
+    // A conformant host that enumerates the KHR alias reports the promoted f12 feature too; pin
+    // the relay-side implication and the old-worker converse as paired policy facts.
+    const bool advertised = indirect_count_extension_advertised(true, false, true);
+    const bool reported = indirect_count_feature_reported(true, true);
+    VKR_CHECK(!advertised || reported);
+    VKR_CHECK(!indirect_count_extension_advertised(false, false, true) &&
+              !indirect_count_feature_reported(false, true));
+    VKR_CHECK(indirect_count_device_enabled(true, false));
+    VKR_CHECK(indirect_count_device_enabled(false, true));
+    VKR_CHECK(!indirect_count_device_enabled(false, false));
+    VKR_CHECK(indirect_count_khr_proc_available(true));
+    VKR_CHECK(!indirect_count_khr_proc_available(false));
+    VKR_CHECK(vkr::icd_policy::indirect_count_core_proc_name("vkCmdDrawIndirectCount"));
+    VKR_CHECK(vkr::icd_policy::indirect_count_core_proc_name("vkCmdDrawIndexedIndirectCount"));
+    VKR_CHECK(!vkr::icd_policy::indirect_count_core_proc_name("vkCmdDrawIndirectCountKHR"));
+    VKR_CHECK(vkr::icd_policy::indirect_count_khr_proc_name("vkCmdDrawIndirectCountKHR"));
+    VKR_CHECK(vkr::icd_policy::indirect_count_khr_proc_name("vkCmdDrawIndexedIndirectCountKHR"));
+    VKR_CHECK(!vkr::icd_policy::indirect_count_khr_proc_name("vkCmdDrawIndirectCount"));
 }
 
 void test_core_indirect_draw_validation() {
@@ -1477,6 +1511,28 @@ void test_core_indirect_draw_validation() {
                   std::numeric_limits<std::uint64_t>::max() - 3, 2, 20, true, true));
 }
 
+void test_core_indirect_count_draw_validation() {
+    const char* why = "";
+    VKR_CHECK(icd_subset::core_indirect_count_worker_ok(true, &why));
+    VKR_CHECK(!icd_subset::core_indirect_count_worker_ok(false, &why));
+    const auto ok = [&](bool enabled, bool main_live, bool main_bound,
+                        VkBufferUsageFlags main_usage, VkDeviceSize main_size, bool count_live,
+                        bool count_bound, VkBufferUsageFlags count_usage, VkDeviceSize count_size,
+                        VkDeviceSize offset, VkDeviceSize count_offset, std::uint32_t max_count,
+                        std::uint32_t stride, bool indexed) {
+        return icd_subset::draw_indirect_count_ok(
+            enabled, main_live, main_bound, main_usage, main_size, count_live, count_bound,
+            count_usage, count_size, offset, count_offset, max_count, stride, indexed, &why);
+    };
+    constexpr VkBufferUsageFlags indirect = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    VKR_CHECK(ok(true, true, true, indirect, 64, true, true, indirect, 64, 0, 0, 2, 16, false));
+    VKR_CHECK(ok(true, true, true, indirect, 64, true, true, indirect, 64, 0, 60, 0, 16, false));
+    VKR_CHECK(!ok(false, true, true, indirect, 64, true, true, indirect, 64, 0, 0, 1, 16, false));
+    VKR_CHECK(!ok(true, true, true, indirect, 64, true, true, indirect, 64, 0, 0, 1, 16,
+                  true)); // indexed command is 20 bytes
+    VKR_CHECK(!ok(true, true, true, indirect, 64, true, true, indirect, 64, 0, 64, 0, 16, false));
+}
+
 } // namespace
 
 int main() {
@@ -1488,6 +1544,7 @@ int main() {
     test_commands();
     test_memory_buffer();
     test_core_indirect_draw_validation();
+    test_core_indirect_count_draw_validation();
     test_descriptor_surface();
     test_image_depth();
     test_sampler_copy();

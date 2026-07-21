@@ -1,4 +1,5 @@
-// Observable real-GPU proof for core vkCmdDrawIndexedIndirect replay.
+// Observable real-GPU proof for core vkCmdDrawIndexedIndirect and the Vulkan-1.2/KHR
+// vkCmdDrawIndexedIndirectCount replay path.
 //
 // Two indexed indirect commands draw disjoint solid-color triangles into an offscreen RGBA8
 // image. The first pass submits drawCount=1 and proves only the left triangle appears. When the
@@ -12,6 +13,7 @@
 #include "tests/test_assert.hpp"
 #include "tests/vbo_spv.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -47,6 +49,28 @@ int main() {
     const auto features = backend.get_physical_device_features(feature_req);
     VKR_CHECK(features.ok);
     const bool multi = (features.feature_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
+    vkrpc::GetPhysicalDeviceCapabilityChainRequest count_feature_req;
+    count_feature_req.physical_device = phys;
+    count_feature_req.which = 0;
+    vkrpc::CapabilityChainEntry count_query;
+    count_query.s_type = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    count_query.size = sizeof(VkPhysicalDeviceVulkan12Features);
+    count_feature_req.entries = {count_query};
+    const auto count_features = backend.get_physical_device_capability_chain(count_feature_req);
+    VkPhysicalDeviceVulkan12Features host_f12{};
+    bool count_core = false;
+    if (count_features.ok && count_features.entries.size() == 1 &&
+        count_features.entries[0].blob.size() >= sizeof(host_f12)) {
+        std::memcpy(&host_f12, count_features.entries[0].blob.data(), sizeof(host_f12));
+        count_core = host_f12.drawIndirectCount != VK_FALSE;
+    }
+    const auto& host_extensions = fixture.devices.devices.front().device_extensions;
+    const bool count_khr =
+        std::find(host_extensions.begin(), host_extensions.end(),
+                  VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) != host_extensions.end();
+    VKR_CHECK(fixture.devices.devices.front().caps.core_indirect_draw_count != 0);
+    VKR_CHECK(!count_khr || count_core); // promoted-feature / advertised-KHR consistency
+    const bool count_supported = count_core || count_khr;
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.features.multiDrawIndirect = multi ? VK_TRUE : VK_FALSE;
@@ -61,6 +85,55 @@ int main() {
     cdr.enabled_feature_bits_authoritative = true;
     if (multi) {
         cdr.enabled_feature_bits = vkrpc::kFeatureMultiDrawIndirect;
+    }
+    VkPhysicalDeviceVulkan12Features enabled_f12{};
+    enabled_f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    if (count_core) {
+        enabled_f12.drawIndirectCount = VK_TRUE;
+        vkrpc::CapabilityChainEntry enabled_f12_entry;
+        enabled_f12_entry.s_type = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        enabled_f12_entry.size = sizeof(enabled_f12);
+        enabled_f12_entry.blob.assign(reinterpret_cast<const char*>(&enabled_f12),
+                                      sizeof(enabled_f12));
+        cdr.enabled_feature_chain.push_back(std::move(enabled_f12_entry));
+    }
+    if (count_khr) {
+        cdr.enabled_extensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+    }
+    cdr.draw_indirect_count_enabled = count_supported ? 1 : 0;
+    if (count_supported) {
+        vkrpc::CreateDeviceRequest bad_count = cdr;
+        bad_count.draw_indirect_count_enabled = 0;
+        const auto rejected = backend.create_device(bad_count);
+        VKR_CHECK(!rejected.ok);
+        VKR_CHECK(rejected.reason.find("drawIndirectCount scalar") != std::string::npos);
+        vkrpc::CreateDeviceRequest legacy_count = cdr;
+        legacy_count.draw_indirect_count_enabled = vkrpc::kDrawIndirectCountScalarOmitted;
+        const auto derived = backend.create_device(legacy_count);
+        VKR_CHECK(derived.ok);
+        if (derived.ok) {
+            VKR_CHECK(backend.destroy_device({derived.device}).ok);
+        }
+    }
+    if (count_core) {
+        vkrpc::CreateDeviceRequest core_only = cdr;
+        core_only.enabled_extensions.clear();
+        const auto core_device = backend.create_device(core_only);
+        VKR_CHECK(core_device.ok);
+        if (core_device.ok) {
+            VKR_CHECK(backend.destroy_device({core_device.device}).ok);
+        }
+    }
+    if (count_khr) {
+        vkrpc::CreateDeviceRequest khr_only = cdr;
+        if (khr_only.enabled_feature_chain.size() > 1) {
+            khr_only.enabled_feature_chain.resize(1); // retain Features2, drop enabled f12
+        }
+        const auto khr_device = backend.create_device(khr_only);
+        VKR_CHECK(khr_device.ok);
+        if (khr_device.ok) {
+            VKR_CHECK(backend.destroy_device({khr_device.device}).ok);
+        }
     }
     // A new-client scalar must agree exactly with the Features2 chain: the chain is what reaches
     // host vkCreateDevice. An absent authority marker retains the legacy old-ICD spelling, where
@@ -174,6 +247,25 @@ int main() {
     const BoundBuffer index = make_buffer(vkrpc::kBufferUsageIndexBuffer, sizeof(indices), indices);
     const BoundBuffer indirect =
         make_buffer(vkrpc::kBufferUsageIndirectBuffer, sizeof(draws), draws);
+    const std::uint32_t count_one_value = 1;
+    const std::uint32_t count_two_value = 2;
+    const std::uint32_t count_zero_value = 0;
+    const std::uint32_t count_offset_values[] = {2, 0, 1}; // offset-0 decoy, offset-8 truth
+    const BoundBuffer count_one =
+        make_buffer(vkrpc::kBufferUsageIndirectBuffer, sizeof(count_one_value), &count_one_value);
+    const BoundBuffer count_two =
+        make_buffer(vkrpc::kBufferUsageIndirectBuffer, sizeof(count_two_value), &count_two_value);
+    const BoundBuffer count_zero =
+        make_buffer(vkrpc::kBufferUsageIndirectBuffer, sizeof(count_zero_value), &count_zero_value);
+    const BoundBuffer count_offset = make_buffer(vkrpc::kBufferUsageIndirectBuffer,
+                                                 sizeof(count_offset_values), count_offset_values);
+    vkrpc::CreateBufferRequest unbound_count_req;
+    unbound_count_req.device = cd.device;
+    unbound_count_req.size = 4;
+    unbound_count_req.usage = vkrpc::kBufferUsageIndirectBuffer;
+    unbound_count_req.sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
+    const auto unbound_count = backend.create_buffer(unbound_count_req);
+    VKR_CHECK(unbound_count.ok);
     const BoundBuffer readback =
         make_buffer(vkrpc::kBufferUsageTransferDst, kReadbackBytes, nullptr);
 
@@ -313,7 +405,7 @@ int main() {
     const auto fence = backend.create_fence(fence_req);
     VKR_CHECK(fence.ok);
 
-    auto render = [&](long long draw_count) {
+    auto record_draw = [&](vkrpc::RecordedCommand draw) {
         vkrpc::RecordedCommand begin;
         begin.kind = "begin_render_pass";
         begin.render_pass = render_pass.render_pass;
@@ -342,12 +434,6 @@ int main() {
         bind_index.kind = "bind_index_buffer";
         bind_index.args_u64 = {index.buffer, 0};
         bind_index.args_i64 = {VK_INDEX_TYPE_UINT32};
-        vkrpc::RecordedCommand draw;
-        draw.kind = "draw_indexed_indirect";
-        draw.src_buffer = indirect.buffer;
-        draw.indirect_offset = 0;
-        draw.indirect_draw_count = draw_count;
-        draw.indirect_stride = sizeof(VkDrawIndexedIndirectCommand);
         vkrpc::RecordedCommand end;
         end.kind = "end_render_pass";
         vkrpc::RecordedCommand barrier;
@@ -385,7 +471,10 @@ int main() {
         record.one_time_submit = true;
         record.commands = {begin,      bind_pipeline, viewport, scissor, bind_vertex,
                            bind_index, draw,          end,      barrier, copy};
-        const auto recorded = backend.record_command_buffer(record);
+        return backend.record_command_buffer(record);
+    };
+    auto render = [&](vkrpc::RecordedCommand draw) {
+        const auto recorded = record_draw(std::move(draw));
         if (!recorded.ok) {
             std::fprintf(stderr, "integration_real_indirect: record rejected: %s\n",
                          recorded.reason.c_str());
@@ -415,14 +504,39 @@ int main() {
     auto pixel = [&](const std::string& bytes, int x, int y, int channel) {
         return static_cast<unsigned char>(bytes[(y * kExtent + x) * 4 + channel]);
     };
-    const std::string one = render(1);
-    VKR_CHECK(pixel(one, 16, 32, 0) > 200 && pixel(one, 16, 32, 1) < 40);
-    VKR_CHECK(pixel(one, 48, 32, 0) < 40 && pixel(one, 48, 32, 1) < 40);
-    if (multi) {
+    const auto base_draw = [&](long long draw_count) {
+        vkrpc::RecordedCommand draw;
+        draw.kind = "draw_indexed_indirect";
+        draw.src_buffer = indirect.buffer;
+        draw.indirect_offset = 0;
+        draw.indirect_draw_count = draw_count;
+        draw.indirect_stride = sizeof(VkDrawIndexedIndirectCommand);
+        return draw;
+    };
+    const auto counted_draw = [&](std::uint64_t count_buffer, std::uint64_t count_buffer_offset,
+                                  long long max_draw_count) {
+        vkrpc::RecordedCommand draw;
+        draw.kind = "draw_indexed_indirect_count";
+        draw.src_buffer = indirect.buffer;
+        draw.indirect_offset = 0;
+        draw.indirect_draw_count = max_draw_count;
+        draw.indirect_stride = sizeof(VkDrawIndexedIndirectCommand);
+        draw.indirect_count_buffer = count_buffer;
+        draw.indirect_count_buffer_offset = count_buffer_offset;
+        return draw;
+    };
+    const auto reset_fence = [&] {
         vkrpc::ResetFencesRequest reset;
         reset.fences = {fence.fence};
         VKR_CHECK(backend.reset_fences(reset).ok);
-        const std::string two = render(2);
+    };
+
+    const std::string one = render(base_draw(1));
+    VKR_CHECK(pixel(one, 16, 32, 0) > 200 && pixel(one, 16, 32, 1) < 40);
+    VKR_CHECK(pixel(one, 48, 32, 0) < 40 && pixel(one, 48, 32, 1) < 40);
+    if (multi) {
+        reset_fence();
+        const std::string two = render(base_draw(2));
         VKR_CHECK(pixel(two, 16, 32, 0) > 200 && pixel(two, 16, 32, 1) < 40);
         VKR_CHECK(pixel(two, 48, 32, 0) < 40 && pixel(two, 48, 32, 1) > 200);
     } else {
@@ -431,6 +545,56 @@ int main() {
     }
     std::fprintf(stderr, "integration_real_indirect: indexed indirect pixels verified%s\n",
                  multi ? " (drawCount 1 and 2)" : " (drawCount 1)");
+
+    if (count_supported) {
+        // Real-backend negative admission checks: the shared predicate is reached after full draw
+        // readiness and rejects every count-buffer class before a host command is recorded.
+        const auto dead = record_draw(counted_draw(0xDEAD, 0, 2));
+        VKR_CHECK(!dead.ok && dead.reason.find("not live") != std::string::npos);
+        const auto not_bound = record_draw(counted_draw(unbound_count.buffer, 0, 2));
+        VKR_CHECK(!not_bound.ok && not_bound.reason.find("not bound") != std::string::npos);
+        const auto wrong_usage = record_draw(counted_draw(vertex.buffer, 0, 2));
+        VKR_CHECK(!wrong_usage.ok &&
+                  wrong_usage.reason.find("INDIRECT_BUFFER") != std::string::npos);
+        const auto misaligned = record_draw(counted_draw(count_one.buffer, 2, 2));
+        VKR_CHECK(!misaligned.ok && misaligned.reason.find("aligned") != std::string::npos);
+        const auto out_of_range = record_draw(counted_draw(count_one.buffer, 4, 2));
+        VKR_CHECK(!out_of_range.ok && out_of_range.reason.find("count slot") != std::string::npos);
+
+        reset_fence();
+        const std::string count_one_pixels = render(counted_draw(count_one.buffer, 0, 2));
+        VKR_CHECK(pixel(count_one_pixels, 16, 32, 0) > 200 &&
+                  pixel(count_one_pixels, 16, 32, 1) < 40);
+        VKR_CHECK(pixel(count_one_pixels, 48, 32, 0) < 40 &&
+                  pixel(count_one_pixels, 48, 32, 1) < 40);
+
+        reset_fence();
+        const std::string count_two_pixels = render(counted_draw(count_two.buffer, 0, 2));
+        VKR_CHECK(pixel(count_two_pixels, 16, 32, 0) > 200 &&
+                  pixel(count_two_pixels, 16, 32, 1) < 40);
+        VKR_CHECK(pixel(count_two_pixels, 48, 32, 0) < 40 &&
+                  pixel(count_two_pixels, 48, 32, 1) > 200);
+
+        reset_fence();
+        const std::string clamped_pixels = render(counted_draw(count_two.buffer, 0, 1));
+        VKR_CHECK(pixel(clamped_pixels, 16, 32, 0) > 200 && pixel(clamped_pixels, 16, 32, 1) < 40);
+        VKR_CHECK(pixel(clamped_pixels, 48, 32, 0) < 40 && pixel(clamped_pixels, 48, 32, 1) < 40);
+
+        reset_fence();
+        const std::string zero_pixels = render(counted_draw(count_zero.buffer, 0, 2));
+        VKR_CHECK(pixel(zero_pixels, 16, 32, 0) < 40 && pixel(zero_pixels, 16, 32, 1) < 40);
+        VKR_CHECK(pixel(zero_pixels, 48, 32, 0) < 40 && pixel(zero_pixels, 48, 32, 1) < 40);
+
+        reset_fence();
+        const std::string offset_pixels = render(counted_draw(count_offset.buffer, 8, 2));
+        VKR_CHECK(pixel(offset_pixels, 16, 32, 0) > 200 && pixel(offset_pixels, 16, 32, 1) < 40);
+        VKR_CHECK(pixel(offset_pixels, 48, 32, 0) < 40 && pixel(offset_pixels, 48, 32, 1) < 40);
+        std::fprintf(stderr, "integration_real_indirect: indexed indirect-count pixels verified "
+                             "(count 0/1/2, max clamp, offset-8 decoy)\n");
+    } else {
+        std::fprintf(stderr, "integration_real_indirect: indirect-count legs skipped (host surface "
+                             "absent)\n");
+    }
 
     VKR_CHECK(backend.destroy_command_pool({pool.command_pool}).ok);
     VKR_CHECK(backend.destroy_fence({fence.fence}).ok);
@@ -443,7 +607,9 @@ int main() {
     VKR_CHECK(backend.destroy_image_view({view.image_view}).ok);
     VKR_CHECK(backend.destroy_image({image.image}).ok);
     VKR_CHECK(backend.free_memory({image_memory.memory}).ok);
-    for (const BoundBuffer buffer : {vertex, index, indirect, readback}) {
+    VKR_CHECK(backend.destroy_buffer({unbound_count.buffer}).ok);
+    for (const BoundBuffer buffer :
+         {vertex, index, indirect, count_one, count_two, count_zero, count_offset, readback}) {
         VKR_CHECK(backend.destroy_buffer({buffer.buffer}).ok);
         VKR_CHECK(backend.free_memory({buffer.memory}).ok);
     }

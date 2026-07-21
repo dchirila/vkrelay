@@ -27,6 +27,38 @@ inline bool native_lane_enabled(const char* env_value) {
     return env_value != nullptr && std::strcmp(env_value, "1") == 0;
 }
 
+// Indirect-count support separates protocol vocabulary from the host's core feature and optional
+// KHR alias name. Older allowlist entries treat an empty host-extension list as the established
+// old-worker/mock "unknown" case. This new extension deliberately does not: its advertisement is
+// host-list-intersected, so both the additive vocabulary bit and a concrete host-list hit are
+// required. That also keeps advertised-KHR => reported-f12-feature true for every peer shape.
+inline bool indirect_count_extension_advertised(bool worker_support, bool host_extension_list_empty,
+                                                bool host_has_extension) {
+    return worker_support && !host_extension_list_empty && host_has_extension;
+}
+
+inline bool indirect_count_feature_reported(bool worker_support, bool host_feature) {
+    return worker_support && host_feature;
+}
+
+inline bool indirect_count_device_enabled(bool extension_enabled, bool feature_enabled) {
+    return extension_enabled || feature_enabled;
+}
+
+inline bool indirect_count_khr_proc_available(bool extension_enabled) {
+    return extension_enabled;
+}
+
+inline bool indirect_count_core_proc_name(const char* name) {
+    return name != nullptr && (std::strcmp(name, "vkCmdDrawIndirectCount") == 0 ||
+                               std::strcmp(name, "vkCmdDrawIndexedIndirectCount") == 0);
+}
+
+inline bool indirect_count_khr_proc_name(const char* name) {
+    return name != nullptr && (std::strcmp(name, "vkCmdDrawIndirectCountKHR") == 0 ||
+                               std::strcmp(name, "vkCmdDrawIndexedIndirectCountKHR") == 0);
+}
+
 } // namespace vkr::icd_policy
 
 #endif // VKRELAY2_LINUX_ICD_ICD_VERSION_POLICY_H

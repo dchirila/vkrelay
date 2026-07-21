@@ -2818,7 +2818,8 @@ struct MockDrawFixture {
     vkrpc::CreateGraphicsPipelinesResponse pipeline;
 
     MockDrawFixture(vkrpc::MockVulkanBackend& backend_in, int extent_in,
-                    std::uint64_t feature_bits = 0, std::vector<std::string> extensions = {})
+                    std::uint64_t feature_bits = 0, std::vector<std::string> extensions = {},
+                    bool draw_indirect_count_enabled = false)
         : backend(backend_in), extent(extent_in) {
         ci = backend.create_instance({});
         vkrpc::EnumeratePhysicalDevicesRequest enumerate;
@@ -2834,6 +2835,7 @@ struct MockDrawFixture {
         create_device.physical_device = physical_device;
         create_device.enabled_extensions = std::move(extensions);
         create_device.enabled_feature_bits = feature_bits;
+        create_device.draw_indirect_count_enabled = draw_indirect_count_enabled ? 1 : 0;
         device = backend.create_device(create_device);
         VKR_CHECK(device.ok);
 
@@ -3157,6 +3159,238 @@ void test_core_indirect_draw_mock_case(bool multi_draw_indirect) {
 void test_core_indirect_draw_mock() {
     test_core_indirect_draw_mock_case(false);
     test_core_indirect_draw_mock_case(true);
+}
+
+void test_core_indirect_count_validation() {
+    const vkrpc::IndirectBufferState good{true, true, true, 64};
+    const char* why = "";
+    const auto ok = [&](bool enabled, vkrpc::IndirectBufferState main,
+                        vkrpc::IndirectBufferState count, std::uint64_t offset,
+                        std::uint64_t count_offset, long long max_count, long long stride,
+                        std::uint64_t command_size) {
+        return vkrpc::core_indirect_count_draw_ok(enabled, main, count, offset, count_offset,
+                                                  max_count, stride, command_size, &why);
+    };
+    VKR_CHECK(ok(true, good, good, 0, 0, 2, 16, 16));
+    VKR_CHECK(ok(true, good, good, 0, 60, 0, 16, 16)); // zero max still reads count slot
+    VKR_CHECK(!ok(false, good, good, 0, 0, 1, 16, 16));
+    auto bad = good;
+    bad.live = false;
+    VKR_CHECK(!ok(true, bad, good, 0, 0, 1, 16, 16));
+    bad = good;
+    bad.bound = false;
+    VKR_CHECK(!ok(true, bad, good, 0, 0, 1, 16, 16));
+    bad = good;
+    bad.has_indirect_usage = false;
+    VKR_CHECK(!ok(true, bad, good, 0, 0, 1, 16, 16));
+    bad = good;
+    bad.live = false;
+    VKR_CHECK(!ok(true, good, bad, 0, 0, 1, 16, 16));
+    bad = good;
+    bad.bound = false;
+    VKR_CHECK(!ok(true, good, bad, 0, 0, 1, 16, 16));
+    bad = good;
+    bad.has_indirect_usage = false;
+    VKR_CHECK(!ok(true, good, bad, 0, 0, 1, 16, 16));
+    VKR_CHECK(!ok(true, good, good, 2, 0, 1, 16, 16));
+    VKR_CHECK(!ok(true, good, good, 0, 2, 1, 16, 16));
+    VKR_CHECK(!ok(true, good, good, 0, 64, 1, 16, 16));
+    VKR_CHECK(!ok(true, good, good, 0, std::numeric_limits<std::uint64_t>::max() - 3, 1, 16, 16));
+    VKR_CHECK(!ok(true, good, good, 0, 0, -1, 16, 16));
+    VKR_CHECK(!ok(true, good, good, 0, 0,
+                  static_cast<long long>(std::numeric_limits<std::uint32_t>::max()) + 1, 16, 16));
+    VKR_CHECK(!ok(true, good, good, 0, 0, 1, -1, 16));
+    VKR_CHECK(!ok(true, good, good, 0, 0, 1,
+                  static_cast<long long>(std::numeric_limits<std::uint32_t>::max()) + 1, 16));
+    // Count variants require a valid stride unconditionally, even at maxDrawCount 0/1.
+    VKR_CHECK(!ok(true, good, good, 0, 0, 0, 15, 16));
+    VKR_CHECK(!ok(true, good, good, 0, 0, 1, 12, 16));
+    VKR_CHECK(!ok(true, good, good, 0, 0, 1, 18, 16));
+    VKR_CHECK(!ok(true, good, good, 48, 0, 2, 16, 16));
+    VKR_CHECK(!ok(true, good, good, std::numeric_limits<std::uint64_t>::max() - 3, 0, 2, 16, 16));
+    // maxDrawCount > 1 has no multiDrawIndirect dependency, and buffer aliasing is legal.
+    VKR_CHECK(ok(true, good, good, 0, 60, 2, 16, 16));
+}
+
+void test_core_indirect_count_draw_mock_case(bool enabled) {
+    const std::vector<protocol::GpuDevice> devices = protocol::probe_mocked();
+    vkrpc::MockVulkanBackend backend(devices.front().name);
+    MockDrawFixture fixture(backend, 64, 0, {}, enabled);
+    vkrpc::GetPhysicalDeviceMemoryPropertiesRequest mpr;
+    mpr.physical_device = fixture.physical_device;
+    const auto memory_props = backend.get_physical_device_memory_properties(mpr);
+    VKR_CHECK(memory_props.ok);
+    struct TestBuffer {
+        std::uint64_t buffer = 0;
+        std::uint64_t memory = 0;
+    };
+    auto make_buffer = [&](std::uint64_t usage, bool bind) {
+        vkrpc::CreateBufferRequest req;
+        req.device = fixture.device.device;
+        req.size = 64;
+        req.usage = usage;
+        req.sharing_mode = 0;
+        const auto made = backend.create_buffer(req);
+        VKR_CHECK(made.ok);
+        TestBuffer result{made.buffer, 0};
+        if (!bind) {
+            return result;
+        }
+        int type = -1;
+        for (std::size_t i = 0; i < memory_props.types.size() && i < 32; ++i) {
+            if ((made.mem_type_bits & (std::uint64_t{1} << i)) != 0) {
+                type = static_cast<int>(i);
+                break;
+            }
+        }
+        VKR_CHECK(type >= 0);
+        vkrpc::AllocateMemoryRequest ar;
+        ar.device = fixture.device.device;
+        ar.allocation_size = made.mem_size;
+        ar.memory_type_index = type;
+        const auto memory = backend.allocate_memory(ar);
+        VKR_CHECK(memory.ok);
+        vkrpc::BindBufferMemoryRequest br;
+        br.buffer = made.buffer;
+        br.memory = memory.memory;
+        VKR_CHECK(backend.bind_buffer_memory(br).ok);
+        result.memory = memory.memory;
+        return result;
+    };
+    const TestBuffer main0 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
+    const TestBuffer count0 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
+    const TestBuffer main1 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
+    const TestBuffer count1 = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
+    const TestBuffer wrong = make_buffer(vkrpc::kBufferUsageVertexBuffer, true);
+    const TestBuffer unbound = make_buffer(vkrpc::kBufferUsageIndirectBuffer, false);
+    const TestBuffer index = make_buffer(vkrpc::kBufferUsageIndexBuffer, true);
+
+    auto draw = [&](bool indexed, std::uint64_t main, std::uint64_t count,
+                    std::uint64_t count_offset = 0) {
+        vkrpc::RecordedCommand c = vkrpc::make_core_indirect_count_draw_command(
+            main, 0, count, count_offset, 2, indexed ? 20u : 16u, indexed);
+        c.kind = std::string(vkrpc::recorded_command_kind_name(c));
+        return c;
+    };
+    auto record = [&](vkrpc::RecordedCommand d, bool bind_index) {
+        vkrpc::RecordedCommand begin;
+        begin.kind = "begin_render_pass";
+        begin.render_pass = fixture.render_pass.render_pass;
+        begin.framebuffer = fixture.framebuffer.framebuffer;
+        begin.render_area_w = 64;
+        begin.render_area_h = 64;
+        vkrpc::RecordedCommand bind;
+        bind.kind = "bind_pipeline";
+        bind.pipeline = fixture.pipeline.pipeline;
+        vkrpc::RecordedCommand viewport;
+        viewport.kind = "set_viewport";
+        viewport.vp_w = 64;
+        viewport.vp_h = 64;
+        viewport.vp_max_depth = 1;
+        vkrpc::RecordedCommand scissor;
+        scissor.kind = "set_scissor";
+        scissor.sc_w = 64;
+        scissor.sc_h = 64;
+        vkrpc::RecordedCommand ib;
+        ib.kind = "bind_index_buffer";
+        ib.args_u64 = {index.buffer, 0};
+        ib.args_i64 = {0};
+        vkrpc::RecordedCommand end;
+        end.kind = "end_render_pass";
+        vkrpc::RecordCommandBufferRequest req;
+        req.command_buffer = fixture.command_buffer;
+        req.commands = {begin, bind, viewport, scissor};
+        if (bind_index) {
+            req.commands.push_back(ib);
+        }
+        req.commands.push_back(std::move(d));
+        req.commands.push_back(end);
+        return backend.record_command_buffer(req);
+    };
+
+    if (!enabled) {
+        VKR_CHECK(!record(draw(false, main0.buffer, count0.buffer), false).ok);
+    } else {
+        VKR_CHECK(record(draw(false, main0.buffer, count0.buffer), false).ok);
+        VKR_CHECK(record(draw(true, main0.buffer, count0.buffer), true).ok);
+        VKR_CHECK(!record(draw(true, main0.buffer, count0.buffer), false).ok);
+        VKR_CHECK(record(draw(false, main0.buffer, main0.buffer, 60), false).ok);
+        VKR_CHECK(!record(draw(false, wrong.buffer, count0.buffer), false).ok);
+        VKR_CHECK(!record(draw(false, main0.buffer, wrong.buffer), false).ok);
+        VKR_CHECK(!record(draw(false, main0.buffer, unbound.buffer), false).ok);
+        VKR_CHECK(!record(draw(false, main0.buffer, 0xDEAD), false).ok);
+        auto mixed = draw(false, main0.buffer, count0.buffer);
+        mixed.args_u64 = {0};
+        VKR_CHECK(!record(mixed, false).ok);
+
+        // Both handles are baked dependencies. Destroying either invalidates the last successful
+        // recording; aliasing above did not create a special case.
+        VKR_CHECK(record(draw(false, main0.buffer, count0.buffer), false).ok);
+        VKR_CHECK(backend.destroy_buffer({count0.buffer}).ok);
+        vkrpc::QueueSubmitRequest submit;
+        submit.queue = fixture.queue.queue;
+        submit.command_buffers = {fixture.command_buffer};
+        VKR_CHECK(!backend.queue_submit(submit).ok);
+        VKR_CHECK(record(draw(false, main1.buffer, count1.buffer), false).ok);
+        VKR_CHECK(backend.destroy_buffer({main1.buffer}).ok);
+        VKR_CHECK(!backend.queue_submit(submit).ok);
+    }
+
+    const auto destroy_buffer = [&](const TestBuffer& b) {
+        const bool already_destroyed =
+            enabled && (b.buffer == count0.buffer || b.buffer == main1.buffer);
+        if (b.buffer != 0 && !already_destroyed) {
+            VKR_CHECK(backend.destroy_buffer({b.buffer}).ok);
+        }
+        if (b.memory != 0) {
+            VKR_CHECK(backend.free_memory({b.memory}).ok);
+        }
+    };
+    destroy_buffer(main0);
+    destroy_buffer(count0);
+    destroy_buffer(main1);
+    destroy_buffer(count1);
+    destroy_buffer(wrong);
+    destroy_buffer(unbound);
+    destroy_buffer(index);
+    VKR_CHECK(backend.destroy_pipeline({fixture.pipeline.pipeline}).ok);
+    VKR_CHECK(backend.destroy_pipeline_layout({fixture.pipeline_layout.pipeline_layout}).ok);
+    VKR_CHECK(backend.destroy_framebuffer({fixture.framebuffer.framebuffer}).ok);
+    VKR_CHECK(backend.destroy_render_pass({fixture.render_pass.render_pass}).ok);
+    VKR_CHECK(backend.destroy_shader_module({fixture.vertex_shader.shader_module}).ok);
+    VKR_CHECK(backend.destroy_shader_module({fixture.fragment_shader.shader_module}).ok);
+    VKR_CHECK(backend.destroy_image_view({fixture.image_view.image_view}).ok);
+    VKR_CHECK(backend.destroy_swapchain({fixture.swapchain.swapchain}).ok);
+    VKR_CHECK(backend.destroy_command_pool({fixture.command_pool.command_pool}).ok);
+    VKR_CHECK(backend.destroy_surface({fixture.surface.surface}).ok);
+    VKR_CHECK(backend.destroy_device({fixture.device.device}).ok);
+    VKR_CHECK(backend.destroy_instance({fixture.ci.instance}).ok);
+}
+
+void test_core_indirect_count_draw_mock() {
+    test_core_indirect_count_validation();
+    {
+        const auto devices = protocol::probe_mocked();
+        vkrpc::MockVulkanBackend backend(devices.front().name);
+        const auto instance = backend.create_instance({});
+        vkrpc::EnumeratePhysicalDevicesRequest er;
+        er.instance = instance.instance;
+        const auto enumerated = backend.enumerate_physical_devices(er);
+        vkrpc::CreateDeviceRequest old_icd;
+        old_icd.instance = instance.instance;
+        old_icd.physical_device = enumerated.devices.front().handle;
+        old_icd.enabled_extensions = {vkrpc::kDrawIndirectCountExtensionName};
+        old_icd.draw_indirect_count_enabled = vkrpc::kDrawIndirectCountScalarOmitted;
+        const auto derived = backend.create_device(old_icd);
+        VKR_CHECK(derived.ok); // absent scalar derives the extension path
+        VKR_CHECK(backend.destroy_device({derived.device}).ok);
+        auto invalid = old_icd;
+        invalid.draw_indirect_count_enabled = vkrpc::kDrawIndirectCountScalarInvalid;
+        VKR_CHECK(!backend.create_device(invalid).ok);
+        VKR_CHECK(backend.destroy_instance({instance.instance}).ok);
+    }
+    test_core_indirect_count_draw_mock_case(false);
+    test_core_indirect_count_draw_mock_case(true);
 }
 
 // draw surface on the mock backend: the full bufferless-triangle object graph + the
@@ -5746,6 +5980,11 @@ void test_image_depth_wire() {
     VKR_CHECK_EQ(
         static_cast<int>(vkrpc::DeviceCaps::from_body(stripped).core_indirect_draw_scalar_payload),
         0);
+    caps.core_indirect_draw_count = 1;
+    VKR_CHECK_EQ(
+        static_cast<int>(vkrpc::DeviceCaps::from_body(caps.to_body()).core_indirect_draw_count), 1);
+    VKR_CHECK_EQ(static_cast<int>(vkrpc::DeviceCaps::from_body(stripped).core_indirect_draw_count),
+                 0);
 
     // Pipeline carries depth-stencil state.
     vkrpc::CreateGraphicsPipelinesRequest gp;
@@ -8322,11 +8561,13 @@ void test_zink_caps_wire() {
         req.enabled_extensions = {"VK_KHR_swapchain", "VK_KHR_maintenance1"};
         req.enabled_feature_bits = 0xDEAD;
         req.enabled_feature_bits_authoritative = true;
+        req.draw_indirect_count_enabled = 1;
         const auto rt = vkrpc::CreateDeviceRequest::from_body(req.to_body());
         VKR_CHECK_EQ(rt.enabled_extensions.size(), static_cast<std::size_t>(2));
         VKR_CHECK_EQ(rt.enabled_extensions[1], std::string("VK_KHR_maintenance1"));
         VKR_CHECK_EQ(rt.enabled_feature_bits, static_cast<std::uint64_t>(0xDEAD));
         VKR_CHECK(rt.enabled_feature_bits_authoritative);
+        VKR_CHECK_EQ(rt.draw_indirect_count_enabled, 1);
         // Legacy request (no new keys) -> empty list + 0 bits (the worker's prior behavior).
         const auto legacy = vkrpc::CreateDeviceRequest::from_body([] {
             json::Value b = json::Value::make_object();
@@ -8337,6 +8578,11 @@ void test_zink_caps_wire() {
         VKR_CHECK(legacy.enabled_extensions.empty());
         VKR_CHECK_EQ(legacy.enabled_feature_bits, static_cast<std::uint64_t>(0));
         VKR_CHECK(!legacy.enabled_feature_bits_authoritative);
+        VKR_CHECK_EQ(legacy.draw_indirect_count_enabled, vkrpc::kDrawIndirectCountScalarOmitted);
+        json::Value forged = req.to_body();
+        forged.set("draw_indirect_count_enabled", json::Value(-1));
+        VKR_CHECK_EQ(vkrpc::CreateDeviceRequest::from_body(forged).draw_indirect_count_enabled,
+                     vkrpc::kDrawIndirectCountScalarInvalid);
     }
 }
 
@@ -9355,7 +9601,11 @@ void test_record_raw_wire() {
     indexed_indirect.indirect_offset = 20;
     indexed_indirect.indirect_draw_count = 3;
     indexed_indirect.indirect_stride = 20;
-    req.commands = {c, d, indirect, indexed_indirect};
+    vkrpc::RecordedCommand indirect_count =
+        vkrpc::make_core_indirect_count_draw_command(0xB0B, 24, 0xC0C, 8, 4, 16, false);
+    vkrpc::RecordedCommand indexed_indirect_count =
+        vkrpc::make_core_indirect_count_draw_command(0xD0D, 40, 0xE0E, 12, 5, 20, true);
+    req.commands = {c, d, indirect, indexed_indirect, indirect_count, indexed_indirect_count};
 
     const std::string wire = req.to_wire();
     std::string err;
@@ -9375,6 +9625,11 @@ void test_record_raw_wire() {
     VKR_CHECK(vkrpc::cmd_kind_from_string(back.commands[2].kind) == vkrpc::CmdKind::DrawIndirect);
     VKR_CHECK(vkrpc::cmd_kind_from_string(back.commands[3].kind) ==
               vkrpc::CmdKind::DrawIndexedIndirect);
+    VKR_CHECK_EQ(back.commands[4].kind, std::string("draw_indirect_count"));
+    VKR_CHECK_EQ(back.commands[4].indirect_count_buffer, 0xC0Cull);
+    VKR_CHECK_EQ(back.commands[4].indirect_count_buffer_offset, 8ull);
+    VKR_CHECK_EQ(back.commands[4].indirect_draw_count, 4ll);
+    VKR_CHECK_EQ(back.commands[5].kind, std::string("draw_indexed_indirect_count"));
     // New-to-new: the ICD hot-path spelling owns no kind string or payload vectors; the codec
     // emits the canonical kind and the worker decodes an ordinary command.
     vkrpc::RecordCommandBufferRequest hot_path;
@@ -9387,6 +9642,82 @@ void test_record_raw_wire() {
     VKR_CHECK(hot_indexed.args_u64.empty() && hot_indexed.args_i64.empty());
     VKR_CHECK_EQ(hot_back.commands[0].kind, std::string("draw_indexed_indirect"));
     VKR_CHECK_EQ(hot_back.commands[0].indirect_offset, 4ull);
+    // Count producers are allocation-free too, and their raw shape always has frozen base group
+    // 16 plus dedicated group 17. Base producers never set group 17.
+    vkrpc::RecordCommandBufferRequest hot_count;
+    vkrpc::RecordedCommand hot_counted =
+        vkrpc::make_core_indirect_count_draw_command(0x111, 4, 0x222, 8, 2, 20, true);
+    hot_count.commands = {hot_counted};
+    const auto read_u64 = [](const std::string& bytes, std::size_t at) {
+        std::uint64_t value = 0;
+        for (unsigned i = 0; i < 8; ++i) {
+            value |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[at + i]))
+                     << (i * 8);
+        }
+        return value;
+    };
+    const auto one_command_mask_offset = [&](const std::string& bytes) {
+        const std::uint32_t json_size =
+            static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[0])) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[1])) << 8) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[2])) << 16) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[3])) << 24);
+        const std::size_t kind_len_at = 4 + json_size;
+        return kind_len_at + 8 + static_cast<std::size_t>(read_u64(bytes, kind_len_at));
+    };
+    const std::string base_hot_wire = hot_path.to_wire();
+    const std::string count_hot_wire = hot_count.to_wire();
+    const std::uint64_t base_mask = read_u64(base_hot_wire, one_command_mask_offset(base_hot_wire));
+    const std::uint64_t count_mask =
+        read_u64(count_hot_wire, one_command_mask_offset(count_hot_wire));
+    VKR_CHECK((base_mask & (std::uint64_t{1} << 16)) != 0);
+    VKR_CHECK((base_mask & (std::uint64_t{1} << 17)) == 0);
+    VKR_CHECK((count_mask & (std::uint64_t{1} << 16)) != 0);
+    VKR_CHECK((count_mask & (std::uint64_t{1} << 17)) != 0);
+    const auto count_back = vkrpc::RecordCommandBufferRequest::from_wire(count_hot_wire, err);
+    VKR_CHECK(err.empty());
+    VKR_CHECK(hot_counted.kind.empty() && hot_counted.args_u64.empty() &&
+              hot_counted.args_i64.empty());
+    VKR_CHECK_EQ(count_back.commands[0].kind, std::string("draw_indexed_indirect_count"));
+    vkrpc::CoreIndirectCountDrawArgs count_args;
+    const char* count_reason = "";
+    VKR_CHECK(
+        vkrpc::core_indirect_count_draw_args(count_back.commands[0], count_args, &count_reason));
+    VKR_CHECK_EQ(count_args.count_buffer, 0x222ull);
+    VKR_CHECK_EQ(count_args.count_buffer_offset, 8ull);
+    auto mixed_count = count_back.commands[0];
+    mixed_count.args_u64 = {0};
+    VKR_CHECK(!vkrpc::core_indirect_count_draw_args(mixed_count, count_args, &count_reason));
+    auto mixed_base = hot_back.commands[0];
+    mixed_base.indirect_count_buffer = 0x333;
+    vkrpc::CoreIndirectDrawArgs base_args;
+    VKR_CHECK(!vkrpc::core_indirect_draw_args(mixed_base, base_args, &count_reason));
+
+    // Dedicated fail-closed pins for group 17: truncation, an unknown next group, a base kind
+    // carrying it, and a count kind missing it.
+    (void) vkrpc::RecordCommandBufferRequest::from_wire(
+        count_hot_wire.substr(0, count_hot_wire.size() - 1), err);
+    VKR_CHECK(!err.empty());
+    auto write_u64 = [](std::string& bytes, std::size_t at, std::uint64_t value) {
+        for (unsigned i = 0; i < 8; ++i) {
+            bytes[at + i] = static_cast<char>((value >> (i * 8)) & 0xFF);
+        }
+    };
+    std::string unknown_group = count_hot_wire;
+    const std::size_t count_mask_at = one_command_mask_offset(unknown_group);
+    write_u64(unknown_group, count_mask_at, count_mask | (std::uint64_t{1} << 18));
+    (void) vkrpc::RecordCommandBufferRequest::from_wire(unknown_group, err);
+    VKR_CHECK(!err.empty());
+    std::string missing_group = count_hot_wire;
+    write_u64(missing_group, count_mask_at, count_mask & ~(std::uint64_t{1} << 17));
+    (void) vkrpc::RecordCommandBufferRequest::from_wire(missing_group, err);
+    VKR_CHECK(!err.empty());
+    std::string base_with_group = base_hot_wire;
+    const std::size_t base_mask_at = one_command_mask_offset(base_with_group);
+    write_u64(base_with_group, base_mask_at, base_mask | (std::uint64_t{1} << 17));
+    base_with_group.append(16, '\0');
+    (void) vkrpc::RecordCommandBufferRequest::from_wire(base_with_group, err);
+    VKR_CHECK(!err.empty());
     // New ICD -> milestone-A worker: the absent scalar-payload capability selects exactly the old
     // positional spelling, while a new worker continues to accept it in the opposite skew.
     vkrpc::RecordedCommand legacy_indirect =
@@ -10039,6 +10370,7 @@ int main() {
     test_surface_queries();
     test_draw_surface_wire();
     test_core_indirect_draw_mock();
+    test_core_indirect_count_draw_mock();
     test_draw_surface_mock();
     test_memory_buffer_wire();
     test_memory_buffer_mock();

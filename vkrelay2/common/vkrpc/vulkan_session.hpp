@@ -98,6 +98,11 @@ struct DeviceCaps {
     // indirect_* scalars (raw field group and JSON keys). Additive: 0 = a milestone-A worker, so
     // a newer ICD emits the original args_u64/args_i64 spelling for rolling-upgrade safety.
     std::uint32_t core_indirect_draw_scalar_payload = 0;
+    // Core-1.2/KHR indirect-count draw protocol surface: 1 iff this worker understands,
+    // validates, tracks, and replays draw_indirect_count + draw_indexed_indirect_count records.
+    // Additive: 0 = an older worker, so the ICD masks the feature and extension and rejects the
+    // void command locally instead of sending an unknown vocabulary/wire group.
+    std::uint32_t core_indirect_draw_count = 0;
 
     json::Value to_body() const;
     static DeviceCaps from_body(const json::Value& body);
@@ -254,6 +259,11 @@ struct CreateDeviceRequest {
     // value -- a transmitted non-0/1 (e.g. a forged -1 dodging the agreement check) decodes
     // kGeometryStreamsScalarInvalid (-2) and create_device rejects it by name (mock == real).
     int geometry_streams_feature_enabled = 0;
+    // Core-1.2/KHR indirect-count operational state. New ICDs send extension-enabled OR
+    // Vulkan12Features.drawIndirectCount-enabled. On the wire this is three-state: an absent key
+    // from an older ICD is derived by the worker from the extension/feature chain; an explicit
+    // 0/1 must agree with that derivation.
+    int draw_indirect_count_enabled = 0;
     // Descriptor indexing: the enabled kDIFeature* bits (the ICD sends only the
     // served kDIFeatureServedBits subset, native lane only). Gates the per-binding flag
     // admission, UPDATE_AFTER_BIND layouts/pools, and variable-count allocation on both backends;
@@ -810,6 +820,9 @@ constexpr bool kMockTransformFeedbackStreamSelect = true;
 // omitted state.
 constexpr int kGeometryStreamsScalarOmitted = -1;
 constexpr int kGeometryStreamsScalarInvalid = -2;
+constexpr int kDrawIndirectCountScalarOmitted = -1;
+constexpr int kDrawIndirectCountScalarInvalid = -2;
+constexpr const char* kDrawIndirectCountExtensionName = "VK_KHR_draw_indirect_count";
 
 // One recorded command. The subset is the minimum a clear frame needs:
 // a single image-memory pipeline barrier and a full-subresource color clear. `kind`
@@ -905,11 +918,17 @@ struct RecordedCommand {
     std::uint64_t indirect_offset = 0;
     long long indirect_draw_count = -1;
     long long indirect_stride = -1;
+    // Core-1.2/KHR indirect-count variants add a second INDIRECT buffer holding the GPU-side draw
+    // count and its byte offset. These fields occupy their own frozen raw-wire group; a zero
+    // handle is missing/malformed while offset zero is valid.
+    std::uint64_t indirect_count_buffer = 0;
+    std::uint64_t indirect_count_buffer_offset = 0;
     // Producer-only kind hint for the negotiated scalar spelling: the ICD leaves the long kind
     // string empty and sets this flag, avoiding its heap allocation. Codecs materialize the
     // canonical wire name. Toward a milestone-A worker, the ICD instead retains the canonical
     // kind string and positional vectors that worker understands.
     bool indirect_indexed = false;
+    bool indirect_counted = false;
     // copy_width/height/depth are GENERIC codec fields (kept wire-compatible; exercised by the
     // codec parity test) -- copy_buffer_to_image itself no longer uses them (its regions ride
     // args_i64, above).
@@ -958,6 +977,14 @@ struct CoreIndirectDrawArgs {
     long long stride = -1;
 };
 
+struct CoreIndirectCountDrawArgs {
+    std::uint64_t offset = 0;
+    long long max_draw_count = -1;
+    long long stride = -1;
+    std::uint64_t count_buffer = 0;
+    std::uint64_t count_buffer_offset = 0;
+};
+
 // Construct the capability-selected producer spelling. New-to-new uses the allocation-free
 // scalar form; a new ICD paired with a milestone-A worker uses its original positional form.
 RecordedCommand make_core_indirect_draw_command(std::uint64_t buffer, std::uint64_t offset,
@@ -968,6 +995,17 @@ RecordedCommand make_core_indirect_draw_command(std::uint64_t buffer, std::uint6
 // mixed/partial payloads. Shared by mock and real validation/replay.
 bool core_indirect_draw_args(const RecordedCommand& command, CoreIndirectDrawArgs& args,
                              const char** reason);
+
+RecordedCommand make_core_indirect_count_draw_command(std::uint64_t buffer, std::uint64_t offset,
+                                                      std::uint64_t count_buffer,
+                                                      std::uint64_t count_buffer_offset,
+                                                      std::uint32_t max_draw_count,
+                                                      std::uint32_t stride, bool indexed);
+
+// Count commands have only the dedicated scalar spelling. Reject partial/mixed payloads and keep
+// the milestone-A base decoder from accepting count-only fields.
+bool core_indirect_count_draw_args(const RecordedCommand& command, CoreIndirectCountDrawArgs& args,
+                                   const char** reason);
 
 // The recorded-command kind vocabulary as an enum. `kind` stays the wire and decoded-struct
 // identity; the indirect producer-only hint above is materialized into that canonical string by
@@ -1083,6 +1121,10 @@ enum class CmdKind : unsigned char {
     // Dedicated indirect_* scalars; legacy positional payloads remain decodable. APPEND-ONLY.
     DrawIndirect,
     DrawIndexedIndirect,
+    // Core-1.2 / VK_KHR_draw_indirect_count. Same base indirect scalars plus raw group 17's count
+    // buffer + offset. APPEND-ONLY.
+    DrawIndirectCount,
+    DrawIndexedIndirectCount,
 };
 CmdKind cmd_kind_from_string(const std::string& kind);
 CmdKind recorded_command_kind(const RecordedCommand& command);
@@ -3653,6 +3695,7 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
         // Core indirect draws: single-draw indirect needs no feature; drawCount > 1 requires the
         // enabled VkPhysicalDeviceFeatures::multiDrawIndirect bit.
         bool multi_draw_indirect_feature_enabled = false;
+        bool draw_indirect_count_enabled = false;
         // Descriptor indexing: the enabled kDIFeature* bits. Gates the per-binding
         // flag admission, UAB layouts/pools, and variable-count allocation.
         std::uint64_t descriptor_indexing_feature_bits = 0;

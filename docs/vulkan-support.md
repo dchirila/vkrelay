@@ -48,8 +48,8 @@ The current RPC and ICD implementation covers these major families:
 - shader modules, pipeline layouts, graphics pipelines, compute pipelines, render passes,
   render-pass2, framebuffers, and imageless framebuffers;
 - vertex/index/indirect buffers, uniform and sampled-image access, push constants, direct draw,
-  indexed draw, core draw indirect and indexed draw indirect, dispatch, dispatch indirect,
-  transfers, clears, blits, resolves, and query copy;
+  indexed draw, core/KHR indirect-count draw, core draw indirect and indexed draw indirect,
+  dispatch, dispatch indirect, transfers, clears, blits, resolves, and query copy;
 - dynamic rendering, synchronization2, extended dynamic state used by the native lane, maintenance4
   memory-requirement queries, private data, buffer device address, multiview, host query reset, and
   copy-commands2;
@@ -118,8 +118,6 @@ The following valid Vulkan shapes are currently rejected rather than approximate
 - pipeline derivatives;
 - dedicated-allocation `pNext` state;
 - render-pass input, resolve, and preserve attachments outside the currently carried forms;
-- indirect-count draw variants (`vkCmdDrawIndirectCount*`); the core
-  `vkCmdDrawIndirect`/`vkCmdDrawIndexedIndirect` pair is implemented;
 - sparse resource binding;
 - external Linux file-descriptor memory, semaphore, and fence handles;
 - image-class portions of descriptor indexing not included in the served buffer-oriented subset;

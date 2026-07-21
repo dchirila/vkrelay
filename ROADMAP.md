@@ -99,11 +99,9 @@ one fail-closed run should replace speculation with its exact named-reject list.
 |---|---|---|
 | Aggregate descriptor indexing and image-class bindless access | Aggregate feature false; buffer-only subset | Med–High |
 | Specialization constants | `pSpecializationInfo` rejected | Low–Med |
-| Indirect draw commands | DispatchIndirect and transform-feedback byte-count only | Low |
 | Secondary command buffers | Inline-only recording model | High |
 | Render-pass resolve attachments | Input/resolve/preserve references rejected | Med |
 | Linux external-FD memory/semaphore/fence | No external handle types advertised | Policy decision: continue honest rejection or define a documented shim tier |
-| Indirect-count draw | Not implemented | Defer |
 
 ## Reliability and maintainability
 

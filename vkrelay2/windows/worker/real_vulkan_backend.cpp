@@ -109,6 +109,7 @@ vkrpc::DeviceCaps caps_from_props(const VkPhysicalDeviceProperties& p) {
     c.rasterization_stream_state = 1;
     c.core_indirect_draw = 1;
     c.core_indirect_draw_scalar_payload = 1;
+    c.core_indirect_draw_count = 1;
     return c;
 }
 
@@ -2239,6 +2240,7 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
     // the scalar is omitted by an older ICD) -- computed inside the normalization block below,
     // consumed at the RealDevice fill.
     bool geometry_streams_enabled = false;
+    bool draw_indirect_count_enabled = false;
     {
         bool chain_bda = false;
         bool chain_bda_unwired_bits = false;
@@ -2247,6 +2249,7 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
         bool chain_divisor = false;      // vertex-attr-divisor: vertexAttributeInstanceRateDivisor
         bool chain_zero_divisor = false; // ... vertexAttributeInstanceRateZeroDivisor
         bool chain_geometry_streams = false; // geometry-stream: geometryStreams (TF features)
+        bool chain_draw_indirect_count = false;
         for (const vkrpc::CapabilityChainEntry& e : req.enabled_feature_chain) {
             // Exact-size gate for the KNOWN structs this normalization interprets:
             // an undersized known blob would otherwise reach the host vkCreateDevice as a
@@ -2282,6 +2285,8 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
                                          f.bufferDeviceAddressCaptureReplay != VK_FALSE ||
                                          f.bufferDeviceAddressMultiDevice != VK_FALSE;
                 chain_host_query_reset = chain_host_query_reset || f.hostQueryReset != VK_FALSE;
+                chain_draw_indirect_count =
+                    chain_draw_indirect_count || f.drawIndirectCount != VK_FALSE;
             }
             // Required-feature audit (hardening): the standalone
             // hostQueryReset feature spelling, exact-size gated like the structs above.
@@ -2451,6 +2456,31 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
         geometry_streams_enabled = req.geometry_streams_feature_enabled < 0
                                        ? chain_geometry_streams
                                        : req.geometry_streams_feature_enabled != 0;
+        // Indirect-count has two legal enable paths: the featureless KHR extension or the promoted
+        // Vulkan-1.2 feature. The additive scalar mirrors their OR. An old ICD omits the key, so
+        // derive from the actual extension/chain instead of rejecting an otherwise valid request.
+        if (req.draw_indirect_count_enabled != vkrpc::kDrawIndirectCountScalarOmitted &&
+            req.draw_indirect_count_enabled != 0 && req.draw_indirect_count_enabled != 1) {
+            resp.ok = false;
+            resp.reason = "draw_indirect_count_enabled must be 0 or 1 when present (omission is "
+                          "wire-key absence, not a transmittable value)";
+            return resp;
+        }
+        const bool extension_draw_indirect_count =
+            std::find(ext_storage.begin(), ext_storage.end(),
+                      VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) != ext_storage.end();
+        const bool derived_draw_indirect_count =
+            extension_draw_indirect_count || chain_draw_indirect_count;
+        if (req.draw_indirect_count_enabled >= 0 &&
+            (req.draw_indirect_count_enabled != 0) != derived_draw_indirect_count) {
+            resp.ok = false;
+            resp.reason = "drawIndirectCount scalar/extension-feature-chain mismatch (the request "
+                          "bit and enabled surface must agree)";
+            return resp;
+        }
+        draw_indirect_count_enabled = req.draw_indirect_count_enabled < 0
+                                          ? derived_draw_indirect_count
+                                          : req.draw_indirect_count_enabled != 0;
     }
     // Descriptor indexing: the same normalization for the DI feature bits --
     // derive what the chain enables (the standalone DescriptorIndexingFeatures struct, exact-size
@@ -2853,6 +2883,7 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
     rd.geometry_streams_feature_enabled = geometry_streams_enabled;
     rd.multi_draw_indirect_feature_enabled =
         (enabled_base_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
+    rd.draw_indirect_count_enabled = draw_indirect_count_enabled;
     if (rd.enabled_extensions.count(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME) != 0) {
         VkPhysicalDeviceTransformFeedbackPropertiesEXT tf_props{};
         tf_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT;
@@ -2876,6 +2907,26 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
             vkGetDeviceProcAddr(vk, "vkCmdEndTransformFeedbackEXT"));
         rd.pfn_draw_indirect_byte_count = reinterpret_cast<PFN_vkCmdDrawIndirectByteCountEXT>(
             vkGetDeviceProcAddr(vk, "vkCmdDrawIndirectByteCountEXT"));
+    }
+    if (rd.draw_indirect_count_enabled) {
+        // Bind the spelling whose enable path made the command legal: KHR aliases for the enabled
+        // extension, core names for the promoted Vulkan-1.2 feature. Do not fall back across an
+        // unenabled surface merely because a loader happens to return its pointer.
+        const bool khr_enabled =
+            rd.enabled_extensions.count(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) != 0;
+        rd.pfn_draw_indirect_count =
+            reinterpret_cast<PFN_vkCmdDrawIndirectCount>(vkGetDeviceProcAddr(
+                vk, khr_enabled ? "vkCmdDrawIndirectCountKHR" : "vkCmdDrawIndirectCount"));
+        rd.pfn_draw_indexed_indirect_count = reinterpret_cast<PFN_vkCmdDrawIndexedIndirectCount>(
+            vkGetDeviceProcAddr(vk, khr_enabled ? "vkCmdDrawIndexedIndirectCountKHR"
+                                                : "vkCmdDrawIndexedIndirectCount"));
+        if (rd.pfn_draw_indirect_count == nullptr ||
+            rd.pfn_draw_indexed_indirect_count == nullptr) {
+            vkDestroyDevice(vk, nullptr);
+            resp.ok = false;
+            resp.reason = "indirect-count drawing enabled but its host commands did not resolve";
+            return resp;
+        }
     }
     if (rd.enabled_extensions.count(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) != 0) {
         rd.pfn_begin_cond_render = reinterpret_cast<PFN_vkCmdBeginConditionalRenderingEXT>(
@@ -5981,14 +6032,16 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
         VkPipelineLayout desc_layout = VK_NULL_HANDLE; // bind_descriptor_sets
         std::vector<VkDescriptorSet> desc_sets;        // bind_descriptor_sets (resolved)
         VkBuffer src_buffer = VK_NULL_HANDLE;          // copy_buffer_to_image
+        VkBuffer count_buffer = VK_NULL_HANDLE;        // indirect-count GPU draw-count source
         VkBuffer dst_buffer = VK_NULL_HANDLE;          // (GL/zink): copy_buffer dest
         VkBuffer index_buffer = VK_NULL_HANDLE;        // (GL/zink): bind_index_buffer
         VkDeviceSize index_offset = 0;
         VkIndexType index_type = VK_INDEX_TYPE_UINT16;
         vkrpc::CoreIndirectDrawArgs indirect_draw; // validated scalar/legacy-normalized payload
-        VkImage dst_image = VK_NULL_HANDLE;        // (GL/zink): blit_image dest
-        std::vector<VkDeviceSize> vsizes;          // (GL/zink): bind_transform_feedback sizes
-        VkQueryPool query_pool = VK_NULL_HANDLE;   // query pools: reset/begin/end/write_timestamp
+        vkrpc::CoreIndirectCountDrawArgs indirect_count_draw; // validated dedicated payload
+        VkImage dst_image = VK_NULL_HANDLE;                   // (GL/zink): blit_image dest
+        std::vector<VkDeviceSize> vsizes;        // (GL/zink): bind_transform_feedback sizes
+        VkQueryPool query_pool = VK_NULL_HANDLE; // query pools: reset/begin/end/write_timestamp
         // (dynamic rendering): the resolved host image views for a begin_rendering command,
         // in the same order the wire carried them (color[0..n-1], depth?, stencil?); a null
         // attachment stays VK_NULL_HANDLE. replay rebuilds VkRenderingInfo from r.cmd's enums +
@@ -6508,18 +6561,24 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
             referenced_draw_objects.insert(c.desc_layout);
         } else if (k == vkrpc::CmdKind::Draw || k == vkrpc::CmdKind::DrawIndexed ||
                    k == vkrpc::CmdKind::DrawIndirectByteCount ||
-                   k == vkrpc::CmdKind::DrawIndirect || k == vkrpc::CmdKind::DrawIndexedIndirect) {
+                   k == vkrpc::CmdKind::DrawIndirect || k == vkrpc::CmdKind::DrawIndexedIndirect ||
+                   k == vkrpc::CmdKind::DrawIndirectCount ||
+                   k == vkrpc::CmdKind::DrawIndexedIndirectCount) {
             if (active_scope == RenderScope::None) {
                 resp.ok = false;
                 resp.reason = "draw outside an active render pass";
                 return resp;
             }
-            if ((k == vkrpc::CmdKind::DrawIndexed || k == vkrpc::CmdKind::DrawIndexedIndirect) &&
+            if ((k == vkrpc::CmdKind::DrawIndexed || k == vkrpc::CmdKind::DrawIndexedIndirect ||
+                 k == vkrpc::CmdKind::DrawIndexedIndirectCount) &&
                 !index_bound) {
                 resp.ok = false;
-                resp.reason = k == vkrpc::CmdKind::DrawIndexed
-                                  ? "draw_indexed without a bound index buffer"
-                                  : "draw_indexed_indirect without a bound index buffer";
+                resp.reason =
+                    k == vkrpc::CmdKind::DrawIndexed
+                        ? "draw_indexed without a bound index buffer"
+                        : (k == vkrpc::CmdKind::DrawIndexedIndirect
+                               ? "draw_indexed_indirect without a bound index buffer"
+                               : "draw_indexed_indirect_count without a bound index buffer");
                 return resp;
             }
             // (GL/zink): the byte-count draw (glDrawTransformFeedback) shares full
@@ -6663,6 +6722,39 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                 r.src_buffer = indirect_buffer->vk;
                 r.indirect_draw = args;
                 referenced_draw_objects.insert(c.src_buffer);
+            } else if (k == vkrpc::CmdKind::DrawIndirectCount ||
+                       k == vkrpc::CmdKind::DrawIndexedIndirectCount) {
+                vkrpc::CoreIndirectCountDrawArgs args;
+                const char* why = "";
+                if (!vkrpc::core_indirect_count_draw_args(c, args, &why)) {
+                    resp.ok = false;
+                    resp.reason = why;
+                    return resp;
+                }
+                const vkrpc::IndirectBufferState buffer = vkrpc::indirect_buffer_state(
+                    buffers_, c.src_buffer, device, vkrpc::kBufferUsageIndirectBuffer);
+                const vkrpc::IndirectBufferState count_buffer = vkrpc::indirect_buffer_state(
+                    buffers_, args.count_buffer, device, vkrpc::kBufferUsageIndirectBuffer);
+                if (!vkrpc::core_indirect_count_draw_ok(
+                        dev->second.draw_indirect_count_enabled, buffer, count_buffer, args.offset,
+                        args.count_buffer_offset, args.max_draw_count, args.stride,
+                        k == vkrpc::CmdKind::DrawIndexedIndirectCount
+                            ? vkrpc::kDrawIndexedIndirectCommandBytes
+                            : vkrpc::kDrawIndirectCommandBytes,
+                        &why)) {
+                    resp.ok = false;
+                    resp.reason = why;
+                    return resp;
+                }
+                const auto* indirect_buffer =
+                    vkrpc::live_device_buffer(buffers_, c.src_buffer, device);
+                const auto* resolved_count_buffer =
+                    vkrpc::live_device_buffer(buffers_, args.count_buffer, device);
+                r.src_buffer = indirect_buffer->vk;
+                r.count_buffer = resolved_count_buffer->vk;
+                r.indirect_count_draw = args;
+                referenced_draw_objects.insert(c.src_buffer);
+                referenced_draw_objects.insert(args.count_buffer);
             } else if (c.vertex_count < 0 || c.instance_count < 0 || c.first_vertex < 0 ||
                        c.first_instance < 0) {
                 resp.ok = false;
@@ -8437,6 +8529,20 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                                          static_cast<VkDeviceSize>(r.indirect_draw.offset),
                                          static_cast<std::uint32_t>(r.indirect_draw.draw_count),
                                          static_cast<std::uint32_t>(r.indirect_draw.stride));
+            } else if (rk == vkrpc::CmdKind::DrawIndirectCount) {
+                dev->second.pfn_draw_indirect_count(
+                    cmd_vk, r.src_buffer, static_cast<VkDeviceSize>(r.indirect_count_draw.offset),
+                    r.count_buffer,
+                    static_cast<VkDeviceSize>(r.indirect_count_draw.count_buffer_offset),
+                    static_cast<std::uint32_t>(r.indirect_count_draw.max_draw_count),
+                    static_cast<std::uint32_t>(r.indirect_count_draw.stride));
+            } else if (rk == vkrpc::CmdKind::DrawIndexedIndirectCount) {
+                dev->second.pfn_draw_indexed_indirect_count(
+                    cmd_vk, r.src_buffer, static_cast<VkDeviceSize>(r.indirect_count_draw.offset),
+                    r.count_buffer,
+                    static_cast<VkDeviceSize>(r.indirect_count_draw.count_buffer_offset),
+                    static_cast<std::uint32_t>(r.indirect_count_draw.max_draw_count),
+                    static_cast<std::uint32_t>(r.indirect_count_draw.stride));
             } else if (rk == vkrpc::CmdKind::ClearAttachments) {
                 // Rebuild the attachment/rect arrays; the 4 raw words restore the
                 // VkClearValue union bit-faithfully (color OR depth+stencil).
