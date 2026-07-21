@@ -6,6 +6,13 @@ between minor releases.
 
 ## Unreleased
 
+### Graphics
+
+- Added core `vkCmdDrawIndirect` and `vkCmdDrawIndexedIndirect` recording and real-host replay,
+  closing the missing core-1.0 command surface. The implementation includes additive worker
+  capability negotiation, `multiDrawIndirect` feature gating, overflow-safe buffer-range
+  validation, and observable indexed-indirect GPU readback coverage.
+
 ### Build
 
 - `scripts/dev/rebuild_all.sh` no longer requires Visual Studio Community: it auto-detects the

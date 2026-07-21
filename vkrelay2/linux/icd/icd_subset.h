@@ -13,6 +13,8 @@
 #ifndef VKRELAY2_LINUX_ICD_ICD_SUBSET_H
 #define VKRELAY2_LINUX_ICD_ICD_SUBSET_H
 
+#include "common/vkrpc/indirect_draw_validation.h"
+
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
@@ -516,6 +518,30 @@ inline bool buffer_ok(const VkBufferCreateInfo* ci, const char** reason) {
         return false;
     }
     return true;
+}
+
+// Core indirect draws use the same total structural predicate at the ICD and both worker
+// backends. `indexed` selects the host command struct size; GPU-owned command contents are not
+// inspected (their validity remains the application's responsibility).
+inline bool core_indirect_worker_ok(bool supported, const char** reason) {
+    if (!supported) {
+        *reason = "core indirect draw requires a worker advertising core_indirect_draw support";
+        return false;
+    }
+    return true;
+}
+
+inline bool draw_indirect_ok(bool buffer_live, bool buffer_bound, VkBufferUsageFlags usage,
+                             VkDeviceSize buffer_size, VkDeviceSize offset,
+                             std::uint32_t draw_count, std::uint32_t stride, bool indexed,
+                             bool multi_draw_indirect_enabled, const char** reason) {
+    return vkr::vkrpc::core_indirect_draw_ok(
+        buffer_live, buffer_bound, (usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0,
+        static_cast<std::uint64_t>(buffer_size), static_cast<std::uint64_t>(offset),
+        static_cast<long long>(draw_count), static_cast<long long>(stride),
+        indexed ? vkr::vkrpc::kDrawIndexedIndirectCommandBytes
+                : vkr::vkrpc::kDrawIndirectCommandBytes,
+        multi_draw_indirect_enabled, reason);
 }
 
 // bufferDeviceAddress: the ONE admitted pNext is a VkMemoryAllocateFlagsInfo carrying

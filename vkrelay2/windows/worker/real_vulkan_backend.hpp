@@ -492,6 +492,9 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
         // parameterize the shared vkrpc::rasterization_stream_ok gate on the stream pNext a
         // pipeline may carry (mock == real via the same helper on the mock's modeled values).
         bool geometry_streams_feature_enabled = false;
+        // Core indirect draws: single-draw indirect needs no feature; drawCount > 1 requires the
+        // enabled VkPhysicalDeviceFeatures::multiDrawIndirect bit.
+        bool multi_draw_indirect_feature_enabled = false;
         std::uint32_t max_transform_feedback_streams = 0;
         bool transform_feedback_rasterization_stream_select = false;
         // Descriptor indexing: the enabled kDIFeature* bits, NORMALIZED against the

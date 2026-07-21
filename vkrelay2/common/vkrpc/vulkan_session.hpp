@@ -89,6 +89,10 @@ struct DeviceCaps {
     // geometryStreams FEATURE stays advertised either way -- masking it breaks Mesa 23.2 zink
     // shaders (see the features2 pass-through note in icd.cpp).
     std::uint32_t rasterization_stream_state = 0;
+    // Core indirect draw protocol surface: 1 iff this worker understands, validates, and replays
+    // the draw_indirect + draw_indexed_indirect record kinds. Additive: 0 = an older worker, so a
+    // newer ICD marks the command buffer invalid locally instead of sending an unknown kind.
+    std::uint32_t core_indirect_draw = 0;
 
     json::Value to_body() const;
     static DeviceCaps from_body(const json::Value& body);
@@ -1038,6 +1042,10 @@ enum class CmdKind : unsigned char {
     // (0xFFFFFFFFFFFFFFFF) means fill-to-end per spec, data is the 32-bit fill word. APPEND-ONLY
     // enum (the wire is string-keyed; integer positions are per-TU baked).
     FillBuffer,
+    // Core 1.0 indirect draw commands. Payload for both: src_buffer = guest buffer;
+    // args_u64=[offset]; args_i64=[drawCount, stride]. APPEND-ONLY.
+    DrawIndirect,
+    DrawIndexedIndirect,
 };
 CmdKind cmd_kind_from_string(const std::string& kind);
 
@@ -3603,6 +3611,9 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
         // (integration_real_draw). It DOES mirror the structural extension invariant: a true
         // scalar without VK_EXT_transform_feedback rejects by name (mock == real).
         bool geometry_streams_feature_enabled = false;
+        // Core indirect draws: single-draw indirect needs no feature; drawCount > 1 requires the
+        // enabled VkPhysicalDeviceFeatures::multiDrawIndirect bit.
+        bool multi_draw_indirect_feature_enabled = false;
         // Descriptor indexing: the enabled kDIFeature* bits. Gates the per-binding
         // flag admission, UAB layouts/pools, and variable-count allocation.
         std::uint64_t descriptor_indexing_feature_bits = 0;

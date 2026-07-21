@@ -8,7 +8,8 @@
 
 #include "common/logging/logging.hpp"
 #include "common/sidecar/window_placement.hpp"
-#include "common/vkrpc/feature_bits.h"       // pack/unpack VkPhysicalDeviceFeatures <-> u64
+#include "common/vkrpc/feature_bits.h" // pack/unpack VkPhysicalDeviceFeatures <-> u64
+#include "common/vkrpc/indirect_draw_validation.h"
 #include "common/vkrpc/rpc_profile.h"        // record-handler phase timers
 #include "windows/worker/acquire_poll.hpp"   // abort-aware acquire poll policy
 #include "windows/worker/real_gpu_probe.hpp" // format_luid -- the LUID match key shares one formatter
@@ -106,6 +107,7 @@ vkrpc::DeviceCaps caps_from_props(const VkPhysicalDeviceProperties& p) {
     // against the host's cached TF properties) + replays the stream pipeline pNext. A worker that
     // does not advertise this gets the older ICD's fail-closed rejection of the stream shape.
     c.rasterization_stream_state = 1;
+    c.core_indirect_draw = 1;
     return c;
 }
 
@@ -2803,6 +2805,8 @@ RealVulkanBackend::create_device(const vkrpc::CreateDeviceRequest& req) {
     // (shared vkrpc::rasterization_stream_ok) is table-local. Queried only when the extension is
     // enabled; core-1.1 props2 is safe (the worker instance requests >= 1.1 on this host path).
     rd.geometry_streams_feature_enabled = geometry_streams_enabled;
+    rd.multi_draw_indirect_feature_enabled =
+        (req.enabled_feature_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
     if (rd.enabled_extensions.count(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME) != 0) {
         VkPhysicalDeviceTransformFeedbackPropertiesEXT tf_props{};
         tf_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT;
@@ -6457,15 +6461,19 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
             resolved.push_back(std::move(r));
             referenced_draw_objects.insert(c.desc_layout);
         } else if (k == vkrpc::CmdKind::Draw || k == vkrpc::CmdKind::DrawIndexed ||
-                   k == vkrpc::CmdKind::DrawIndirectByteCount) {
+                   k == vkrpc::CmdKind::DrawIndirectByteCount ||
+                   k == vkrpc::CmdKind::DrawIndirect || k == vkrpc::CmdKind::DrawIndexedIndirect) {
             if (active_scope == RenderScope::None) {
                 resp.ok = false;
                 resp.reason = "draw outside an active render pass";
                 return resp;
             }
-            if (k == vkrpc::CmdKind::DrawIndexed && !index_bound) {
+            if ((k == vkrpc::CmdKind::DrawIndexed || k == vkrpc::CmdKind::DrawIndexedIndirect) &&
+                !index_bound) {
                 resp.ok = false;
-                resp.reason = "draw_indexed without a bound index buffer";
+                resp.reason = k == vkrpc::CmdKind::DrawIndexed
+                                  ? "draw_indexed without a bound index buffer"
+                                  : "draw_indexed_indirect without a bound index buffer";
                 return resp;
             }
             // (GL/zink): the byte-count draw (glDrawTransformFeedback) shares full
@@ -6583,6 +6591,32 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                 }
                 r.src_buffer = cbf->second.vk;
                 referenced_draw_objects.insert(c.args_u64[0]);
+            } else if (k == vkrpc::CmdKind::DrawIndirect ||
+                       k == vkrpc::CmdKind::DrawIndexedIndirect) {
+                if (c.args_u64.size() != 1 || c.args_i64.size() != 2) {
+                    resp.ok = false;
+                    resp.reason = "malformed core indirect draw command";
+                    return resp;
+                }
+                const auto ibf = buffers_.find(c.src_buffer);
+                const bool live = ibf != buffers_.end() && ibf->second.device == device;
+                const bool bound = live && ibf->second.bound_memory != 0;
+                const bool usage =
+                    live && (ibf->second.usage & vkrpc::kBufferUsageIndirectBuffer) != 0;
+                const char* why = "";
+                if (!vkrpc::core_indirect_draw_ok(live, bound, usage, live ? ibf->second.size : 0,
+                                                  c.args_u64[0], c.args_i64[0], c.args_i64[1],
+                                                  k == vkrpc::CmdKind::DrawIndexedIndirect
+                                                      ? vkrpc::kDrawIndexedIndirectCommandBytes
+                                                      : vkrpc::kDrawIndirectCommandBytes,
+                                                  dev->second.multi_draw_indirect_feature_enabled,
+                                                  &why)) {
+                    resp.ok = false;
+                    resp.reason = why;
+                    return resp;
+                }
+                r.src_buffer = ibf->second.vk;
+                referenced_draw_objects.insert(c.src_buffer);
             } else if (c.vertex_count < 0 || c.instance_count < 0 || c.first_vertex < 0 ||
                        c.first_instance < 0) {
                 resp.ok = false;
@@ -8354,6 +8388,16 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                 vkCmdDrawIndexed(cmd_vk, static_cast<std::uint32_t>(a[0]),
                                  static_cast<std::uint32_t>(a[1]), static_cast<std::uint32_t>(a[2]),
                                  static_cast<std::int32_t>(a[3]), static_cast<std::uint32_t>(a[4]));
+            } else if (rk == vkrpc::CmdKind::DrawIndirect) {
+                vkCmdDrawIndirect(cmd_vk, r.src_buffer,
+                                  static_cast<VkDeviceSize>(r.cmd->args_u64[0]),
+                                  static_cast<std::uint32_t>(r.cmd->args_i64[0]),
+                                  static_cast<std::uint32_t>(r.cmd->args_i64[1]));
+            } else if (rk == vkrpc::CmdKind::DrawIndexedIndirect) {
+                vkCmdDrawIndexedIndirect(cmd_vk, r.src_buffer,
+                                         static_cast<VkDeviceSize>(r.cmd->args_u64[0]),
+                                         static_cast<std::uint32_t>(r.cmd->args_i64[0]),
+                                         static_cast<std::uint32_t>(r.cmd->args_i64[1]));
             } else if (rk == vkrpc::CmdKind::ClearAttachments) {
                 // Rebuild the attachment/rect arrays; the 4 raw words restore the
                 // VkClearValue union bit-faithfully (color OR depth+stencil).

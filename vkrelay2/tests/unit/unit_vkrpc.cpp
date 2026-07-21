@@ -4,12 +4,14 @@
 #include "common/protocol/gpu.hpp"
 #include "common/protocol/wire.hpp"
 #include "common/vkrpc/device_loss_policy.h"
+#include "common/vkrpc/indirect_draw_validation.h"
 #include "common/vkrpc/rpc.hpp"
 #include "common/vkrpc/rpc_profile.h"
 #include "common/vkrpc/vulkan_session.hpp"
 #include "tests/test_assert.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -2792,6 +2794,288 @@ void test_draw_surface_wire() {
     VKR_CHECK(rec2.commands[2].vp_w > 1279.0 && rec2.commands[2].vp_w < 1281.0);
 }
 
+// Core indirect draws need full draw readiness in addition to their buffer/stride/range rules.
+// Build the smallest real mock object graph twice so both feature states are exercised at the
+// backend boundary (the pure ICD/shared predicate has its own exhaustive pins).
+void test_core_indirect_draw_mock_case(bool multi_draw_indirect) {
+    const std::vector<protocol::GpuDevice> devices = protocol::probe_mocked();
+    vkrpc::MockVulkanBackend backend(devices.front().name);
+
+    const auto ci = backend.create_instance({});
+    vkrpc::EnumeratePhysicalDevicesRequest er;
+    er.instance = ci.instance;
+    const auto en = backend.enumerate_physical_devices(er);
+    VKR_CHECK(ci.ok && en.ok && !en.devices.empty());
+    const std::uint64_t phys = en.devices.front().handle;
+    vkrpc::CreateDeviceRequest cdr;
+    cdr.instance = ci.instance;
+    cdr.physical_device = phys;
+    if (multi_draw_indirect) {
+        cdr.enabled_feature_bits = vkrpc::kFeatureMultiDrawIndirect;
+    }
+    const auto cd = backend.create_device(cdr);
+    VKR_CHECK(cd.ok);
+    vkrpc::GetDeviceQueueRequest gqr;
+    gqr.device = cd.device;
+    gqr.queue_family_index = cd.queue_family_index;
+    const auto queue = backend.get_device_queue(gqr);
+    VKR_CHECK(queue.ok);
+
+    vkrpc::CreateSurfaceRequest sr;
+    sr.instance = ci.instance;
+    const auto surface = backend.create_surface(sr);
+    vkrpc::CreateSwapchainRequest scr;
+    scr.device = cd.device;
+    scr.surface = surface.surface;
+    scr.image_format = 44;
+    scr.color_space = 0;
+    scr.present_mode = 2;
+    scr.width = 64;
+    scr.height = 64;
+    scr.min_image_count = 2;
+    scr.image_usage = vkrpc::kImageUsageColorAttachment;
+    const auto swapchain = backend.create_swapchain(scr);
+    VKR_CHECK(surface.ok && swapchain.ok);
+    vkrpc::GetSwapchainImagesRequest gir;
+    gir.swapchain = swapchain.swapchain;
+    const auto images = backend.get_swapchain_images(gir);
+    VKR_CHECK(images.ok && !images.images.empty());
+    vkrpc::CreateImageViewRequest ivr;
+    ivr.image = images.images.front();
+    ivr.view_type = 1;
+    ivr.format = 44;
+    ivr.aspect = 1;
+    ivr.level_count = 1;
+    ivr.layer_count = 1;
+    const auto view = backend.create_image_view(ivr);
+    VKR_CHECK(view.ok);
+
+    vkrpc::CreateRenderPassRequest rpr;
+    rpr.device = cd.device;
+    vkrpc::AttachmentDesc attachment;
+    attachment.format = 44;
+    attachment.samples = 1;
+    attachment.load_op = 1;
+    attachment.store_op = 0;
+    attachment.stencil_load_op = 2;
+    attachment.stencil_store_op = 1;
+    attachment.initial_layout = 0;
+    attachment.final_layout = 1000001002;
+    rpr.attachments = {attachment};
+    rpr.color_attachment = 0;
+    rpr.color_layout = 2;
+    const auto render_pass = backend.create_render_pass(rpr);
+    VKR_CHECK(render_pass.ok);
+    vkrpc::CreateFramebufferRequest fbr;
+    fbr.device = cd.device;
+    fbr.render_pass = render_pass.render_pass;
+    fbr.image_view = view.image_view;
+    fbr.width = 64;
+    fbr.height = 64;
+    fbr.layers = 1;
+    const auto framebuffer = backend.create_framebuffer(fbr);
+    VKR_CHECK(framebuffer.ok);
+
+    vkrpc::CreateShaderModuleRequest smr;
+    smr.device = cd.device;
+    smr.code.assign(8, '\0');
+    smr.code_size = 8;
+    const auto vs = backend.create_shader_module(smr);
+    const auto fs = backend.create_shader_module(smr);
+    VKR_CHECK(vs.ok && fs.ok);
+    vkrpc::CreatePipelineLayoutRequest plr;
+    plr.device = cd.device;
+    plr.set_layout_count = 0;
+    plr.push_constant_range_count = 0;
+    const auto layout = backend.create_pipeline_layout(plr);
+    VKR_CHECK(layout.ok);
+    vkrpc::CreateGraphicsPipelinesRequest gpr;
+    gpr.device = cd.device;
+    vkrpc::ShaderStageDesc vstage;
+    vstage.stage = 1;
+    vstage.module = vs.shader_module;
+    vstage.entry = "main";
+    vkrpc::ShaderStageDesc fstage;
+    fstage.stage = 16;
+    fstage.module = fs.shader_module;
+    fstage.entry = "main";
+    gpr.stages = {vstage, fstage};
+    gpr.topology = 3;
+    gpr.vertex_binding_count = 0;
+    gpr.vertex_attribute_count = 0;
+    gpr.cull_mode = 0;
+    gpr.front_face = 1;
+    gpr.dynamic_states = {0, 1};
+    gpr.layout = layout.pipeline_layout;
+    gpr.render_pass = render_pass.render_pass;
+    gpr.subpass = 0;
+    const auto pipeline = backend.create_graphics_pipelines(gpr);
+    VKR_CHECK(pipeline.ok);
+    vkrpc::CreateCommandPoolRequest cpr;
+    cpr.device = cd.device;
+    cpr.queue_family_index = cd.queue_family_index;
+    const auto pool = backend.create_command_pool(cpr);
+    vkrpc::AllocateCommandBuffersRequest acbr;
+    acbr.command_pool = pool.command_pool;
+    acbr.count = 1;
+    const auto command_buffers = backend.allocate_command_buffers(acbr);
+    VKR_CHECK(pool.ok && command_buffers.ok && command_buffers.command_buffers.size() == 1);
+    const std::uint64_t command_buffer = command_buffers.command_buffers.front();
+
+    vkrpc::GetPhysicalDeviceMemoryPropertiesRequest mpr;
+    mpr.physical_device = phys;
+    const auto memory_props = backend.get_physical_device_memory_properties(mpr);
+    VKR_CHECK(memory_props.ok);
+    struct TestBuffer {
+        std::uint64_t buffer = 0;
+        std::uint64_t memory = 0;
+    };
+    auto make_buffer = [&](std::uint64_t usage, bool bind) {
+        vkrpc::CreateBufferRequest req;
+        req.device = cd.device;
+        req.size = 64;
+        req.usage = usage;
+        req.sharing_mode = 0;
+        const auto created = backend.create_buffer(req);
+        VKR_CHECK(created.ok);
+        TestBuffer result{created.buffer, 0};
+        if (!bind) {
+            return result;
+        }
+        int type = -1;
+        for (std::size_t i = 0; i < memory_props.types.size() && i < 32; ++i) {
+            if ((created.mem_type_bits & (std::uint64_t{1} << i)) != 0) {
+                type = static_cast<int>(i);
+                break;
+            }
+        }
+        VKR_CHECK(type >= 0);
+        vkrpc::AllocateMemoryRequest amr;
+        amr.device = cd.device;
+        amr.allocation_size = created.mem_size;
+        amr.memory_type_index = type;
+        const auto memory = backend.allocate_memory(amr);
+        VKR_CHECK(memory.ok);
+        vkrpc::BindBufferMemoryRequest bmr;
+        bmr.buffer = created.buffer;
+        bmr.memory = memory.memory;
+        VKR_CHECK(backend.bind_buffer_memory(bmr).ok);
+        result.memory = memory.memory;
+        return result;
+    };
+    const TestBuffer indirect = make_buffer(vkrpc::kBufferUsageIndirectBuffer, true);
+    const TestBuffer wrong_usage = make_buffer(vkrpc::kBufferUsageVertexBuffer, true);
+    const TestBuffer index = make_buffer(vkrpc::kBufferUsageIndexBuffer, true);
+    const TestBuffer unbound = make_buffer(vkrpc::kBufferUsageIndirectBuffer, false);
+
+    auto indirect_command = [&](bool indexed, std::uint64_t buffer, std::uint64_t offset,
+                                long long count, long long stride) {
+        vkrpc::RecordedCommand c;
+        c.kind = indexed ? "draw_indexed_indirect" : "draw_indirect";
+        c.src_buffer = buffer;
+        c.args_u64 = {offset};
+        c.args_i64 = {count, stride};
+        return c;
+    };
+    auto record = [&](vkrpc::RecordedCommand draw, bool bind_index) {
+        vkrpc::RecordedCommand begin;
+        begin.kind = "begin_render_pass";
+        begin.render_pass = render_pass.render_pass;
+        begin.framebuffer = framebuffer.framebuffer;
+        begin.render_area_w = 64;
+        begin.render_area_h = 64;
+        vkrpc::RecordedCommand bind;
+        bind.kind = "bind_pipeline";
+        bind.pipeline = pipeline.pipeline;
+        vkrpc::RecordedCommand viewport;
+        viewport.kind = "set_viewport";
+        viewport.vp_w = 64;
+        viewport.vp_h = 64;
+        viewport.vp_max_depth = 1;
+        vkrpc::RecordedCommand scissor;
+        scissor.kind = "set_scissor";
+        scissor.sc_w = 64;
+        scissor.sc_h = 64;
+        vkrpc::RecordedCommand bind_ib;
+        bind_ib.kind = "bind_index_buffer";
+        bind_ib.args_u64 = {index.buffer, 0};
+        bind_ib.args_i64 = {0};
+        vkrpc::RecordedCommand end;
+        end.kind = "end_render_pass";
+        vkrpc::RecordCommandBufferRequest req;
+        req.command_buffer = command_buffer;
+        req.commands = {begin, bind, viewport, scissor};
+        if (bind_index) {
+            req.commands.push_back(bind_ib);
+        }
+        req.commands.push_back(std::move(draw));
+        req.commands.push_back(end);
+        return backend.record_command_buffer(req);
+    };
+
+    VKR_CHECK(record(indirect_command(false, indirect.buffer, 0, 1, 16), false).ok);
+    VKR_CHECK(record(indirect_command(true, indirect.buffer, 0, 1, 20), true).ok);
+    VKR_CHECK(!record(indirect_command(true, indirect.buffer, 0, 1, 20), false).ok);
+    VKR_CHECK(!record(indirect_command(false, wrong_usage.buffer, 0, 1, 16), false).ok);
+    VKR_CHECK(!record(indirect_command(false, unbound.buffer, 0, 1, 16), false).ok);
+    VKR_CHECK(!record(indirect_command(false, 0xDEAD, 0, 1, 16), false).ok);
+    VKR_CHECK(!record(indirect_command(false, indirect.buffer, 2, 1, 16), false).ok);
+    VKR_CHECK(!record(indirect_command(true, indirect.buffer, 48, 1, 20), true).ok);
+    if (multi_draw_indirect) {
+        VKR_CHECK(record(indirect_command(false, indirect.buffer, 0, 2, 16), false).ok);
+        VKR_CHECK(record(indirect_command(true, indirect.buffer, 0, 2, 20), true).ok);
+        VKR_CHECK(!record(indirect_command(false, indirect.buffer, 0, 2, 15), false).ok);
+        VKR_CHECK(!record(indirect_command(true, indirect.buffer, 0, 2, 16), true).ok);
+        VKR_CHECK(!record(indirect_command(true, indirect.buffer,
+                                           std::numeric_limits<std::uint64_t>::max() - 3, 2, 20),
+                          true)
+                       .ok);
+    } else {
+        VKR_CHECK(!record(indirect_command(false, indirect.buffer, 0, 2, 16), false).ok);
+    }
+
+    // The indirect and index buffers become command-buffer dependencies just like pipelines.
+    VKR_CHECK(record(indirect_command(false, indirect.buffer, 0, 1, 16), false).ok);
+    VKR_CHECK(backend.destroy_buffer({indirect.buffer}).ok);
+    // This record RPC is the worker boundary reached by guest vkEndCommandBuffer: the destroyed
+    // referent is rejected there rather than becoming a stale host VkBuffer.
+    VKR_CHECK(!record(indirect_command(false, indirect.buffer, 0, 1, 16), false).ok);
+    vkrpc::QueueSubmitRequest submit;
+    submit.queue = queue.queue;
+    submit.command_buffers = {command_buffer};
+    VKR_CHECK(!backend.queue_submit(submit).ok);
+
+    auto destroy_buffer = [&](const TestBuffer& buffer) {
+        if (buffer.buffer != indirect.buffer) {
+            VKR_CHECK(backend.destroy_buffer({buffer.buffer}).ok);
+        }
+        if (buffer.memory != 0) {
+            VKR_CHECK(backend.free_memory({buffer.memory}).ok);
+        }
+    };
+    destroy_buffer(indirect);
+    destroy_buffer(wrong_usage);
+    destroy_buffer(index);
+    destroy_buffer(unbound);
+    VKR_CHECK(backend.destroy_pipeline({pipeline.pipeline}).ok);
+    VKR_CHECK(backend.destroy_pipeline_layout({layout.pipeline_layout}).ok);
+    VKR_CHECK(backend.destroy_framebuffer({framebuffer.framebuffer}).ok);
+    VKR_CHECK(backend.destroy_render_pass({render_pass.render_pass}).ok);
+    VKR_CHECK(backend.destroy_shader_module({vs.shader_module}).ok);
+    VKR_CHECK(backend.destroy_shader_module({fs.shader_module}).ok);
+    VKR_CHECK(backend.destroy_image_view({view.image_view}).ok);
+    VKR_CHECK(backend.destroy_swapchain({swapchain.swapchain}).ok);
+    VKR_CHECK(backend.destroy_command_pool({pool.command_pool}).ok);
+    VKR_CHECK(backend.destroy_surface({surface.surface}).ok);
+    VKR_CHECK(backend.destroy_device({cd.device}).ok);
+    VKR_CHECK(backend.destroy_instance({ci.instance}).ok);
+}
+
+void test_core_indirect_draw_mock() {
+    test_core_indirect_draw_mock_case(false);
+    test_core_indirect_draw_mock_case(true);
+}
+
 // draw surface on the mock backend: the full bufferless-triangle object graph + the
 // create -> record(draw) -> submit -> present chain, the bounded-subset rejections, and destroy
 // ordering -- all headless, so it runs on both platforms (the real backend's parallel coverage is
@@ -5464,6 +5748,12 @@ void test_image_depth_wire() {
         1);
     VKR_CHECK_EQ(
         static_cast<int>(vkrpc::DeviceCaps::from_body(stripped).rasterization_stream_state), 0);
+    // Core indirect-draw vocabulary follows the same additive negotiation rule. A new ICD must
+    // fail the void command locally when paired with an old worker, never send an unknown kind.
+    caps.core_indirect_draw = 1;
+    VKR_CHECK_EQ(static_cast<int>(vkrpc::DeviceCaps::from_body(caps.to_body()).core_indirect_draw),
+                 1);
+    VKR_CHECK_EQ(static_cast<int>(vkrpc::DeviceCaps::from_body(stripped).core_indirect_draw), 0);
 
     // Pipeline carries depth-stencil state.
     vkrpc::CreateGraphicsPipelinesRequest gp;
@@ -9058,7 +9348,17 @@ void test_record_raw_wire() {
     c.args_blob = std::string("\x00\xFF\x7F\x80zz", 6); // NUL + high bytes survive raw
     vkrpc::RecordedCommand d;                           // a mostly-default second command
     d.kind = "end_render_pass";
-    req.commands = {c, d};
+    vkrpc::RecordedCommand indirect;
+    indirect.kind = "draw_indirect";
+    indirect.src_buffer = 0x909;
+    indirect.args_u64 = {12};
+    indirect.args_i64 = {2, 16};
+    vkrpc::RecordedCommand indexed_indirect = indirect;
+    indexed_indirect.kind = "draw_indexed_indirect";
+    indexed_indirect.src_buffer = 0xA0A;
+    indexed_indirect.args_u64 = {20};
+    indexed_indirect.args_i64 = {3, 20};
+    req.commands = {c, d, indirect, indexed_indirect};
 
     const std::string wire = req.to_wire();
     std::string err;
@@ -9070,6 +9370,13 @@ void test_record_raw_wire() {
     const auto via_json = vkrpc::RecordCommandBufferRequest::from_body(req.to_body());
     VKR_CHECK(via_json.to_body().dump(0) == back.to_body().dump(0));
     VKR_CHECK(back.commands[0].args_blob == c.args_blob); // bytes, not hex, still exact
+    VKR_CHECK_EQ(back.commands[2].src_buffer, 0x909ull);
+    VKR_CHECK_EQ(back.commands[2].args_u64[0], 12ull);
+    VKR_CHECK_EQ(back.commands[2].args_i64[0], 2ll);
+    VKR_CHECK_EQ(back.commands[3].src_buffer, 0xA0Aull);
+    VKR_CHECK(vkrpc::cmd_kind_from_string(back.commands[2].kind) == vkrpc::CmdKind::DrawIndirect);
+    VKR_CHECK(vkrpc::cmd_kind_from_string(back.commands[3].kind) ==
+              vkrpc::CmdKind::DrawIndexedIndirect);
     // i64 exactness: the wire is BIT-exact where JSON's number path would round (> 2^53).
     vkrpc::RecordCommandBufferRequest big;
     vkrpc::RecordedCommand bc;
@@ -9706,6 +10013,7 @@ int main() {
     test_command_decode();
     test_surface_queries();
     test_draw_surface_wire();
+    test_core_indirect_draw_mock();
     test_draw_surface_mock();
     test_memory_buffer_wire();
     test_memory_buffer_mock();

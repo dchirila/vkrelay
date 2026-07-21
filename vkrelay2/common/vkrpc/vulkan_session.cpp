@@ -2,6 +2,7 @@
 
 #include "common/logging/logging.hpp"
 #include "common/protocol/wire.hpp"
+#include "common/vkrpc/indirect_draw_validation.h"
 #include "common/vkrpc/rpc_profile.h"
 
 #include <algorithm>
@@ -1394,6 +1395,7 @@ json::Value DeviceCaps::to_body() const {
     // geometry-stream (additive): worker validates + replays the stream pipeline pNext.
     b.set("rasterization_stream_state",
           json::Value(static_cast<long long>(rasterization_stream_state)));
+    b.set("core_indirect_draw", json::Value(static_cast<long long>(core_indirect_draw)));
     return b;
 }
 
@@ -1413,6 +1415,8 @@ DeviceCaps DeviceCaps::from_body(const json::Value& body) {
     d.vk13_ready = static_cast<std::uint32_t>(get_i64(body, "vk13_ready", 0)); // absent -> 0
     d.rasterization_stream_state = static_cast<std::uint32_t>(
         get_i64(body, "rasterization_stream_state", 0)); // absent -> 0 (old worker)
+    d.core_indirect_draw =
+        static_cast<std::uint32_t>(get_i64(body, "core_indirect_draw", 0)); // absent -> 0
     return d;
 }
 
@@ -2574,6 +2578,8 @@ CmdKind cmd_kind_from_string(const std::string& kind) {
         {"set_primitive_restart_enable", CmdKind::SetPrimitiveRestartEnable},
         {"resolve_image", CmdKind::ResolveImage},
         {"fill_buffer", CmdKind::FillBuffer},
+        {"draw_indirect", CmdKind::DrawIndirect},
+        {"draw_indexed_indirect", CmdKind::DrawIndexedIndirect},
     };
     const auto it = kMap.find(std::string_view(kind));
     return it != kMap.end() ? it->second : CmdKind::Unknown;
@@ -5967,6 +5973,7 @@ DeviceCaps MockVulkanBackend::device_caps() const {
     // geometry-stream: the mock validates (shared rasterization_stream_ok) + models the stream
     // pNext, so it advertises the capability exactly like the real worker (mock == real).
     caps.rasterization_stream_state = 1;
+    caps.core_indirect_draw = 1;
     return caps;
 }
 
@@ -6079,6 +6086,8 @@ CreateDeviceResponse MockVulkanBackend::create_device(const CreateDeviceRequest&
         return resp;
     }
     dev.geometry_streams_feature_enabled = req.geometry_streams_feature_enabled > 0;
+    dev.multi_draw_indirect_feature_enabled =
+        (req.enabled_feature_bits & kFeatureMultiDrawIndirect) != 0;
     // descriptorIndexing: CreateDevice POLICY clamps to the SERVED buffer-only
     // subset -- a deferred-but-known bit (an image/texel UAB class) is rejected exactly like an
     // unknown one, so a skewed/custom client can never enable an unproven class past the ICD.
@@ -7817,6 +7826,7 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
     bool viewport_set = false;           // dynamic viewport set since vkBeginCommandBuffer (sticky)
     bool scissor_set = false;            // dynamic scissor likewise
     std::set<int> bound_vertex_bindings; // binding indices bound by bind_vertex_buffers
+    bool index_bound = false;
     // (GL/zink): transform-feedback + conditional-rendering scope state (mock == real; see
     // the real backend for the spec rationale). The device record is needed for the enabled-
     // extension gate on those commands.
@@ -8129,10 +8139,31 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
             }
             bound_desc_layout_by_point[dbp] = c.desc_layout;
             bound_desc_sets_by_point[dbp] = c.descriptor_sets;
-        } else if (k == CmdKind::Draw || k == CmdKind::DrawIndirectByteCount) {
+        } else if (k == CmdKind::BindIndexBuffer) {
+            if (c.args_u64.size() < 2 || c.args_i64.empty()) {
+                resp.ok = false;
+                resp.reason = "malformed bind_index_buffer";
+                return resp;
+            }
+            const auto ibf = buffers_.find(c.args_u64[0]);
+            if (ibf == buffers_.end() || ibf->second.device != device ||
+                ibf->second.bound_memory == 0) {
+                resp.ok = false;
+                resp.reason = "bind_index_buffer references a buffer not live/bound on the device";
+                return resp;
+            }
+            referenced_draw_objects.insert(c.args_u64[0]);
+            index_bound = true;
+        } else if (k == CmdKind::Draw || k == CmdKind::DrawIndirectByteCount ||
+                   k == CmdKind::DrawIndirect || k == CmdKind::DrawIndexedIndirect) {
             if (active_scope == RenderScope::None) {
                 resp.ok = false;
                 resp.reason = "draw outside an active render pass";
+                return resp;
+            }
+            if (k == CmdKind::DrawIndexedIndirect && !index_bound) {
+                resp.ok = false;
+                resp.reason = "draw_indexed_indirect without a bound index buffer";
                 return resp;
             }
             // (GL/zink): the byte-count draw (glDrawTransformFeedback) shares full
@@ -8235,6 +8266,28 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
                     return resp;
                 }
                 referenced_draw_objects.insert(c.args_u64[0]);
+            } else if (k == CmdKind::DrawIndirect || k == CmdKind::DrawIndexedIndirect) {
+                if (c.args_u64.size() != 1 || c.args_i64.size() != 2) {
+                    resp.ok = false;
+                    resp.reason = "malformed core indirect draw command";
+                    return resp;
+                }
+                const auto ibf = buffers_.find(c.src_buffer);
+                const bool live = ibf != buffers_.end() && ibf->second.device == device;
+                const bool bound = live && ibf->second.bound_memory != 0;
+                const bool usage = live && (ibf->second.usage & kBufferUsageIndirectBuffer) != 0;
+                const char* why = "";
+                if (!core_indirect_draw_ok(
+                        live, bound, usage, live ? ibf->second.size : 0, c.args_u64[0],
+                        c.args_i64[0], c.args_i64[1],
+                        k == CmdKind::DrawIndexedIndirect ? kDrawIndexedIndirectCommandBytes
+                                                          : kDrawIndirectCommandBytes,
+                        mdev->second.multi_draw_indirect_feature_enabled, &why)) {
+                    resp.ok = false;
+                    resp.reason = why;
+                    return resp;
+                }
+                referenced_draw_objects.insert(c.src_buffer);
             } else if (c.vertex_count < 0 || c.instance_count < 0 || c.first_vertex < 0 ||
                        c.first_instance < 0) {
                 // u32 draw args carried wide; a missing/negative value (-1 sentinel) is rejected.

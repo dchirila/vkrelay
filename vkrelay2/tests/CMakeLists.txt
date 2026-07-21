@@ -217,6 +217,10 @@ if(WIN32 AND Vulkan_FOUND)
     target_link_libraries(integration_real_vbo PRIVATE vkrelay2_worker_vulkan vkrelay2_warnings)
     add_test(NAME integration_real_vbo COMMAND integration_real_vbo)
 
+    add_executable(integration_real_indirect integration/integration_real_indirect.cpp)
+    target_link_libraries(integration_real_indirect PRIVATE vkrelay2_worker_vulkan vkrelay2_warnings)
+    add_test(NAME integration_real_indirect COMMAND integration_real_indirect)
+
     # the descriptor / per-frame UBO path drawn + presented on the real GPU.
     add_executable(integration_real_ubo integration/integration_real_ubo.cpp)
     target_link_libraries(integration_real_ubo PRIVATE vkrelay2_worker_vulkan vkrelay2_warnings)

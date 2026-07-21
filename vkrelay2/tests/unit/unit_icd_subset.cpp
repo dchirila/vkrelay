@@ -12,6 +12,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstring>
+#include <limits>
 
 using namespace vkr;
 
@@ -1445,6 +1446,37 @@ void test_native_lane_policy() {
     VKR_CHECK(!native_lane_enabled("yes"));
 }
 
+void test_core_indirect_draw_validation() {
+    const char* why = "";
+    VKR_CHECK(icd_subset::core_indirect_worker_ok(true, &why));
+    VKR_CHECK(!icd_subset::core_indirect_worker_ok(false, &why));
+    VKR_CHECK(std::strstr(why, "worker") != nullptr);
+    auto ok = [&](bool live, bool bound, VkBufferUsageFlags usage, VkDeviceSize size,
+                  VkDeviceSize offset, std::uint32_t count, std::uint32_t stride, bool indexed,
+                  bool multi) {
+        why = "";
+        return icd_subset::draw_indirect_ok(live, bound, usage, size, offset, count, stride,
+                                            indexed, multi, &why);
+    };
+
+    VKR_CHECK(ok(true, true, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, 64, 0, 1, 16, false, false));
+    VKR_CHECK(ok(true, true, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, 64, 44, 1, 20, true, false));
+    VKR_CHECK(ok(true, true, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, 64, 0, 2, 16, false, true));
+    VKR_CHECK(ok(true, true, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, 64, 0, 0, 0, false, false));
+
+    VKR_CHECK(!ok(false, false, 0, 0, 0, 1, 16, false, false));
+    VKR_CHECK(!ok(true, false, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, 64, 0, 1, 16, false, false));
+    VKR_CHECK(!ok(true, true, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 64, 0, 1, 16, false, false));
+    VKR_CHECK(!ok(true, true, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, 64, 2, 1, 16, false, false));
+    VKR_CHECK(!ok(true, true, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, 64, 0, 2, 16, false, false));
+    VKR_CHECK(!ok(true, true, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, 64, 0, 2, 15, false, true));
+    VKR_CHECK(!ok(true, true, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, 64, 0, 2, 12, false, true));
+    VKR_CHECK(!ok(true, true, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, 64, 48, 1, 16, true, false));
+    VKR_CHECK(!ok(true, true, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                  std::numeric_limits<std::uint64_t>::max(),
+                  std::numeric_limits<std::uint64_t>::max() - 3, 2, 20, true, true));
+}
+
 } // namespace
 
 int main() {
@@ -1455,6 +1487,7 @@ int main() {
     test_graphics_pipeline();
     test_commands();
     test_memory_buffer();
+    test_core_indirect_draw_validation();
     test_descriptor_surface();
     test_image_depth();
     test_sampler_copy();

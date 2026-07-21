@@ -174,6 +174,10 @@ struct DeviceImpl {
     bool transform_feedback_enabled = false;
     bool geometry_streams_feature_enabled = false;
     bool worker_rasterization_stream = false;
+    // Core indirect-draw command vocabulary. The worker bit is additive protocol negotiation;
+    // multi_draw_indirect_enabled is the base feature state requested at device creation.
+    bool worker_core_indirect_draw = false;
+    bool multi_draw_indirect_enabled = false;
     // descriptorIndexing: the enabled kDIFeature* bits. CreateDevice folds the app's
     // enabled-feature chain into these (served subset only -- an unserved or off-lane enable is
     // FEATURE_NOT_PRESENT), and the per-binding flag admission, UAB pools, and variable-count
@@ -227,6 +231,10 @@ struct CommandBufferImpl {
     // native device) a copy2 call marks the recording locally invalid instead of silently
     // serving a command surface the reported apiVersion does not include.
     bool vk13_device = false;
+    // Additive worker-vocabulary gate + the owning device's enabled base feature, stamped at
+    // allocation like vk13_device so void vkCmd* recorders can fail locally without an RPC.
+    bool worker_core_indirect_draw = false;
+    bool multi_draw_indirect_enabled = false;
 };
 
 template <class H> H to_handle(std::uint64_t v) {
@@ -392,6 +400,10 @@ std::uint64_t sweep_rebaseline_every() {
 // vkGetBufferMemoryRequirements is void, so the requirements ride on CreateBufferResponse and are
 // cached here (keyed by worker buffer handle); the getter is a pure cache copy.
 std::map<std::uint64_t, VkMemoryRequirements> g_buffer_reqs;
+// Core indirect-draw admission needs the guest-visible logical size + usage (the memory
+// requirements size may include host padding and is not the Vulkan buffer bound).
+std::map<std::uint64_t, VkDeviceSize> g_buffer_sizes;
+std::map<std::uint64_t, VkBufferUsageFlags> g_buffer_usages;
 // GPU-write readback (surgical): worker buffer handle -> its bound worker memory handle (set at
 // BindBufferMemory). Only readback destinations ever download from the worker, so streaming
 // upload buffers -- mapped every frame -- pay ZERO readback cost. Guarded by g_mu.
@@ -2233,6 +2245,13 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
         }
         for (auto* node = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext);
              node != nullptr; node = node->pNext) {
+            // The Features2 spelling owns the core-1.0 feature members when pEnabledFeatures is
+            // null. Preserve the same scalar mirror used by the worker's mock/device-state gates;
+            // the real host still receives the original Features2 chain verbatim.
+            if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+                enabled_feature_bits = vkrpc::pack_physical_device_features(
+                    reinterpret_cast<const VkPhysicalDeviceFeatures2*>(node)->features);
+            }
             const std::uint32_t sz =
                 capability_struct_size(static_cast<std::uint32_t>(node->sType));
             if (sz == 0) {
@@ -2775,6 +2794,9 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
         dev->transform_feedback_enabled = wants_transform_feedback;
         dev->geometry_streams_feature_enabled = wants_geometry_streams_feature;
         dev->worker_rasterization_stream = pd->caps.rasterization_stream_state != 0;
+        dev->worker_core_indirect_draw = pd->caps.core_indirect_draw != 0;
+        dev->multi_draw_indirect_enabled =
+            (enabled_feature_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
         // (bufferDeviceAddress): native lane AND the enabled FEATURE (there is no
         // extension to require -- core 1.2). An off-lane enable was already rejected above with
         // FEATURE_NOT_PRESENT, so this equals wants_bda_feature; the && stays as defense in depth.
@@ -4531,6 +4553,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateBuffer(VkDevice device, const VkBufferCreat
         mr.alignment = r.mem_alignment;
         mr.memoryTypeBits = static_cast<std::uint32_t>(r.mem_type_bits);
         g_buffer_reqs[r.buffer] = mr;
+        g_buffer_sizes[r.buffer] = pCreateInfo->size;
+        g_buffer_usages[r.buffer] = pCreateInfo->usage;
         return VK_SUCCESS;
     } catch (const std::exception&) {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -4547,6 +4571,8 @@ VKAPI_ATTR void VKAPI_CALL DestroyBuffer(VkDevice, VkBuffer buffer, const VkAllo
         req.handle = from_handle(buffer);
         (void) vkrpc::destroy_buffer(*g_rpc, next_id(), req);
         g_buffer_reqs.erase(from_handle(buffer));
+        g_buffer_sizes.erase(from_handle(buffer));
+        g_buffer_usages.erase(from_handle(buffer));
         g_buffer_memory.erase(from_handle(buffer));
     } catch (const std::exception&) {
     }
@@ -4776,6 +4802,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BindBufferMemory2(VkDevice, std::uint32_t bindInf
             if (!vkrpc::bind_buffer_memory(*g_rpc, next_id(), req).ok) {
                 return fault();
             }
+            g_buffer_memory[req.buffer] = req.memory;
         }
         return VK_SUCCESS;
     } catch (const std::exception&) {
@@ -5373,6 +5400,8 @@ VKAPI_ATTR VkResult VKAPI_CALL AllocateCommandBuffers(VkDevice device,
             set_loader_magic_value(cb);
             cb->worker = r.command_buffers[i];
             cb->vk13_device = dev->vk13_device; // Vulkan 1.3 support: gates the copy2 wrappers
+            cb->worker_core_indirect_draw = dev->worker_core_indirect_draw;
+            cb->multi_draw_indirect_enabled = dev->multi_draw_indirect_enabled;
             pCommandBuffers[i] = reinterpret_cast<VkCommandBuffer>(cb);
         }
         return VK_SUCCESS;
@@ -7246,6 +7275,51 @@ VKAPI_ATTR void VKAPI_CALL CmdDrawIndexed(VkCommandBuffer commandBuffer, std::ui
     cb->recording.push_back(std::move(c));
 }
 
+// Core-1.0 indirect draws. The worker-vocabulary gate prevents a new ICD from sending unknown
+// record kinds to an older worker; the shared structural predicate is re-run by both backends
+// against their authoritative object tables before any host command is emitted.
+void record_core_indirect_draw(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
+                               std::uint32_t drawCount, std::uint32_t stride, bool indexed) {
+    auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
+    const char* why = "";
+    if (!vkr::icd_subset::core_indirect_worker_ok(cb->worker_core_indirect_draw, &why)) {
+        cb->local_invalid = true;
+        cb->invalid_reason = why;
+        return;
+    }
+    const std::uint64_t handle = from_handle(buffer);
+    const auto size_it = g_buffer_sizes.find(handle);
+    const auto usage_it = g_buffer_usages.find(handle);
+    const bool live = size_it != g_buffer_sizes.end() && usage_it != g_buffer_usages.end();
+    const bool bound = g_buffer_memory.find(handle) != g_buffer_memory.end();
+    const VkDeviceSize size = live ? size_it->second : 0;
+    const VkBufferUsageFlags usage = live ? usage_it->second : 0;
+    if (!vkr::icd_subset::draw_indirect_ok(live, bound, usage, size, offset, drawCount, stride,
+                                           indexed, cb->multi_draw_indirect_enabled, &why)) {
+        cb->local_invalid = true;
+        cb->invalid_reason = why;
+        return;
+    }
+    vkrpc::RecordedCommand c;
+    c.kind = indexed ? "draw_indexed_indirect" : "draw_indirect";
+    c.src_buffer = handle;
+    c.args_u64 = {static_cast<std::uint64_t>(offset)};
+    c.args_i64 = {static_cast<long long>(drawCount), static_cast<long long>(stride)};
+    cb->recording.push_back(std::move(c));
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                           VkDeviceSize offset, std::uint32_t drawCount,
+                                           std::uint32_t stride) {
+    record_core_indirect_draw(commandBuffer, buffer, offset, drawCount, stride, false);
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                                  VkDeviceSize offset, std::uint32_t drawCount,
+                                                  std::uint32_t stride) {
+    record_core_indirect_draw(commandBuffer, buffer, offset, drawCount, stride, true);
+}
+
 // --- (GL/zink): VK_EXT_transform_feedback + VK_EXT_conditional_rendering ----------------
 // The two extensions gating zink's OpenGL 3.0 (see kDeviceExtAllowlist). zink only emits these
 // when the app actually drives GL transform feedback / conditional rendering; the steady-state
@@ -8303,6 +8377,7 @@ PFN_vkVoidFunction get_proc(const char* name) {
     RET(CmdSetViewport);
     RET(CmdSetScissor);
     RET(CmdDraw);
+    RET(CmdDrawIndirect);
     // Host-visible memory + buffers.
     RET(CreateBuffer);
     RET(DestroyBuffer);
@@ -8322,6 +8397,7 @@ PFN_vkVoidFunction get_proc(const char* name) {
     RET(CmdBindVertexBuffers);
     RET(CmdBindIndexBuffer); // (GL/zink): indexed draws
     RET(CmdDrawIndexed);
+    RET(CmdDrawIndexedIndirect);
     RET(CmdPushConstants);
     // (GL/zink): the wired VK_EXT_transform_feedback + VK_EXT_conditional_rendering command
     // surfaces (the vkCmdBegin/EndQueryIndexedEXT pair stays a named abort-stub: XFB-stream queries
