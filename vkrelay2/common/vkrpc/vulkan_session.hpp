@@ -17,6 +17,7 @@
 #include "common/sidecar/sidecar_session.hpp"
 #include "common/sidecar/window_registry.hpp"
 #include "common/util/json.hpp"
+#include "common/vkrpc/pipeline_specialization_validation.h"
 #include "common/vkrpc/rpc.hpp"
 
 #include <cstdint>
@@ -1736,34 +1737,6 @@ struct CreatePipelineLayoutResponse {
     json::Value to_body() const;
     static CreatePipelineLayoutResponse from_body(const json::Value& body);
 };
-
-// VkSpecializationInfo's bounded, Vulkan-free normalized form. `present` distinguishes a null
-// pSpecializationInfo from a legal non-null empty struct. Wide signed fields retain hostile
-// negative / over-u32 wire values until validation proves every narrowing cast.
-constexpr std::size_t kMaxSpecializationMapEntriesPerStage = 256;
-constexpr std::size_t kMaxSpecializationMapEntriesPerRequest = 512;
-constexpr std::size_t kMaxSpecializationDataBytesPerStage = 64u * 1024u;
-constexpr std::size_t kMaxSpecializationDataBytesPerGraphicsRequest = 5u * 64u * 1024u;
-constexpr std::size_t kMaxPipelineEntryPointNameBytes = 4096;
-
-struct SpecializationMapEntryDesc {
-    long long constant_id = -1;
-    long long offset = -1;
-    long long size = -1;
-};
-
-struct SpecializationInfoDesc {
-    int present = 0;
-    std::vector<SpecializationMapEntryDesc> map_entries;
-    std::string data;
-};
-
-// Shared by the ICD after bounded extraction and independently by mock + real workers before
-// mutation/host calls. The input order is shader-stage order. Does not reflect SPIR-V widths or
-// ids; the host driver owns those shader-semantic checks.
-bool pipeline_specialization_ok(const std::vector<const SpecializationInfoDesc*>& infos,
-                                std::size_t max_request_data_bytes, std::string& reason);
-bool pipeline_entry_point_name_ok(const std::string& name, std::string& reason);
 
 // One pipeline shader stage.
 struct ShaderStageDesc {

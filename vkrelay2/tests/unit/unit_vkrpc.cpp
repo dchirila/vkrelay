@@ -10328,7 +10328,7 @@ void test_pipeline_specialization() {
     SpecializationInfoDesc absent;
     VKR_CHECK(ok({&absent}));
     SpecializationInfoDesc empty;
-    empty.present = 1;
+    empty.present = true;
     VKR_CHECK(ok({&empty}));
     SpecializationInfoDesc data_without_entries = empty;
     data_without_entries.data = "unused";
@@ -10341,10 +10341,7 @@ void test_pipeline_specialization() {
     overlap.map_entries = {{1, 1, 3}, {2, 2, 1}, {3, 0, 0}};
     VKR_CHECK(ok({&overlap}));
 
-    SpecializationInfoDesc bad = overlap;
-    bad.present = 2;
-    rejected_as({&bad}, "pipeline specialization presence must be 0 or 1");
-    bad = absent;
+    SpecializationInfoDesc bad = absent;
     bad.data = "x";
     rejected_as({&bad}, "absent pipeline specialization carries entries or data");
     bad = empty;
@@ -10411,7 +10408,7 @@ void test_pipeline_specialization() {
     fs.stage = 16;
     fs.module = 11;
     fs.entry = "main";
-    fs.specialization.present = 1;
+    fs.specialization.present = true;
     fs.specialization.map_entries = {{19, 1, 2}};
     fs.specialization.data = "XYZ"; // distinct tail pins exact per-stage association
     gp.stages = {vs, fs};
@@ -10421,28 +10418,28 @@ void test_pipeline_specialization() {
     auto gp_rt = vkrpc::CreateGraphicsPipelinesRequest::from_wire(graphics_wire, err);
     VKR_CHECK(err.empty());
     VKR_CHECK_EQ(gp_rt.stages.size(), static_cast<std::size_t>(2));
-    VKR_CHECK_EQ(gp_rt.stages[0].specialization.present, 1);
+    VKR_CHECK(gp_rt.stages[0].specialization.present);
     VKR_CHECK_EQ(gp_rt.stages[0].specialization.data, std::string("abcdef"));
     VKR_CHECK_EQ(gp_rt.stages[0].specialization.map_entries.size(), static_cast<std::size_t>(3));
-    VKR_CHECK_EQ(gp_rt.stages[1].specialization.present, 1);
+    VKR_CHECK(gp_rt.stages[1].specialization.present);
     VKR_CHECK_EQ(gp_rt.stages[1].specialization.data, std::string("XYZ"));
     VKR_CHECK_EQ(gp_rt.stages[1].specialization.map_entries.size(), static_cast<std::size_t>(1));
     VKR_CHECK_EQ(gp_rt.stages[1].specialization.map_entries[0].constant_id, 19);
     // A present-empty info is semantically distinct from a null info.
     fs.specialization = {};
-    fs.specialization.present = 1;
+    fs.specialization.present = true;
     gp.stages = {fs};
     const std::string empty_wire = gp.to_wire(err);
     VKR_CHECK(err.empty() && !empty_wire.empty());
     const auto empty_rt = vkrpc::CreateGraphicsPipelinesRequest::from_wire(empty_wire, err);
     VKR_CHECK(err.empty());
-    VKR_CHECK_EQ(empty_rt.stages[0].specialization.present, 1);
+    VKR_CHECK(empty_rt.stages[0].specialization.present);
     VKR_CHECK(empty_rt.stages[0].specialization.data.empty());
     VKR_CHECK(empty_rt.stages[0].specialization.map_entries.empty());
     // Legacy ops remain specialization-free, and decoding owns an independent copy of the tail.
     gp.stages = {vs, fs};
     const auto legacy = vkrpc::CreateGraphicsPipelinesRequest::from_body(gp.to_body());
-    VKR_CHECK_EQ(legacy.stages[0].specialization.present, 0);
+    VKR_CHECK(!legacy.stages[0].specialization.present);
     gp.stages[0].specialization.data[0] = 'Z';
     VKR_CHECK_EQ(gp_rt.stages[0].specialization.data, std::string("abcdef"));
 
@@ -10457,8 +10454,8 @@ void test_pipeline_specialization() {
     const auto cp_rt = vkrpc::CreateComputePipelinesRequest::from_wire(compute_wire, err);
     VKR_CHECK(err.empty());
     VKR_CHECK_EQ(cp_rt.specialization.data, std::string("abcdef"));
-    VKR_CHECK_EQ(
-        vkrpc::CreateComputePipelinesRequest::from_body(cp.to_body()).specialization.present, 0);
+    VKR_CHECK(
+        !vkrpc::CreateComputePipelinesRequest::from_body(cp.to_body()).specialization.present);
 
     // The legacy JSON codec stays byte-compatible, but its SEND helpers must reject rather than
     // silently drop a caller-supplied specialization. The no-I/O connection proves rejection
@@ -10512,6 +10509,18 @@ void test_pipeline_specialization() {
     (void) vkrpc::CreateGraphicsPipelinesRequest::from_wire(
         frame("{\"stages\":[{\"specialization\":{\"entries\":[[1,2]],\"data_size\":0}}]}"), err);
     VKR_CHECK(!err.empty());
+    (void) vkrpc::CreateComputePipelinesRequest::from_wire(
+        frame("{\"entry_point\":\"main\",\"specialization\":{\"entries\":[[1e300,0,0]],"
+              "\"data_size\":1}}",
+              "x"),
+        err);
+    VKR_CHECK_EQ(err, std::string("pipeline specialization entry contains a non-integer scalar"));
+    (void) vkrpc::CreateComputePipelinesRequest::from_wire(
+        frame("{\"entry_point\":\"main\",\"specialization\":{\"entries\":[[7,1,0]],"
+              "\"data_size\":1}}",
+              "x"),
+        err);
+    VKR_CHECK_EQ(err, std::string("pipeline specialization offset must be less than dataSize"));
     std::string trailing = graphics_wire;
     trailing.push_back('x');
     (void) vkrpc::CreateGraphicsPipelinesRequest::from_wire(trailing, err);

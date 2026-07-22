@@ -201,7 +201,7 @@ int main(int argc, char** argv) {
         // deliberately incomplete pipeline requests at the object-model layer; an unrecognized
         // opcode or malformed raw decoder path would instead make the helper throw on RPC status.
         vkrpc::SpecializationInfoDesc spec;
-        spec.present = 1;
+        spec.present = true;
         spec.map_entries = {{5, 0, 4}};
         spec.data = std::string("\x2a\0\0\0", 4);
         vkrpc::CreateGraphicsPipelinesRequest raw_gp;

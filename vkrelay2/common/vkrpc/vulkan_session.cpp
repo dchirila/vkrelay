@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string_view>   // cmd_kind_from_string's static lookup table
 #include <unordered_map> // ditto
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -131,7 +132,13 @@ class DecodedOpTrace {
             }
             const ShaderStageDesc& s = req.stages[i];
             out_ << "{\"stage\":" << s.stage << ",\"module\":\"shader_module#"
-                 << ordinal("shader_module", s.module) << "\"}";
+                 << ordinal("shader_module", s.module) << "\",\"specialization_present\":"
+                 << (s.specialization.present ? "true" : "false")
+                 << ",\"specialization_entries\":" << s.specialization.map_entries.size()
+                 << ",\"specialization_bytes\":" << s.specialization.data.size()
+                 << ",\"specialization_hash\":\""
+                 << hex(hash_bytes(s.specialization.data.data(), s.specialization.data.size()))
+                 << "\"}";
         }
         out_ << "],\"bindings\":[";
         for (std::size_t i = 0; i < req.vertex_bindings.size(); ++i) {
@@ -696,9 +703,26 @@ int get_three_state_scalar(const json::Value& obj, const std::string& key) {
     const int value = get_int(obj, key, kThreeStateScalarInvalid);
     return value == 0 || value == 1 ? value : kThreeStateScalarInvalid;
 }
+bool json_i64_value(const json::Value& value, long long& out) {
+    if (!value.is_integer()) {
+        return false;
+    }
+    const double number = value.as_number();
+    // JSON numbers are double-backed. Guard the conversion explicitly: llround/as_int on a
+    // finite integral double outside int64 is domain/range-sensitive across C libraries. The
+    // upper limit is exclusive because double(LLONG_MAX) rounds to +2^63; -2^63 is exact.
+    const double min_i64 = static_cast<double>(std::numeric_limits<long long>::min());
+    const double max_i64_exclusive = -min_i64;
+    if (number < min_i64 || number >= max_i64_exclusive) {
+        return false;
+    }
+    out = static_cast<long long>(number);
+    return true;
+}
 long long get_i64(const json::Value& obj, const std::string& key, long long fallback) {
-    const json::Value* v = obj.find(key);
-    return (v != nullptr && v->is_integer()) ? v->as_int() : fallback;
+    const json::Value* value = obj.find(key);
+    long long out = 0;
+    return value != nullptr && json_i64_value(*value, out) ? out : fallback;
 }
 // Decodes a small non-negative Vulkan index / extent / enum. Reads wide and maps a
 // missing / wrong-typed / out-of-[0, INT_MAX] value to -1, so a malformed wire
@@ -1290,11 +1314,10 @@ json::Value call_rpc(RpcChannel& channel, RpcOp op, std::uint32_t request_id,
     return parsed;
 }
 
-// Variant for the binary-bodied ops (create_shader_module): the request body is raw bytes
-// ([u32 json_len][json header][raw SPIR-V]) rather than a JSON document. The response is still
-// JSON.
+// Variant for binary-bodied ops: take the encoded envelope by value so temporary bodies move
+// directly into the RPC message. The response is still JSON.
 json::Value call_rpc_raw(RpcChannel& channel, RpcOp op, std::uint32_t request_id,
-                         const std::string& raw_body) {
+                         std::string raw_body) {
     RpcProfile* prof = profile_instance();
     std::uint64_t t0 = 0;
     if (prof != nullptr) {
@@ -1305,7 +1328,7 @@ json::Value call_rpc_raw(RpcChannel& channel, RpcOp op, std::uint32_t request_id
     RpcMessage out;
     out.op = static_cast<std::uint32_t>(op);
     out.request_id = request_id;
-    out.body = raw_body;
+    out.body = std::move(raw_body);
     channel.send(out);
 
     RpcMessage in;
@@ -2805,6 +2828,71 @@ enum : std::uint64_t {
     kRecIndirectCount = 1ull << 17,   // count buffer handle + countBufferOffset
     kRecKnownMask = (1ull << 18) - 1, // decode rejects any bit beyond the known set (fail-closed)
 };
+
+bool start_binary_envelope(const json::Value& header, std::size_t tail_reserve, const char* label,
+                           std::string& out, std::string& err) {
+    err.clear();
+    const std::string json_text = header.dump(0);
+    if (json_text.size() > kMaxBinaryJsonHeaderBytes) {
+        err = std::string(label) + " json header exceeds cap";
+        return false;
+    }
+    const std::size_t prefix_size = 4 + json_text.size();
+    const std::size_t max_body_size = protocol::kMaxFrameBytes - kRpcHeaderBytes;
+    if (prefix_size > max_body_size || tail_reserve > max_body_size - prefix_size) {
+        err = std::string(label) + " encoded RPC frame exceeds cap";
+        return false;
+    }
+    out.clear();
+    out.reserve(prefix_size + tail_reserve);
+    out.resize(4, '\0');
+    protocol::store_le32(static_cast<std::uint32_t>(json_text.size()),
+                         reinterpret_cast<unsigned char*>(out.data()));
+    out += json_text;
+    return true;
+}
+
+bool finish_binary_envelope(const std::string& body, const char* label, std::string& err) {
+    if (body.size() > protocol::kMaxFrameBytes - kRpcHeaderBytes) {
+        err = std::string(label) + " encoded RPC frame exceeds cap";
+        return false;
+    }
+    return true;
+}
+
+bool decode_binary_envelope(const std::string& body, const char* label, json::Value& header,
+                            std::size_t& tail_offset, std::string& err) {
+    err.clear();
+    if (body.size() < 4) {
+        err = std::string(label) + " body shorter than 4-byte length prefix";
+        return false;
+    }
+    const std::uint32_t json_len =
+        protocol::load_le32(reinterpret_cast<const unsigned char*>(body.data()));
+    if (json_len > kMaxBinaryJsonHeaderBytes) {
+        err = std::string(label) + " json header exceeds cap";
+        return false;
+    }
+    if (static_cast<std::size_t>(4) + json_len > body.size()) {
+        err = std::string(label) + " json header runs past end of body";
+        return false;
+    }
+    std::string json_err;
+    if (!json::Value::try_parse(body.substr(4, json_len), header, json_err)) {
+        err = std::string(label) + " json header parse: " + json_err;
+        return false;
+    }
+    if (!header.is_object()) {
+        err = std::string(label) + " json header is not an object";
+        return false;
+    }
+    if (body.size() > protocol::kMaxFrameBytes - kRpcHeaderBytes) {
+        err = std::string(label) + " encoded RPC frame exceeds cap";
+        return false;
+    }
+    tail_offset = static_cast<std::size_t>(4) + json_len;
+    return true;
+}
 } // namespace
 
 std::string RecordCommandBufferRequest::to_wire() const {
@@ -2813,11 +2901,14 @@ std::string RecordCommandBufferRequest::to_wire() const {
     h.set("command_buffer", handle_value(command_buffer));
     h.set("one_time_submit", json::Value(one_time_submit));
     h.set("count", json::Value(static_cast<long long>(commands.size())));
-    const std::string json = h.dump(0);
-    std::string out(4, '\0');
-    protocol::store_le32(static_cast<std::uint32_t>(json.size()),
-                         reinterpret_cast<unsigned char*>(&out[0]));
-    out += json;
+    std::string out;
+    std::string envelope_err;
+    const std::size_t reserve = commands.size() <= (protocol::kMaxFrameBytes - kRpcHeaderBytes) / 16
+                                    ? commands.size() * 16
+                                    : protocol::kMaxFrameBytes;
+    if (!start_binary_envelope(h, reserve, "record", out, envelope_err)) {
+        return {};
+    }
     for (const RecordedCommand& c : commands) {
         std::uint64_t mask = 0;
         if (c.image != 0 || c.old_layout != 0 || c.new_layout != 0 || c.src_stage != 0 ||
@@ -2995,30 +3086,14 @@ std::string RecordCommandBufferRequest::to_wire() const {
             wire_put_u64(out, c.indirect_count_buffer_offset);
         }
     }
-    return out;
+    return finish_binary_envelope(out, "record", envelope_err) ? out : std::string{};
 }
 
 RecordCommandBufferRequest RecordCommandBufferRequest::from_wire(const std::string& body,
                                                                  std::string& err) {
-    err.clear();
-    if (body.size() < 4) {
-        err = "record body shorter than 4-byte length prefix";
-        return RecordCommandBufferRequest{};
-    }
-    const std::uint32_t json_len =
-        protocol::load_le32(reinterpret_cast<const unsigned char*>(body.data()));
-    if (json_len > kMaxBinaryJsonHeaderBytes) {
-        err = "record json header exceeds cap";
-        return RecordCommandBufferRequest{};
-    }
-    if (static_cast<std::size_t>(4) + json_len > body.size()) {
-        err = "record json header runs past end of body";
-        return RecordCommandBufferRequest{};
-    }
     json::Value h;
-    std::string jerr;
-    if (!json::Value::try_parse(body.substr(4, json_len), h, jerr)) {
-        err = "record json header parse: " + jerr;
+    std::size_t tail_offset = 0;
+    if (!decode_binary_envelope(body, "record", h, tail_offset, err)) {
         return RecordCommandBufferRequest{};
     }
     if (get_int(h, "v", -1) != 2) {
@@ -3033,7 +3108,7 @@ RecordCommandBufferRequest RecordCommandBufferRequest::from_wire(const std::stri
         err = "record header count missing";
         return RecordCommandBufferRequest{};
     }
-    WireReader rd{body, static_cast<std::size_t>(4) + json_len};
+    WireReader rd{body, tail_offset};
     // Structural floor: the smallest sparse command (a 4-char kind + the mask, no groups) is
     // 16 bytes, so an absurd count is rejected before any allocation.
     if (static_cast<std::uint64_t>(count) > rd.remaining() / 16) {
@@ -3761,37 +3836,20 @@ std::string CreateShaderModuleRequest::to_wire() const {
     json::Value h = json::Value::make_object();
     h.set("device", handle_value(device));
     h.set("code_size", handle_value(code_size)); // wide (decimal string)
-    const std::string json = h.dump(0);
-    std::string out(4, '\0');
-    protocol::store_le32(static_cast<std::uint32_t>(json.size()),
-                         reinterpret_cast<unsigned char*>(&out[0]));
-    out += json;
+    std::string out;
+    std::string err;
+    if (!start_binary_envelope(h, code.size(), "shader module", out, err)) {
+        return {};
+    }
     out += code;
     return out;
 }
 
 CreateShaderModuleRequest CreateShaderModuleRequest::from_wire(const std::string& body,
                                                                std::string& err) {
-    err.clear();
-    if (body.size() < 4) {
-        err = "shader module body shorter than 4-byte length prefix";
-        return CreateShaderModuleRequest{};
-    }
-    const std::uint32_t json_len =
-        protocol::load_le32(reinterpret_cast<const unsigned char*>(body.data()));
-    if (json_len > kMaxBinaryJsonHeaderBytes) {
-        err = "shader module json header exceeds cap";
-        return CreateShaderModuleRequest{};
-    }
-    if (static_cast<std::size_t>(4) + json_len > body.size()) {
-        err = "shader module json header runs past end of body";
-        return CreateShaderModuleRequest{};
-    }
-    const std::string json_text = body.substr(4, json_len);
     json::Value h;
-    std::string jerr;
-    if (!json::Value::try_parse(json_text, h, jerr)) {
-        err = "shader module json header parse: " + jerr;
+    std::size_t tail_offset = 0;
+    if (!decode_binary_envelope(body, "shader module", h, tail_offset, err)) {
         return CreateShaderModuleRequest{};
     }
     CreateShaderModuleRequest r;
@@ -3804,7 +3862,7 @@ CreateShaderModuleRequest CreateShaderModuleRequest::from_wire(const std::string
         err = "shader module code_size exceeds the cap";
         return CreateShaderModuleRequest{};
     }
-    const std::size_t tail_len = body.size() - 4 - json_len;
+    const std::size_t tail_len = body.size() - tail_offset;
     // Exact (single blob): trailing bytes are a fault, not ignored. Comparing the real
     // tail length against the claimed code_size also bounds the copy (a huge code_size is rejected
     // here, never allocated).
@@ -3812,7 +3870,7 @@ CreateShaderModuleRequest CreateShaderModuleRequest::from_wire(const std::string
         err = "shader module tail length does not match code_size";
         return CreateShaderModuleRequest{};
     }
-    r.code.assign(body, static_cast<std::size_t>(4) + json_len, std::string::npos);
+    r.code.assign(body, tail_offset, std::string::npos);
     return r;
 }
 
@@ -4124,98 +4182,6 @@ CreatePipelineLayoutResponse CreatePipelineLayoutResponse::from_body(const json:
     return r;
 }
 
-bool pipeline_specialization_ok(const std::vector<const SpecializationInfoDesc*>& infos,
-                                std::size_t max_request_data_bytes, std::string& reason) {
-    reason.clear();
-    std::size_t total_entries = 0;
-    std::size_t total_data = 0;
-    // Shape and caps first, in stage order. Additions are checked before they are performed even
-    // though the per-stage caps make overflow unreachable for an ordinary pipeline request.
-    for (const SpecializationInfoDesc* info : infos) {
-        if (info == nullptr) {
-            reason = "pipeline specialization descriptor is null";
-            return false;
-        }
-        if (info->present != 0 && info->present != 1) {
-            reason = "pipeline specialization presence must be 0 or 1";
-            return false;
-        }
-        if (info->present == 0 && (!info->map_entries.empty() || !info->data.empty())) {
-            reason = "absent pipeline specialization carries entries or data";
-            return false;
-        }
-        if (info->map_entries.size() > kMaxSpecializationMapEntriesPerStage) {
-            reason = "pipeline specialization map entry count exceeds per-stage cap";
-            return false;
-        }
-        if (info->data.size() > kMaxSpecializationDataBytesPerStage) {
-            reason = "pipeline specialization data size exceeds per-stage cap";
-            return false;
-        }
-        if (total_entries > std::numeric_limits<std::size_t>::max() - info->map_entries.size() ||
-            total_data > std::numeric_limits<std::size_t>::max() - info->data.size()) {
-            reason = "pipeline specialization request totals overflow";
-            return false;
-        }
-        total_entries += info->map_entries.size();
-        total_data += info->data.size();
-    }
-    if (total_entries > kMaxSpecializationMapEntriesPerRequest) {
-        reason = "pipeline specialization map entry count exceeds request cap";
-        return false;
-    }
-    if (total_data > max_request_data_bytes) {
-        reason = "pipeline specialization data size exceeds request cap";
-        return false;
-    }
-
-    for (const SpecializationInfoDesc* info : infos) {
-        for (const SpecializationMapEntryDesc& entry : info->map_entries) {
-            if (entry.constant_id < 0 ||
-                static_cast<unsigned long long>(entry.constant_id) > UINT32_MAX) {
-                reason = "pipeline specialization constantID is outside uint32";
-                return false;
-            }
-            if (entry.offset < 0 || static_cast<unsigned long long>(entry.offset) > UINT32_MAX) {
-                reason = "pipeline specialization offset is outside uint32";
-                return false;
-            }
-            if (entry.size < 0 || static_cast<unsigned long long>(entry.size) >
-                                      std::numeric_limits<std::size_t>::max()) {
-                reason = "pipeline specialization size is negative or not representable";
-                return false;
-            }
-            const std::size_t offset = static_cast<std::size_t>(entry.offset);
-            const std::size_t size = static_cast<std::size_t>(entry.size);
-            if (offset >= info->data.size()) {
-                reason = "pipeline specialization offset must be less than dataSize";
-                return false;
-            }
-            if (size > info->data.size() - offset) {
-                reason = "pipeline specialization size exceeds dataSize minus offset";
-                return false;
-            }
-        }
-        std::set<long long> ids;
-        for (const SpecializationMapEntryDesc& entry : info->map_entries) {
-            if (!ids.insert(entry.constant_id).second) {
-                reason = "pipeline specialization constantID values must be unique";
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-bool pipeline_entry_point_name_ok(const std::string& name, std::string& reason) {
-    reason.clear();
-    if (name.size() > kMaxPipelineEntryPointNameBytes) {
-        reason = "pipeline stage entry-point name exceeds 4096-byte cap";
-        return false;
-    }
-    return true;
-}
-
 namespace {
 
 json::Value* mutable_object_field(json::Value& object, const char* key) {
@@ -4257,7 +4223,7 @@ bool decode_specialization_header(const json::Value& stage, SpecializationInfoDe
         err = "pipeline specialization header is not an object";
         return false;
     }
-    info.present = 1;
+    info.present = true;
     const json::Value* entries = spec->find("entries");
     const json::Value* size = spec->find("data_size");
     if (entries == nullptr || !entries->is_array()) {
@@ -4268,76 +4234,43 @@ bool decode_specialization_header(const json::Value& stage, SpecializationInfoDe
         err = "pipeline specialization map entry count exceeds per-stage cap";
         return false;
     }
-    if (size == nullptr || !size->is_integer() || size->as_int() < 0 ||
-        static_cast<unsigned long long>(size->as_int()) > kMaxSpecializationDataBytesPerStage) {
+    long long encoded_data_size = -1;
+    if (size == nullptr || !json_i64_value(*size, encoded_data_size) || encoded_data_size < 0 ||
+        static_cast<unsigned long long>(encoded_data_size) > kMaxSpecializationDataBytesPerStage) {
         err = "pipeline specialization data_size is invalid or exceeds per-stage cap";
         return false;
     }
-    data_size = static_cast<std::size_t>(size->as_int());
+    data_size = static_cast<std::size_t>(encoded_data_size);
     for (const json::Value& encoded : entries->as_array()) {
         if (!encoded.is_array() || encoded.as_array().size() != 3) {
             err = "pipeline specialization entry is not a three-scalar array";
             return false;
         }
         const json::Array& values = encoded.as_array();
-        if (!values[0].is_integer() || !values[1].is_integer() || !values[2].is_integer()) {
+        SpecializationMapEntryDesc entry;
+        if (!json_i64_value(values[0], entry.constant_id) ||
+            !json_i64_value(values[1], entry.offset) || !json_i64_value(values[2], entry.size)) {
             err = "pipeline specialization entry contains a non-integer scalar";
             return false;
         }
-        info.map_entries.push_back({values[0].as_int(), values[1].as_int(), values[2].as_int()});
+        info.map_entries.push_back(entry);
     }
-    return true;
-}
-
-bool decode_pipeline_wire_header(const std::string& body, const char* label, json::Value& header,
-                                 std::size_t& tail_offset, std::string& err) {
-    err.clear();
-    if (body.size() < 4) {
-        err = std::string(label) + " body shorter than 4-byte length prefix";
-        return false;
-    }
-    const std::uint32_t json_len =
-        protocol::load_le32(reinterpret_cast<const unsigned char*>(body.data()));
-    if (json_len > kMaxBinaryJsonHeaderBytes) {
-        err = std::string(label) + " json header exceeds cap";
-        return false;
-    }
-    if (static_cast<std::size_t>(4) + json_len > body.size()) {
-        err = std::string(label) + " json header runs past end of body";
-        return false;
-    }
-    std::string json_err;
-    if (!json::Value::try_parse(body.substr(4, json_len), header, json_err)) {
-        err = std::string(label) + " json header parse: " + json_err;
-        return false;
-    }
-    if (!header.is_object()) {
-        err = std::string(label) + " json header is not an object";
-        return false;
-    }
-    tail_offset = static_cast<std::size_t>(4) + json_len;
     return true;
 }
 
 std::string encode_pipeline_wire(json::Value header,
                                  const std::vector<const SpecializationInfoDesc*>& infos,
                                  const char* label, std::string& err) {
-    err.clear();
-    const std::string json_text = header.dump(0);
-    if (json_text.size() > kMaxBinaryJsonHeaderBytes) {
-        err = std::string(label) + " json header exceeds cap";
+    std::size_t tail_size = 0;
+    for (const SpecializationInfoDesc* info : infos) {
+        tail_size += info->data.size();
+    }
+    std::string out;
+    if (!start_binary_envelope(header, tail_size, label, out, err)) {
         return {};
     }
-    std::string out(4, '\0');
-    protocol::store_le32(static_cast<std::uint32_t>(json_text.size()),
-                         reinterpret_cast<unsigned char*>(&out[0]));
-    out += json_text;
     for (const SpecializationInfoDesc* info : infos) {
         out += info->data;
-    }
-    if (out.size() + kRpcHeaderBytes > protocol::kMaxFrameBytes) {
-        err = std::string(label) + " encoded RPC frame exceeds cap";
-        return {};
     }
     return out;
 }
@@ -4670,7 +4603,7 @@ std::string CreateGraphicsPipelinesRequest::to_wire(std::string& err) const {
         return {};
     }
     for (std::size_t i = 0; i < stages.size(); ++i) {
-        if (stages[i].specialization.present != 0) {
+        if (stages[i].specialization.present) {
             encoded_stages->as_array()[i].set("specialization",
                                               specialization_header(stages[i].specialization));
         }
@@ -4682,7 +4615,7 @@ CreateGraphicsPipelinesRequest CreateGraphicsPipelinesRequest::from_wire(const s
                                                                          std::string& err) {
     json::Value header;
     std::size_t tail_offset = 0;
-    if (!decode_pipeline_wire_header(body, "graphics pipeline raw", header, tail_offset, err)) {
+    if (!decode_binary_envelope(body, "graphics pipeline raw", header, tail_offset, err)) {
         return {};
     }
     CreateGraphicsPipelinesRequest r = from_body(header);
@@ -4693,29 +4626,17 @@ CreateGraphicsPipelinesRequest CreateGraphicsPipelinesRequest::from_wire(const s
         return {};
     }
     std::vector<std::size_t> data_sizes(r.stages.size(), 0);
-    std::size_t total_entries = 0;
     std::size_t total_data = 0;
     for (std::size_t i = 0; i < r.stages.size(); ++i) {
         if (!decode_specialization_header(encoded_stages->as_array()[i], r.stages[i].specialization,
                                           data_sizes[i], err)) {
             return {};
         }
-        if (total_entries > std::numeric_limits<std::size_t>::max() -
-                                r.stages[i].specialization.map_entries.size() ||
-            total_data > std::numeric_limits<std::size_t>::max() - data_sizes[i]) {
+        if (total_data > std::numeric_limits<std::size_t>::max() - data_sizes[i]) {
             err = "graphics pipeline specialization totals overflow";
             return {};
         }
-        total_entries += r.stages[i].specialization.map_entries.size();
         total_data += data_sizes[i];
-    }
-    if (total_entries > kMaxSpecializationMapEntriesPerRequest) {
-        err = "pipeline specialization map entry count exceeds request cap";
-        return {};
-    }
-    if (total_data > kMaxSpecializationDataBytesPerGraphicsRequest) {
-        err = "pipeline specialization data size exceeds request cap";
-        return {};
     }
     if (body.size() - tail_offset != total_data) {
         err = "graphics pipeline raw tail length does not match specialization data sizes";
@@ -4725,6 +4646,17 @@ CreateGraphicsPipelinesRequest CreateGraphicsPipelinesRequest::from_wire(const s
     for (std::size_t i = 0; i < r.stages.size(); ++i) {
         r.stages[i].specialization.data.assign(body, cursor, data_sizes[i]);
         cursor += data_sizes[i];
+    }
+    std::vector<const SpecializationInfoDesc*> infos;
+    infos.reserve(r.stages.size());
+    for (const ShaderStageDesc& stage : r.stages) {
+        if (!pipeline_entry_point_name_ok(stage.entry, err)) {
+            return {};
+        }
+        infos.push_back(&stage.specialization);
+    }
+    if (!pipeline_specialization_ok(infos, kMaxSpecializationDataBytesPerGraphicsRequest, err)) {
+        return {};
     }
     return r;
 }
@@ -4781,7 +4713,7 @@ std::string CreateComputePipelinesRequest::to_wire(std::string& err) const {
         return {};
     }
     json::Value header = to_body();
-    if (specialization.present != 0) {
+    if (specialization.present) {
         header.set("specialization", specialization_header(specialization));
     }
     return encode_pipeline_wire(std::move(header), infos, "compute pipeline raw", err);
@@ -4791,7 +4723,7 @@ CreateComputePipelinesRequest CreateComputePipelinesRequest::from_wire(const std
                                                                        std::string& err) {
     json::Value header;
     std::size_t tail_offset = 0;
-    if (!decode_pipeline_wire_header(body, "compute pipeline raw", header, tail_offset, err)) {
+    if (!decode_binary_envelope(body, "compute pipeline raw", header, tail_offset, err)) {
         return {};
     }
     CreateComputePipelinesRequest r = from_body(header);
@@ -4799,15 +4731,16 @@ CreateComputePipelinesRequest CreateComputePipelinesRequest::from_wire(const std
     if (!decode_specialization_header(header, r.specialization, data_size, err)) {
         return {};
     }
-    if (r.specialization.map_entries.size() > kMaxSpecializationMapEntriesPerRequest) {
-        err = "pipeline specialization map entry count exceeds request cap";
-        return {};
-    }
     if (body.size() - tail_offset != data_size) {
         err = "compute pipeline raw tail length does not match specialization data_size";
         return {};
     }
     r.specialization.data.assign(body, tail_offset, data_size);
+    if (!pipeline_entry_point_name_ok(r.entry_point, err) ||
+        !pipeline_specialization_ok({&r.specialization}, kMaxSpecializationDataBytesPerStage,
+                                    err)) {
+        return {};
+    }
     return r;
 }
 
@@ -4964,36 +4897,20 @@ std::string WriteMemoryRangesRequest::to_wire() const {
         ups.emplace_back(std::move(uv));
     }
     h.set("uploads", json::Value(std::move(ups)));
-    const std::string json = h.dump(0);
-    std::string out(4, '\0');
-    protocol::store_le32(static_cast<std::uint32_t>(json.size()),
-                         reinterpret_cast<unsigned char*>(&out[0]));
-    out += json;
+    std::string out;
+    std::string err;
+    if (!start_binary_envelope(h, payload.size(), "write_memory_ranges", out, err)) {
+        return {};
+    }
     out += payload;
     return out;
 }
 
 WriteMemoryRangesRequest WriteMemoryRangesRequest::from_wire(const std::string& body,
                                                              std::string& err) {
-    err.clear();
-    if (body.size() < 4) {
-        err = "write_memory_ranges body shorter than 4-byte length prefix";
-        return WriteMemoryRangesRequest{};
-    }
-    const std::uint32_t json_len =
-        protocol::load_le32(reinterpret_cast<const unsigned char*>(body.data()));
-    if (json_len > kMaxBinaryJsonHeaderBytes) {
-        err = "write_memory_ranges json header exceeds cap";
-        return WriteMemoryRangesRequest{};
-    }
-    if (static_cast<std::size_t>(4) + json_len > body.size()) {
-        err = "write_memory_ranges json header runs past end of body";
-        return WriteMemoryRangesRequest{};
-    }
     json::Value h;
-    std::string jerr;
-    if (!json::Value::try_parse(body.substr(4, json_len), h, jerr)) {
-        err = "write_memory_ranges json header parse: " + jerr;
+    std::size_t tail_offset = 0;
+    if (!decode_binary_envelope(body, "write_memory_ranges", h, tail_offset, err)) {
         return WriteMemoryRangesRequest{};
     }
     WriteMemoryRangesRequest r;
@@ -5041,7 +4958,7 @@ WriteMemoryRangesRequest WriteMemoryRangesRequest::from_wire(const std::string& 
             r.uploads.push_back(std::move(u));
         }
     }
-    const std::size_t tail_len = body.size() - 4 - json_len;
+    const std::size_t tail_len = body.size() - tail_offset;
     if (total != tail_len) {
         err = "write_memory_ranges payload length does not match the summed range sizes";
         return WriteMemoryRangesRequest{};
@@ -5050,14 +4967,7 @@ WriteMemoryRangesRequest WriteMemoryRangesRequest::from_wire(const std::string& 
         err = "write_memory_ranges payload exceeds the per-call cap";
         return WriteMemoryRangesRequest{};
     }
-    // Full encoded frame must fit the transport cap: the RPC frame payload is the
-    // 12-byte RPC header + this whole [u32 json_len][json][tail] body.
-    if (kRpcHeaderBytes + 4 + static_cast<std::size_t>(json_len) + tail_len >
-        protocol::kMaxFrameBytes) {
-        err = "write_memory_ranges encoded frame exceeds the transport cap";
-        return WriteMemoryRangesRequest{};
-    }
-    r.payload.assign(body, static_cast<std::size_t>(4) + json_len, std::string::npos);
+    r.payload.assign(body, tail_offset, std::string::npos);
     return r;
 }
 
@@ -5878,42 +5788,26 @@ std::string ReadMemoryRangesResponse::to_wire() const {
     json::Value h = json::Value::make_object();
     h.set("ok", json::Value(ok));
     h.set("reason", json::Value(reason));
-    const std::string json = h.dump(0);
-    std::string out(4, '\0');
-    protocol::store_le32(static_cast<std::uint32_t>(json.size()),
-                         reinterpret_cast<unsigned char*>(&out[0]));
-    out += json;
+    std::string out;
+    std::string err;
+    if (!start_binary_envelope(h, payload.size(), "read_memory_ranges response", out, err)) {
+        return {};
+    }
     out += payload;
     return out;
 }
 
 ReadMemoryRangesResponse ReadMemoryRangesResponse::from_wire(const std::string& body,
                                                              std::string& err) {
-    err.clear();
-    if (body.size() < 4) {
-        err = "read_memory_ranges response shorter than 4-byte length prefix";
-        return ReadMemoryRangesResponse{};
-    }
-    const std::uint32_t json_len =
-        protocol::load_le32(reinterpret_cast<const unsigned char*>(body.data()));
-    if (json_len > kMaxBinaryJsonHeaderBytes) {
-        err = "read_memory_ranges response json header exceeds cap";
-        return ReadMemoryRangesResponse{};
-    }
-    if (static_cast<std::size_t>(4) + json_len > body.size()) {
-        err = "read_memory_ranges response json header runs past end of body";
-        return ReadMemoryRangesResponse{};
-    }
     json::Value h;
-    std::string jerr;
-    if (!json::Value::try_parse(body.substr(4, json_len), h, jerr)) {
-        err = "read_memory_ranges response json header parse: " + jerr;
+    std::size_t tail_offset = 0;
+    if (!decode_binary_envelope(body, "read_memory_ranges response", h, tail_offset, err)) {
         return ReadMemoryRangesResponse{};
     }
     ReadMemoryRangesResponse r;
     r.ok = get_bool(h, "ok");
     r.reason = get_string(h, "reason");
-    r.payload = body.substr(4 + json_len);
+    r.payload = body.substr(tail_offset);
     return r;
 }
 
@@ -13559,7 +13453,7 @@ CreateGraphicsPipelinesResponse
 create_graphics_pipelines(RpcChannel& channel, std::uint32_t request_id,
                           const CreateGraphicsPipelinesRequest& req) {
     for (const ShaderStageDesc& stage : req.stages) {
-        if (stage.specialization.present != 0 || !stage.specialization.map_entries.empty() ||
+        if (stage.specialization.present || !stage.specialization.map_entries.empty() ||
             !stage.specialization.data.empty()) {
             CreateGraphicsPipelinesResponse resp;
             resp.reason = "legacy graphics pipeline RPC cannot carry specialization constants";
@@ -13574,20 +13468,20 @@ CreateGraphicsPipelinesResponse
 create_graphics_pipelines_raw(RpcChannel& channel, std::uint32_t request_id,
                               const CreateGraphicsPipelinesRequest& req) {
     std::string err;
-    const std::string wire = req.to_wire(err);
+    std::string wire = req.to_wire(err);
     if (!err.empty()) {
         CreateGraphicsPipelinesResponse resp;
         resp.reason = err;
         return resp;
     }
     return CreateGraphicsPipelinesResponse::from_body(
-        call_rpc_raw(channel, RpcOp::CreateGraphicsPipelinesRaw, request_id, wire));
+        call_rpc_raw(channel, RpcOp::CreateGraphicsPipelinesRaw, request_id, std::move(wire)));
 }
 
 CreateComputePipelinesResponse create_compute_pipelines(RpcChannel& channel,
                                                         std::uint32_t request_id,
                                                         const CreateComputePipelinesRequest& req) {
-    if (req.specialization.present != 0 || !req.specialization.map_entries.empty() ||
+    if (req.specialization.present || !req.specialization.map_entries.empty() ||
         !req.specialization.data.empty()) {
         CreateComputePipelinesResponse resp;
         resp.reason = "legacy compute pipeline RPC cannot carry specialization constants";
@@ -13601,14 +13495,14 @@ CreateComputePipelinesResponse
 create_compute_pipelines_raw(RpcChannel& channel, std::uint32_t request_id,
                              const CreateComputePipelinesRequest& req) {
     std::string err;
-    const std::string wire = req.to_wire(err);
+    std::string wire = req.to_wire(err);
     if (!err.empty()) {
         CreateComputePipelinesResponse resp;
         resp.reason = err;
         return resp;
     }
     return CreateComputePipelinesResponse::from_body(
-        call_rpc_raw(channel, RpcOp::CreateComputePipelinesRaw, request_id, wire));
+        call_rpc_raw(channel, RpcOp::CreateComputePipelinesRaw, request_id, std::move(wire)));
 }
 
 StatusResponse destroy_pipeline(RpcChannel& channel, std::uint32_t request_id,
