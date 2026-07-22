@@ -109,6 +109,9 @@ struct DeviceCaps {
     // Additive: absent/0 is an old worker, so a newer ICD rejects a non-null
     // pSpecializationInfo locally and never sends new vocabulary.
     std::uint32_t pipeline_specialization = 0;
+    // Generation-scoped direct image/buffer recording leases. Additive: absent/0 is an older
+    // worker, so the ICD uses the legacy immediate destroy path and preserves prior behavior.
+    std::uint32_t recording_resource_leases_v1 = 0;
 
     json::Value to_body() const;
     static DeviceCaps from_body(const json::Value& body);
@@ -1209,6 +1212,9 @@ constexpr int kMaxDynamicRenderingColorAttachments = 8;
 
 struct RecordCommandBufferRequest {
     std::uint64_t command_buffer = 0;
+    // Additive generation identity for leased resources. Zero is the legacy spelling and keeps
+    // the pre-lease record/invalidation contract.
+    std::uint64_t recording_generation = 0;
     bool one_time_submit = false;
     std::vector<RecordedCommand> commands;
 
@@ -1226,6 +1232,34 @@ struct RecordCommandBufferRequest {
     // trailing bytes.
     std::string to_wire() const;
     static RecordCommandBufferRequest from_wire(const std::string& body, std::string& err);
+};
+
+constexpr std::size_t kMaxRecordingResourceLeasesPerRequest = 256;
+constexpr std::size_t kMaxRetiredRecordingResourcesPerDevice = 4096;
+constexpr std::size_t kMaxRetiredMemoryAllocationsPerDevice = 4096;
+constexpr std::size_t kMaxRecordingResourceLeaseEdgesPerDevice = 16384;
+
+struct CommandBufferLease {
+    std::uint64_t command_buffer = 0;
+    std::uint64_t recording_generation = 0;
+
+    json::Value to_body() const;
+    static CommandBufferLease from_body(const json::Value& body);
+};
+
+struct LeasedDestroyRequest {
+    std::uint64_t handle = 0;
+    std::vector<CommandBufferLease> leases;
+
+    json::Value to_body() const;
+    static LeasedDestroyRequest from_body(const json::Value& body);
+};
+
+struct RetireCommandBufferRecordingsRequest {
+    std::vector<CommandBufferLease> recordings;
+
+    json::Value to_body() const;
+    static RetireCommandBufferRecordingsRequest from_body(const json::Value& body);
 };
 
 // One {semaphore, stage} wait of a submit. `stage` is the VkPipelineStageFlags the wait
@@ -3306,11 +3340,20 @@ struct UpdateDescriptorSetsRequest {
     static UpdateDescriptorSetsRequest from_body(const json::Value& body);
 };
 
+struct LifetimeLeaseStats {
+    std::size_t live_resources = 0;
+    std::size_t retired_resources = 0;
+    std::size_t retired_memories = 0;
+    std::size_t lease_edges = 0;
+    std::size_t capacity_rejections = 0;
+};
+
 // Worker-side abstraction over host Vulkan. The real implementation lives only in the worker; the
 // supervisor never loads a Vulkan driver.
 class VulkanBackend {
   public:
     virtual ~VulkanBackend() = default;
+    virtual LifetimeLeaseStats lifetime_lease_stats() const = 0;
     virtual CapabilitiesResponse negotiate(const CapabilitiesRequest& req) = 0;
     virtual CreateInstanceResponse create_instance(const CreateInstanceRequest& req) = 0;
     virtual EnumeratePhysicalDevicesResponse
@@ -3339,6 +3382,8 @@ class VulkanBackend {
     virtual AcquireNextImageResponse acquire_next_image(const AcquireNextImageRequest& req) = 0;
     virtual QueuePresentResponse queue_present(const QueuePresentRequest& req) = 0;
     virtual StatusResponse record_command_buffer(const RecordCommandBufferRequest& req) = 0;
+    virtual StatusResponse
+    retire_command_buffer_recordings(const RetireCommandBufferRecordingsRequest& req) = 0;
     virtual QueueSubmitResponse queue_submit(const QueueSubmitRequest& req) = 0;
     // vkQueueSubmit2 -- the whole VkSubmitInfo2[] batch + one fence in one call.
     virtual QueueSubmitResponse queue_submit2(const QueueSubmit2Request& req) = 0;
@@ -3393,6 +3438,7 @@ class VulkanBackend {
     get_physical_device_memory_properties(const GetPhysicalDeviceMemoryPropertiesRequest& req) = 0;
     virtual CreateBufferResponse create_buffer(const CreateBufferRequest& req) = 0;
     virtual StatusResponse destroy_buffer(const HandleRequest& req) = 0;
+    virtual StatusResponse destroy_buffer_leased(const LeasedDestroyRequest& req) = 0;
     virtual StatusResponse bind_buffer_memory(const BindBufferMemoryRequest& req) = 0;
     // (bufferDeviceAddress): the real host VkDeviceAddress verbatim (mock: per-buffer
     // token). Gated on the device's enabled bufferDeviceAddress feature, mock == real.
@@ -3439,6 +3485,7 @@ class VulkanBackend {
     get_physical_device_capability_chain(const GetPhysicalDeviceCapabilityChainRequest& req) = 0;
     virtual CreateImageResponse create_image(const CreateImageRequest& req) = 0;
     virtual StatusResponse destroy_image(const HandleRequest& req) = 0;
+    virtual StatusResponse destroy_image_leased(const LeasedDestroyRequest& req) = 0;
     virtual StatusResponse bind_image_memory(const BindImageMemoryRequest& req) = 0;
     // Sampler support. Pure (both the mock and the worker's RealVulkanBackend
     // override them). The combined-image-sampler descriptor type + the texture-upload commands need
@@ -3471,6 +3518,7 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
   public:
     explicit MockVulkanBackend(const std::string& gpu_name,
                                const display::DisplayLayout* display_layout = nullptr);
+    LifetimeLeaseStats lifetime_lease_stats() const override;
     CapabilitiesResponse negotiate(const CapabilitiesRequest& req) override;
     // Sidecar plane: the mock is one session object spanning both planes, so the
     // dual-platform tests exercise the sidecar plane against the same shape as the real worker.
@@ -3550,6 +3598,8 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
     AcquireNextImageResponse acquire_next_image(const AcquireNextImageRequest& req) override;
     QueuePresentResponse queue_present(const QueuePresentRequest& req) override;
     StatusResponse record_command_buffer(const RecordCommandBufferRequest& req) override;
+    StatusResponse
+    retire_command_buffer_recordings(const RetireCommandBufferRecordingsRequest& req) override;
     QueueSubmitResponse queue_submit(const QueueSubmitRequest& req) override;
     QueueSubmitResponse queue_submit2(const QueueSubmit2Request& req) override;
     StatusResponse reset_fences(const ResetFencesRequest& req) override;
@@ -3596,6 +3646,7 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
         const GetPhysicalDeviceMemoryPropertiesRequest& req) override;
     CreateBufferResponse create_buffer(const CreateBufferRequest& req) override;
     StatusResponse destroy_buffer(const HandleRequest& req) override;
+    StatusResponse destroy_buffer_leased(const LeasedDestroyRequest& req) override;
     StatusResponse bind_buffer_memory(const BindBufferMemoryRequest& req) override;
     GetBufferDeviceAddressResponse
     get_buffer_device_address(const GetBufferDeviceAddressRequest& req) override;
@@ -3631,6 +3682,7 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
         const GetPhysicalDeviceCapabilityChainRequest& req) override;
     CreateImageResponse create_image(const CreateImageRequest& req) override;
     StatusResponse destroy_image(const HandleRequest& req) override;
+    StatusResponse destroy_image_leased(const LeasedDestroyRequest& req) override;
     StatusResponse bind_image_memory(const BindImageMemoryRequest& req) override;
     // Sampler support.
     CreateSamplerResponse create_sampler(const CreateSamplerRequest& req) override;
@@ -3781,6 +3833,7 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
     struct CmdBuffer {
         std::uint64_t pool = 0;
         std::uint64_t device = 0;
+        std::uint64_t recording_generation = 0;
         bool recorded = false;
         std::set<std::uint64_t> referenced_surfaces;   // queue_submit locks their slots
         std::set<std::uint64_t> referenced_swapchains; // invalidated when one is destroyed
@@ -4109,6 +4162,20 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
     // children.
     std::map<std::uint64_t, MemoryObject> memory_objects_;
     std::map<std::uint64_t, Buffer> buffers_;
+    using RecordingLeaseKey = std::pair<std::uint64_t, std::uint64_t>;
+    struct RetiredImage {
+        Image image;
+        std::set<RecordingLeaseKey> leases;
+    };
+    struct RetiredBuffer {
+        Buffer buffer;
+        std::set<RecordingLeaseKey> leases;
+    };
+    std::map<std::uint64_t, RetiredImage> retired_images_;
+    std::map<std::uint64_t, RetiredBuffer> retired_buffers_;
+    std::set<std::uint64_t> retired_memories_;
+    std::size_t recording_resource_lease_edges_ = 0;
+    std::size_t recording_resource_capacity_rejections_ = 0;
     // Descriptor surface tables.
     std::map<std::uint64_t, DescriptorSetLayout> descriptor_set_layouts_;
     std::map<std::uint64_t, DescriptorPool> descriptor_pools_;
@@ -4127,7 +4194,13 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
 
     // Invalidates any recorded command buffer that baked in `handle` (a draw object being
     // destroyed), so a later queue_submit refuses it instead of referencing a freed object.
-    void invalidate_cbs_referencing(std::uint64_t handle);
+    void
+    invalidate_cbs_referencing(std::uint64_t handle,
+                               const std::set<RecordingLeaseKey>* preserved_recordings = nullptr);
+    void release_recording_lease(const RecordingLeaseKey& key);
+    void release_recording_leases_for_command_buffer(std::uint64_t command_buffer,
+                                                     std::uint64_t before_generation = ~0ull);
+    void release_retired_memory_if_unused(std::uint64_t memory);
 
     // The CB -> set -> {buffer | sampler | image-view} destroy consult (for buffers,
     // extended to sampler/image-view referents). Marks any descriptor slot currently
@@ -4136,7 +4209,8 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
     // points at a freed resource. Handles are monotonic + unique across object kinds, so matching
     // by value cannot confuse a buffer for a sampler/view. Called by destroy_buffer /
     // destroy_image_view / destroy_sampler.
-    void dangle_sets_referencing(std::uint64_t resource);
+    void dangle_sets_referencing(std::uint64_t resource,
+                                 const std::set<RecordingLeaseKey>* preserved_recordings = nullptr);
 
     // True if `set` (on `device`) is draw-ready: every slot its layout requires is
     // initialized and still references a live, same-device buffer with UNIFORM_BUFFER usage. On
@@ -4221,6 +4295,8 @@ StatusResponse record_command_buffer(RpcChannel& channel, std::uint32_t request_
 // to_wire; JSON response). Callers use it only when DeviceCaps.raw_record was advertised.
 StatusResponse record_command_buffer_raw(RpcChannel& channel, std::uint32_t request_id,
                                          const RecordCommandBufferRequest& req);
+StatusResponse retire_command_buffer_recordings(RpcChannel& channel, std::uint32_t request_id,
+                                                const RetireCommandBufferRecordingsRequest& req);
 QueueSubmitResponse queue_submit(RpcChannel& channel, std::uint32_t request_id,
                                  const QueueSubmitRequest& req);
 QueueSubmitResponse queue_submit2(RpcChannel& channel, std::uint32_t request_id,
@@ -4311,6 +4387,8 @@ CreateBufferResponse create_buffer(RpcChannel& channel, std::uint32_t request_id
                                    const CreateBufferRequest& req);
 StatusResponse destroy_buffer(RpcChannel& channel, std::uint32_t request_id,
                               const HandleRequest& req);
+StatusResponse destroy_buffer_leased(RpcChannel& channel, std::uint32_t request_id,
+                                     const LeasedDestroyRequest& req);
 StatusResponse bind_buffer_memory(RpcChannel& channel, std::uint32_t request_id,
                                   const BindBufferMemoryRequest& req);
 StatusResponse write_memory_ranges(RpcChannel& channel, std::uint32_t request_id,
@@ -4364,6 +4442,8 @@ CreateImageResponse create_image(RpcChannel& channel, std::uint32_t request_id,
                                  const CreateImageRequest& req);
 StatusResponse destroy_image(RpcChannel& channel, std::uint32_t request_id,
                              const HandleRequest& req);
+StatusResponse destroy_image_leased(RpcChannel& channel, std::uint32_t request_id,
+                                    const LeasedDestroyRequest& req);
 StatusResponse bind_image_memory(RpcChannel& channel, std::uint32_t request_id,
                                  const BindImageMemoryRequest& req);
 // Sampler support. All JSON like every other op.

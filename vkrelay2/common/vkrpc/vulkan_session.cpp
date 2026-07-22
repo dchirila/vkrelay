@@ -35,6 +35,12 @@ namespace {
 
 constexpr char kComponent[] = "vkrpc";
 
+template <typename F> struct ScopeExit {
+    F fn;
+    ~ScopeExit() { fn(); }
+};
+template <typename F> ScopeExit(F) -> ScopeExit<F>;
+
 // AMD-iGPU investigation: one session-owned trace at the worker's DECODED request boundary. The
 // supervisor sets VKRELAY2_OP_TRACE_PATH only for a LaunchSession that explicitly requested it;
 // daemon reuse therefore cannot accidentally enable tracing. Lines are bounded and carry exact
@@ -71,7 +77,8 @@ class DecodedOpTrace {
         out_ << "{\"event\":\"record\",\"seq\":" << seq_++ << ",\"request\":" << request_id
              << ",\"recording\":" << recording << ",\"command_buffer\":\"cb#"
              << ordinal("cb", req.command_buffer)
-             << "\",\"one_time\":" << (req.one_time_submit ? "true" : "false")
+             << "\",\"generation\":" << req.recording_generation
+             << ",\"one_time\":" << (req.one_time_submit ? "true" : "false")
              << ",\"commands\":" << req.commands.size() << "}\n";
 
         for (std::size_t i = 0; i < req.commands.size(); ++i) {
@@ -115,6 +122,20 @@ class DecodedOpTrace {
             out_ << "}\n";
             ++commands_;
         }
+        out_.flush();
+    }
+
+    void lifetime_lease(std::uint32_t request_id, const char* operation,
+                        const StatusResponse& response, const LifetimeLeaseStats& stats) {
+        if (!can_emit()) {
+            return;
+        }
+        out_ << "{\"event\":\"lifetime_lease\",\"seq\":" << seq_++ << ",\"request\":" << request_id
+             << ",\"operation\":\"" << operation << "\",\"ok\":" << (response.ok ? "true" : "false")
+             << ",\"live\":" << stats.live_resources << ",\"retired\":" << stats.retired_resources
+             << ",\"retired_memories\":" << stats.retired_memories
+             << ",\"lease_edges\":" << stats.lease_edges
+             << ",\"capacity_rejections\":" << stats.capacity_rejections << "}\n";
         out_.flush();
     }
 
@@ -1487,6 +1508,8 @@ json::Value DeviceCaps::to_body() const {
     b.set("core_indirect_draw_count",
           json::Value(static_cast<long long>(core_indirect_draw_count)));
     b.set("pipeline_specialization", json::Value(static_cast<long long>(pipeline_specialization)));
+    b.set("recording_resource_leases_v1",
+          json::Value(static_cast<long long>(recording_resource_leases_v1)));
     return b;
 }
 
@@ -1514,6 +1537,8 @@ DeviceCaps DeviceCaps::from_body(const json::Value& body) {
         static_cast<std::uint32_t>(get_i64(body, "core_indirect_draw_count", 0)); // absent -> 0
     d.pipeline_specialization =
         static_cast<std::uint32_t>(get_i64(body, "pipeline_specialization", 0)); // absent -> 0
+    d.recording_resource_leases_v1 =
+        static_cast<std::uint32_t>(get_i64(body, "recording_resource_leases_v1", 0)); // absent -> 0
     return d;
 }
 
@@ -2268,6 +2293,7 @@ QueuePresentResponse QueuePresentResponse::from_body(const json::Value& body) {
 json::Value RecordCommandBufferRequest::to_body() const {
     json::Value b = json::Value::make_object();
     b.set("command_buffer", handle_value(command_buffer));
+    b.set("recording_generation", handle_value(recording_generation));
     b.set("one_time_submit", json::Value(one_time_submit));
     json::Array arr;
     for (const RecordedCommand& c : commands) {
@@ -2414,6 +2440,7 @@ json::Value RecordCommandBufferRequest::to_body() const {
 RecordCommandBufferRequest RecordCommandBufferRequest::from_body(const json::Value& body) {
     RecordCommandBufferRequest r;
     r.command_buffer = get_handle(body, "command_buffer");
+    r.recording_generation = get_handle(body, "recording_generation");
     r.one_time_submit = get_bool(body, "one_time_submit");
     const json::Value* arr = body.find("commands");
     if (arr != nullptr && arr->is_array()) {
@@ -2593,6 +2620,71 @@ RecordCommandBufferRequest RecordCommandBufferRequest::from_body(const json::Val
                 }
             }
             r.commands.push_back(std::move(c));
+        }
+    }
+    return r;
+}
+
+json::Value CommandBufferLease::to_body() const {
+    json::Value b = json::Value::make_object();
+    b.set("command_buffer", handle_value(command_buffer));
+    b.set("recording_generation", handle_value(recording_generation));
+    return b;
+}
+
+CommandBufferLease CommandBufferLease::from_body(const json::Value& body) {
+    CommandBufferLease r;
+    r.command_buffer = get_handle(body, "command_buffer");
+    r.recording_generation = get_handle(body, "recording_generation");
+    return r;
+}
+
+json::Value LeasedDestroyRequest::to_body() const {
+    json::Value b = json::Value::make_object();
+    b.set("handle", handle_value(handle));
+    json::Array leases_body;
+    leases_body.reserve(leases.size());
+    for (const CommandBufferLease& lease : leases) {
+        leases_body.emplace_back(lease.to_body());
+    }
+    b.set("leases", json::Value(std::move(leases_body)));
+    return b;
+}
+
+LeasedDestroyRequest LeasedDestroyRequest::from_body(const json::Value& body) {
+    LeasedDestroyRequest r;
+    r.handle = get_handle(body, "handle");
+    if (const json::Value* arr = body.find("leases"); arr != nullptr && arr->is_array()) {
+        const std::size_t count =
+            std::min(arr->as_array().size(), kMaxRecordingResourceLeasesPerRequest + 1);
+        r.leases.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            r.leases.push_back(CommandBufferLease::from_body(arr->as_array()[i]));
+        }
+    }
+    return r;
+}
+
+json::Value RetireCommandBufferRecordingsRequest::to_body() const {
+    json::Value b = json::Value::make_object();
+    json::Array recordings_body;
+    recordings_body.reserve(recordings.size());
+    for (const CommandBufferLease& recording : recordings) {
+        recordings_body.emplace_back(recording.to_body());
+    }
+    b.set("recordings", json::Value(std::move(recordings_body)));
+    return b;
+}
+
+RetireCommandBufferRecordingsRequest
+RetireCommandBufferRecordingsRequest::from_body(const json::Value& body) {
+    RetireCommandBufferRecordingsRequest r;
+    if (const json::Value* arr = body.find("recordings"); arr != nullptr && arr->is_array()) {
+        const std::size_t count =
+            std::min(arr->as_array().size(), kMaxRecordingResourceLeasesPerRequest + 1);
+        r.recordings.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            r.recordings.push_back(CommandBufferLease::from_body(arr->as_array()[i]));
         }
     }
     return r;
@@ -2995,6 +3087,7 @@ std::string RecordCommandBufferRequest::to_wire() const {
     json::Value h = json::Value::make_object();
     h.set("v", json::Value(2));
     h.set("command_buffer", handle_value(command_buffer));
+    h.set("recording_generation", handle_value(recording_generation));
     h.set("one_time_submit", json::Value(one_time_submit));
     h.set("count", json::Value(static_cast<long long>(commands.size())));
     std::string out;
@@ -3198,6 +3291,7 @@ RecordCommandBufferRequest RecordCommandBufferRequest::from_wire(const std::stri
     }
     RecordCommandBufferRequest r;
     r.command_buffer = get_handle(h, "command_buffer");
+    r.recording_generation = get_handle(h, "recording_generation");
     r.one_time_submit = get_bool(h, "one_time_submit");
     const long long count = get_i64(h, "count", -1);
     if (count < 0) {
@@ -5922,6 +6016,16 @@ MockVulkanBackend::MockVulkanBackend(const std::string& gpu_name,
     }
 }
 
+LifetimeLeaseStats MockVulkanBackend::lifetime_lease_stats() const {
+    LifetimeLeaseStats stats;
+    stats.live_resources = images_.size() + buffers_.size();
+    stats.retired_resources = retired_images_.size() + retired_buffers_.size();
+    stats.retired_memories = retired_memories_.size();
+    stats.lease_edges = recording_resource_lease_edges_;
+    stats.capacity_rejections = recording_resource_capacity_rejections_;
+    return stats;
+}
+
 CapabilitiesResponse MockVulkanBackend::negotiate(const CapabilitiesRequest& req) {
     CapabilitiesResponse resp;
     if (!have_device_) {
@@ -6494,6 +6598,7 @@ DeviceCaps MockVulkanBackend::device_caps() const {
     caps.core_indirect_draw_scalar_payload = 1;
     caps.core_indirect_draw_count = 1;
     caps.pipeline_specialization = 1;
+    caps.recording_resource_leases_v1 = 1;
     return caps;
 }
 
@@ -6851,6 +6956,7 @@ StatusResponse MockVulkanBackend::destroy_command_pool(const HandleRequest& req)
     // Destroying a pool frees all command buffers allocated from it (Vulkan
     // semantics), so this never blocks on live buffers.
     for (const std::uint64_t b : it->second.buffers) {
+        release_recording_leases_for_command_buffer(b);
         command_buffers_.erase(b);
     }
     const auto dev = devices_.find(it->second.device);
@@ -6927,6 +7033,7 @@ StatusResponse MockVulkanBackend::free_command_buffers(const FreeCommandBuffersR
         }
     }
     for (const std::uint64_t b : req.command_buffers) {
+        release_recording_leases_for_command_buffer(b);
         command_buffers_.erase(b);
         it->second.buffers.erase(b);
     }
@@ -7168,6 +7275,38 @@ AllocateMemoryResponse MockVulkanBackend::allocate_memory(const AllocateMemoryRe
 
 StatusResponse MockVulkanBackend::free_memory(const HandleRequest& req) {
     StatusResponse resp;
+    const auto memory = memory_objects_.find(req.handle);
+    if (memory == memory_objects_.end() || retired_memories_.count(req.handle) != 0) {
+        resp.reason = "unknown handle for this object type";
+        return resp;
+    }
+    bool retained_by_resource = false;
+    for (const auto& [handle, retired] : retired_images_) {
+        (void) handle;
+        retained_by_resource |= retired.image.bound_memory == req.handle;
+    }
+    for (const auto& [handle, retired] : retired_buffers_) {
+        (void) handle;
+        retained_by_resource |= retired.buffer.bound_memory == req.handle;
+    }
+    if (retained_by_resource) {
+        std::size_t retired_on_device = 0;
+        for (const std::uint64_t handle : retired_memories_) {
+            const auto other = memory_objects_.find(handle);
+            if (other != memory_objects_.end() && other->second.device == memory->second.device) {
+                ++retired_on_device;
+            }
+        }
+        if (retired_on_device >= kMaxRetiredMemoryAllocationsPerDevice) {
+            ++recording_resource_capacity_rejections_;
+            resp.reason = "recording resource retired-memory capacity exceeded";
+            return resp;
+        }
+        retired_memories_.insert(req.handle);
+        resp.ok = true;
+        resp.reason = "ok";
+        return resp;
+    }
     resp.ok = destroy_device_leaf(req.handle, LeafKind::Memory, resp.reason);
     if (resp.ok) {
         memory_objects_.erase(req.handle); // discard the backing bytes (implicit unmap)
@@ -7290,6 +7429,68 @@ StatusResponse MockVulkanBackend::destroy_buffer(const HandleRequest& req) {
     return resp;
 }
 
+StatusResponse MockVulkanBackend::destroy_buffer_leased(const LeasedDestroyRequest& req) {
+    StatusResponse resp;
+    const auto it = buffers_.find(req.handle);
+    if (it == buffers_.end()) {
+        resp.reason = "unknown buffer handle";
+        return resp;
+    }
+    if (req.leases.empty() || req.leases.size() > kMaxRecordingResourceLeasesPerRequest) {
+        resp.reason = "leased buffer destroy has an invalid lease count";
+        return resp;
+    }
+    std::set<RecordingLeaseKey> leases;
+    for (const CommandBufferLease& lease : req.leases) {
+        const auto cb = command_buffers_.find(lease.command_buffer);
+        const bool current_generation =
+            cb != command_buffers_.end() && lease.recording_generation != 0 &&
+            lease.recording_generation == cb->second.recording_generation;
+        const bool pending_next_generation =
+            cb != command_buffers_.end() &&
+            cb->second.recording_generation != std::numeric_limits<std::uint64_t>::max() &&
+            lease.recording_generation == cb->second.recording_generation + 1;
+        if (lease.recording_generation == 0 || cb == command_buffers_.end() ||
+            cb->second.device != it->second.device ||
+            (!current_generation && !pending_next_generation) ||
+            !leases.emplace(lease.command_buffer, lease.recording_generation).second) {
+            resp.reason = "leased buffer destroy references an invalid command-buffer generation";
+            return resp;
+        }
+    }
+    std::size_t retired_on_device = 0;
+    std::size_t edges_on_device = 0;
+    for (const auto& [handle, retired] : retired_images_) {
+        (void) handle;
+        if (retired.image.device == it->second.device) {
+            ++retired_on_device;
+            edges_on_device += retired.leases.size();
+        }
+    }
+    for (const auto& [handle, retired] : retired_buffers_) {
+        (void) handle;
+        if (retired.buffer.device == it->second.device) {
+            ++retired_on_device;
+            edges_on_device += retired.leases.size();
+        }
+    }
+    if (retired_on_device >= kMaxRetiredRecordingResourcesPerDevice ||
+        edges_on_device + leases.size() > kMaxRecordingResourceLeaseEdgesPerDevice) {
+        ++recording_resource_capacity_rejections_;
+        resp.reason = "recording resource lease capacity exceeded";
+        return resp;
+    }
+    invalidate_cbs_referencing(req.handle, &leases);
+    dangle_sets_referencing(req.handle, &leases);
+    devices_[it->second.device].buffers.erase(req.handle);
+    retired_buffers_.emplace(req.handle, RetiredBuffer{it->second, leases});
+    recording_resource_lease_edges_ += leases.size();
+    buffers_.erase(it);
+    resp.ok = true;
+    resp.reason = "ok";
+    return resp;
+}
+
 StatusResponse MockVulkanBackend::bind_buffer_memory(const BindBufferMemoryRequest& req) {
     StatusResponse resp;
     const auto buf = buffers_.find(req.buffer);
@@ -7299,7 +7500,7 @@ StatusResponse MockVulkanBackend::bind_buffer_memory(const BindBufferMemoryReque
         return resp;
     }
     const auto mem = memory_objects_.find(req.memory);
-    if (mem == memory_objects_.end()) {
+    if (mem == memory_objects_.end() || retired_memories_.count(req.memory) != 0) {
         resp.ok = false;
         resp.reason = "unknown memory handle";
         return resp;
@@ -7406,7 +7607,7 @@ StatusResponse MockVulkanBackend::write_memory_ranges(const WriteMemoryRangesReq
         kMemoryPropertyHostVisible | kMemoryPropertyHostCoherent;
     for (const MemoryUpload& u : req.uploads) {
         const auto mem = memory_objects_.find(u.memory);
-        if (mem == memory_objects_.end()) {
+        if (mem == memory_objects_.end() || retired_memories_.count(u.memory) != 0) {
             resp.ok = false;
             resp.reason = "write_memory_ranges references unknown memory";
             return resp;
@@ -7457,7 +7658,7 @@ ReadMemoryRangesResponse MockVulkanBackend::read_memory_ranges(const ReadMemoryR
     std::string out;
     for (const MemoryUpload& u : req.reads) {
         const auto mem = memory_objects_.find(u.memory);
-        if (mem == memory_objects_.end()) {
+        if (mem == memory_objects_.end() || retired_memories_.count(u.memory) != 0) {
             resp.ok = false;
             resp.reason = "read_memory_ranges references unknown memory";
             return resp;
@@ -7789,6 +7990,72 @@ StatusResponse MockVulkanBackend::destroy_image(const HandleRequest& req) {
     return resp;
 }
 
+StatusResponse MockVulkanBackend::destroy_image_leased(const LeasedDestroyRequest& req) {
+    StatusResponse resp;
+    const auto it = images_.find(req.handle);
+    if (it == images_.end() || !it->second.app_created) {
+        resp.reason = "unknown image handle (must be an app-created image)";
+        return resp;
+    }
+    if (!it->second.image_views.empty()) {
+        resp.reason = "image has live image views; destroy them first";
+        return resp;
+    }
+    if (req.leases.empty() || req.leases.size() > kMaxRecordingResourceLeasesPerRequest) {
+        resp.reason = "leased image destroy has an invalid lease count";
+        return resp;
+    }
+    std::set<RecordingLeaseKey> leases;
+    for (const CommandBufferLease& lease : req.leases) {
+        const auto cb = command_buffers_.find(lease.command_buffer);
+        const bool current_generation =
+            cb != command_buffers_.end() && lease.recording_generation != 0 &&
+            lease.recording_generation == cb->second.recording_generation;
+        const bool pending_next_generation =
+            cb != command_buffers_.end() &&
+            cb->second.recording_generation != std::numeric_limits<std::uint64_t>::max() &&
+            lease.recording_generation == cb->second.recording_generation + 1;
+        if (lease.recording_generation == 0 || cb == command_buffers_.end() ||
+            cb->second.device != it->second.device ||
+            (!current_generation && !pending_next_generation) ||
+            !leases.emplace(lease.command_buffer, lease.recording_generation).second) {
+            resp.reason = "leased image destroy references an invalid command-buffer generation";
+            return resp;
+        }
+    }
+    std::size_t retired_on_device = 0;
+    std::size_t edges_on_device = 0;
+    for (const auto& [handle, retired] : retired_images_) {
+        (void) handle;
+        if (retired.image.device == it->second.device) {
+            ++retired_on_device;
+            edges_on_device += retired.leases.size();
+        }
+    }
+    for (const auto& [handle, retired] : retired_buffers_) {
+        (void) handle;
+        if (retired.buffer.device == it->second.device) {
+            ++retired_on_device;
+            edges_on_device += retired.leases.size();
+        }
+    }
+    if (retired_on_device >= kMaxRetiredRecordingResourcesPerDevice ||
+        edges_on_device + leases.size() > kMaxRecordingResourceLeaseEdgesPerDevice) {
+        ++recording_resource_capacity_rejections_;
+        resp.reason = "recording resource lease capacity exceeded";
+        return resp;
+    }
+    invalidate_cbs_referencing(req.handle, &leases);
+    devices_[it->second.device].images.erase(req.handle);
+    image_tombstones_.remember({req.handle, ImageOrigin::App, ImageDestroyCause::DestroyImage, 0});
+    retired_images_.emplace(req.handle, RetiredImage{it->second, leases});
+    recording_resource_lease_edges_ += leases.size();
+    images_.erase(it);
+    resp.ok = true;
+    resp.reason = "ok";
+    return resp;
+}
+
 StatusResponse MockVulkanBackend::bind_image_memory(const BindImageMemoryRequest& req) {
     StatusResponse resp;
     const auto img = images_.find(req.image);
@@ -7798,7 +8065,7 @@ StatusResponse MockVulkanBackend::bind_image_memory(const BindImageMemoryRequest
         return resp;
     }
     const auto mem = memory_objects_.find(req.memory);
-    if (mem == memory_objects_.end()) {
+    if (mem == memory_objects_.end() || retired_memories_.count(req.memory) != 0) {
         resp.ok = false;
         resp.reason = "unknown memory handle";
         return resp;
@@ -8333,6 +8600,51 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
         resp.reason = "unknown command buffer handle";
         return resp;
     }
+    if (req.recording_generation != 0 &&
+        req.recording_generation < cb->second.recording_generation) {
+        resp.reason = "recording generation is stale";
+        return resp;
+    }
+    if (req.recording_generation != 0 &&
+        (cb->second.recording_generation == std::numeric_limits<std::uint64_t>::max() ||
+         req.recording_generation > cb->second.recording_generation + 1)) {
+        resp.reason = "recording generation skipped the next generation";
+        return resp;
+    }
+    if (req.recording_generation != 0 &&
+        req.recording_generation > cb->second.recording_generation) {
+        release_recording_leases_for_command_buffer(req.command_buffer, req.recording_generation);
+        cb->second.recorded = false;
+        cb->second.referenced_surfaces.clear();
+        cb->second.referenced_swapchains.clear();
+        cb->second.referenced_draw_objects.clear();
+        cb->second.recording_generation = req.recording_generation;
+    }
+    std::vector<std::uint64_t> exposed_images;
+    std::vector<std::uint64_t> exposed_buffers;
+    if (req.recording_generation != 0) {
+        const RecordingLeaseKey key{req.command_buffer, req.recording_generation};
+        for (const auto& [handle, retired] : retired_images_) {
+            if (retired.leases.count(key) != 0) {
+                images_.emplace(handle, retired.image);
+                exposed_images.push_back(handle);
+            }
+        }
+        for (const auto& [handle, retired] : retired_buffers_) {
+            if (retired.leases.count(key) != 0) {
+                buffers_.emplace(handle, retired.buffer);
+                exposed_buffers.push_back(handle);
+            }
+        }
+    }
+    ScopeExit hide_retired{[&] {
+        for (const std::uint64_t handle : exposed_images) {
+            images_.erase(handle);
+        }
+        for (const std::uint64_t handle : exposed_buffers) {
+            buffers_.erase(handle);
+        }
+    }};
     const std::uint64_t device = cb->second.device;
     std::set<std::uint64_t> referenced_surfaces;
     std::set<std::uint64_t> referenced_swapchains;
@@ -10196,11 +10508,44 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
         return resp;
     }
     cb->second.recorded = true;
+    if (req.recording_generation != 0) {
+        cb->second.recording_generation = req.recording_generation;
+    }
     cb->second.referenced_surfaces = std::move(referenced_surfaces);
     cb->second.referenced_swapchains = std::move(referenced_swapchains);
     cb->second.referenced_draw_objects = std::move(referenced_draw_objects);
     if (prof != nullptr) {
         prof->record_phases.validate_us += profile_now_us() - t_validate0;
+    }
+    resp.ok = true;
+    resp.reason = "ok";
+    return resp;
+}
+
+StatusResponse MockVulkanBackend::retire_command_buffer_recordings(
+    const RetireCommandBufferRecordingsRequest& req) {
+    StatusResponse resp;
+    if (req.recordings.empty() || req.recordings.size() > kMaxRecordingResourceLeasesPerRequest) {
+        resp.reason = "retire recordings has an invalid recording count";
+        return resp;
+    }
+    std::set<RecordingLeaseKey> keys;
+    for (const CommandBufferLease& recording : req.recordings) {
+        if (recording.command_buffer == 0 || recording.recording_generation == 0 ||
+            !keys.emplace(recording.command_buffer, recording.recording_generation).second) {
+            resp.reason = "retire recordings references an invalid command-buffer generation";
+            return resp;
+        }
+    }
+    for (const RecordingLeaseKey& key : keys) {
+        release_recording_lease(key);
+        const auto cb = command_buffers_.find(key.first);
+        if (cb != command_buffers_.end() && cb->second.recording_generation == key.second) {
+            cb->second.recorded = false;
+            cb->second.referenced_surfaces.clear();
+            cb->second.referenced_swapchains.clear();
+            cb->second.referenced_draw_objects.clear();
+        }
     }
     resp.ok = true;
     resp.reason = "ok";
@@ -10681,9 +11026,14 @@ CreateImageViewResponse MockVulkanBackend::create_image_view(const CreateImageVi
     return resp;
 }
 
-void MockVulkanBackend::invalidate_cbs_referencing(std::uint64_t handle) {
+void MockVulkanBackend::invalidate_cbs_referencing(
+    std::uint64_t handle, const std::set<RecordingLeaseKey>* preserved_recordings) {
     for (auto& kv : command_buffers_) {
         if (kv.second.referenced_draw_objects.count(handle) != 0) {
+            const RecordingLeaseKey key{kv.first, kv.second.recording_generation};
+            if (preserved_recordings != nullptr && preserved_recordings->count(key) != 0) {
+                continue;
+            }
             kv.second.recorded = false;
             kv.second.referenced_surfaces.clear();
             kv.second.referenced_swapchains.clear();
@@ -10692,7 +11042,85 @@ void MockVulkanBackend::invalidate_cbs_referencing(std::uint64_t handle) {
     }
 }
 
-void MockVulkanBackend::dangle_sets_referencing(std::uint64_t resource) {
+void MockVulkanBackend::release_retired_memory_if_unused(std::uint64_t memory) {
+    if (memory == 0 || retired_memories_.count(memory) == 0) {
+        return;
+    }
+    for (const auto& [handle, retired] : retired_images_) {
+        (void) handle;
+        if (retired.image.bound_memory == memory) {
+            return;
+        }
+    }
+    for (const auto& [handle, retired] : retired_buffers_) {
+        (void) handle;
+        if (retired.buffer.bound_memory == memory) {
+            return;
+        }
+    }
+    std::string ignored;
+    (void) destroy_device_leaf(memory, LeafKind::Memory, ignored);
+    memory_objects_.erase(memory);
+    retired_memories_.erase(memory);
+}
+
+void MockVulkanBackend::release_recording_lease(const RecordingLeaseKey& key) {
+    std::vector<std::uint64_t> images_to_release;
+    std::vector<std::uint64_t> buffers_to_release;
+    for (auto& [handle, retired] : retired_images_) {
+        if (retired.leases.erase(key) != 0) {
+            --recording_resource_lease_edges_;
+            if (retired.leases.empty()) {
+                images_to_release.push_back(handle);
+            }
+        }
+    }
+    for (auto& [handle, retired] : retired_buffers_) {
+        if (retired.leases.erase(key) != 0) {
+            --recording_resource_lease_edges_;
+            if (retired.leases.empty()) {
+                buffers_to_release.push_back(handle);
+            }
+        }
+    }
+    for (const std::uint64_t handle : images_to_release) {
+        const std::uint64_t memory = retired_images_[handle].image.bound_memory;
+        retired_images_.erase(handle);
+        release_retired_memory_if_unused(memory);
+    }
+    for (const std::uint64_t handle : buffers_to_release) {
+        const std::uint64_t memory = retired_buffers_[handle].buffer.bound_memory;
+        retired_buffers_.erase(handle);
+        release_retired_memory_if_unused(memory);
+    }
+}
+
+void MockVulkanBackend::release_recording_leases_for_command_buffer(
+    std::uint64_t command_buffer, std::uint64_t before_generation) {
+    std::set<RecordingLeaseKey> keys;
+    for (const auto& [handle, retired] : retired_images_) {
+        (void) handle;
+        for (const RecordingLeaseKey& key : retired.leases) {
+            if (key.first == command_buffer && key.second < before_generation) {
+                keys.insert(key);
+            }
+        }
+    }
+    for (const auto& [handle, retired] : retired_buffers_) {
+        (void) handle;
+        for (const RecordingLeaseKey& key : retired.leases) {
+            if (key.first == command_buffer && key.second < before_generation) {
+                keys.insert(key);
+            }
+        }
+    }
+    for (const RecordingLeaseKey& key : keys) {
+        release_recording_lease(key);
+    }
+}
+
+void MockVulkanBackend::dangle_sets_referencing(
+    std::uint64_t resource, const std::set<RecordingLeaseKey>* preserved_recordings) {
     for (auto& [set_handle, set] : descriptor_sets_) {
         const auto sl = descriptor_set_layouts_.find(set.layout);
         bool affected = false;
@@ -10733,7 +11161,7 @@ void MockVulkanBackend::dangle_sets_referencing(std::uint64_t resource) {
             }
         }
         if (affected) {
-            invalidate_cbs_referencing(set_handle);
+            invalidate_cbs_referencing(set_handle, preserved_recordings);
         }
     }
 }
@@ -12585,7 +13013,11 @@ void serve_vulkan_rpc(RpcChannel& channel, VulkanBackend& backend) {
             }
             case RpcOp::FreeMemory:
                 if (parse_body()) {
-                    reply(backend.free_memory(HandleRequest::from_body(body)).to_body());
+                    const StatusResponse response =
+                        backend.free_memory(HandleRequest::from_body(body));
+                    op_trace.lifetime_lease(req.request_id, "free_memory", response,
+                                            backend.lifetime_lease_stats());
+                    reply(response.to_body());
                 }
                 break;
             case RpcOp::CreateSurface:
@@ -12692,6 +13124,15 @@ void serve_vulkan_rpc(RpcChannel& channel, VulkanBackend& backend) {
                 reply(rresp.to_body());
                 break;
             }
+            case RpcOp::RetireCommandBufferRecordings:
+                if (parse_body()) {
+                    const StatusResponse response = backend.retire_command_buffer_recordings(
+                        RetireCommandBufferRecordingsRequest::from_body(body));
+                    op_trace.lifetime_lease(req.request_id, "retire_recordings", response,
+                                            backend.lifetime_lease_stats());
+                    reply(response.to_body());
+                }
+                break;
             case RpcOp::QueueSubmit:
                 if (parse_body()) {
                     const QueueSubmitRequest sreq = QueueSubmitRequest::from_body(body);
@@ -12962,6 +13403,15 @@ void serve_vulkan_rpc(RpcChannel& channel, VulkanBackend& backend) {
                     reply(backend.destroy_buffer(HandleRequest::from_body(body)).to_body());
                 }
                 break;
+            case RpcOp::DestroyBufferLeased:
+                if (parse_body()) {
+                    const StatusResponse response =
+                        backend.destroy_buffer_leased(LeasedDestroyRequest::from_body(body));
+                    op_trace.lifetime_lease(req.request_id, "destroy_buffer_leased", response,
+                                            backend.lifetime_lease_stats());
+                    reply(response.to_body());
+                }
+                break;
             case RpcOp::BindBufferMemory: {
                 if (parse_body()) {
                     const BindBufferMemoryRequest breq = BindBufferMemoryRequest::from_body(body);
@@ -13140,6 +13590,15 @@ void serve_vulkan_rpc(RpcChannel& channel, VulkanBackend& backend) {
                     const StatusResponse dresp = backend.destroy_image(dreq);
                     op_trace.destroy_image(req.request_id, dreq, dresp);
                     reply(dresp.to_body());
+                }
+                break;
+            case RpcOp::DestroyImageLeased:
+                if (parse_body()) {
+                    const StatusResponse response =
+                        backend.destroy_image_leased(LeasedDestroyRequest::from_body(body));
+                    op_trace.lifetime_lease(req.request_id, "destroy_image_leased", response,
+                                            backend.lifetime_lease_stats());
+                    reply(response.to_body());
                 }
                 break;
             case RpcOp::BindImageMemory: {
@@ -13371,6 +13830,12 @@ StatusResponse record_command_buffer_raw(RpcChannel& channel, std::uint32_t requ
     // DeviceCaps.raw_record so an old worker never sees this op.
     return StatusResponse::from_body(
         call_rpc_raw(channel, RpcOp::RecordCommandBufferRaw, request_id, req.to_wire()));
+}
+
+StatusResponse retire_command_buffer_recordings(RpcChannel& channel, std::uint32_t request_id,
+                                                const RetireCommandBufferRecordingsRequest& req) {
+    return StatusResponse::from_body(
+        call_rpc(channel, RpcOp::RetireCommandBufferRecordings, request_id, req.to_body()));
 }
 
 QueueSubmitResponse queue_submit(RpcChannel& channel, std::uint32_t request_id,
@@ -13647,6 +14112,12 @@ StatusResponse destroy_buffer(RpcChannel& channel, std::uint32_t request_id,
         call_rpc(channel, RpcOp::DestroyBuffer, request_id, req.to_body()));
 }
 
+StatusResponse destroy_buffer_leased(RpcChannel& channel, std::uint32_t request_id,
+                                     const LeasedDestroyRequest& req) {
+    return StatusResponse::from_body(
+        call_rpc(channel, RpcOp::DestroyBufferLeased, request_id, req.to_body()));
+}
+
 StatusResponse bind_buffer_memory(RpcChannel& channel, std::uint32_t request_id,
                                   const BindBufferMemoryRequest& req) {
     return StatusResponse::from_body(
@@ -13787,6 +14258,12 @@ StatusResponse destroy_image(RpcChannel& channel, std::uint32_t request_id,
                              const HandleRequest& req) {
     return StatusResponse::from_body(
         call_rpc(channel, RpcOp::DestroyImage, request_id, req.to_body()));
+}
+
+StatusResponse destroy_image_leased(RpcChannel& channel, std::uint32_t request_id,
+                                    const LeasedDestroyRequest& req) {
+    return StatusResponse::from_body(
+        call_rpc(channel, RpcOp::DestroyImageLeased, request_id, req.to_body()));
 }
 
 StatusResponse bind_image_memory(RpcChannel& channel, std::uint32_t request_id,

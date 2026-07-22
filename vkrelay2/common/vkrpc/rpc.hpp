@@ -312,6 +312,12 @@ enum class RpcOp : std::uint32_t {
     // old ICD -> new worker remains unambiguous and no body sniffing is required.
     CreateGraphicsPipelinesRaw = 92,
     CreateComputePipelinesRaw = 93,
+    // Generation-scoped recording-resource lifetime tolerance. These additive operations are
+    // used only when DeviceCaps.recording_resource_leases_v1 is advertised; legacy destroys keep
+    // their original immediate invalidation semantics.
+    DestroyImageLeased = 94,
+    DestroyBufferLeased = 95,
+    RetireCommandBufferRecordings = 96,
 };
 
 enum class RpcStatus : std::uint32_t {

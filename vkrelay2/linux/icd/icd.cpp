@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -193,6 +194,7 @@ struct DeviceImpl {
     // Both raw pipeline-create ops + specialization validation/rebuild. False for an old worker;
     // pipeline_stage_shape_ok then preserves the old named local rejection.
     bool worker_pipeline_specialization = false;
+    bool worker_recording_resource_leases = false;
     // descriptorIndexing: the enabled kDIFeature* bits. CreateDevice folds the app's
     // enabled-feature chain into these (served subset only -- an unserved or off-lane enable is
     // FEATURE_NOT_PRESENT), and the per-binding flag admission, UAB pools, and variable-count
@@ -225,6 +227,13 @@ struct QueueImpl {
 struct CommandBufferImpl {
     VK_LOADER_DATA loader_data;
     std::uint64_t worker = 0;
+    std::uint64_t device_worker = 0;
+    std::uint64_t pool_worker = 0;
+    std::uint64_t recording_generation = 0;
+    bool recording_open = false;
+    bool executable = false;
+    std::set<std::uint64_t> direct_images;
+    std::set<std::uint64_t> direct_buffers;
     // Client-side command stream: vkCmd* accumulate here; vkEndCommandBuffer ships the whole
     // begin->[cmds]->end recording in one record_command_buffer RPC (no per-vkCmd round-trip).
     bool one_time_submit = false;
@@ -253,6 +262,7 @@ struct CommandBufferImpl {
     bool multi_draw_indirect_enabled = false;
     bool worker_core_indirect_draw_count = false;
     bool draw_indirect_count_enabled = false;
+    bool worker_recording_resource_leases = false;
 };
 
 template <class H> H to_handle(std::uint64_t v) {
@@ -424,8 +434,29 @@ struct BufferInfo {
     VkDeviceSize size = 0;
     VkBufferUsageFlags usage = 0;
     std::uint64_t memory = 0;
+    std::uint64_t device = 0;
 };
 std::map<std::uint64_t, BufferInfo> g_buffers;
+std::map<std::uint64_t, CommandBufferImpl*> g_command_buffers;
+std::map<std::uint64_t, std::uint64_t> g_dead_images;  // handle -> owning device
+std::map<std::uint64_t, std::uint64_t> g_dead_buffers; // handle -> owning device
+std::deque<std::uint64_t> g_dead_image_order;
+std::deque<std::uint64_t> g_dead_buffer_order;
+
+void remember_dead_resource(std::map<std::uint64_t, std::uint64_t>& dead,
+                            std::deque<std::uint64_t>& order, std::uint64_t handle,
+                            std::uint64_t device) {
+    dead[handle] = device;
+    order.push_back(handle);
+    // These are only guest-side early-rejection tombstones; eviction is safe because the worker
+    // remains authoritative and will reject an evicted dead handle at End. Keep diagnostics
+    // bounded independently of the worker's retained-object cap.
+    while (order.size() > vkrpc::kMaxRetiredRecordingResourcesPerDevice) {
+        const std::uint64_t oldest = order.front();
+        order.pop_front();
+        dead.erase(oldest);
+    }
+}
 // Readback lifecycle: recorded -> SUBMITTED -> READY -> delivered. A
 // recorder (vkCmdCopyQueryPoolResults / vkCmdCopyImageToBuffer) notes its dst memory ON THE
 // COMMAND BUFFER; a successful vkQueueSubmit arms one record per submitted batch (the batch's dst
@@ -455,6 +486,210 @@ std::set<std::uint64_t> g_readback_ready;
 // cache; a zeroed table is the fail-closed answer on RPC failure.
 std::map<std::uint64_t, VkMemoryRequirements> g_image_reqs;
 std::map<std::uint64_t, VkSubresourceLayout> g_image_subresource; // LINEAR images only
+std::map<std::uint64_t, std::uint64_t> g_image_memory;
+std::map<std::uint64_t, std::uint64_t> g_image_device;
+using RecordingLeaseKey = std::pair<std::uint64_t, std::uint64_t>;
+struct LocalLeasedResource {
+    std::uint64_t memory = 0;
+    std::set<RecordingLeaseKey> leases;
+};
+std::map<std::uint64_t, LocalLeasedResource> g_local_leased_resources;
+// A void vkFreeCommandBuffers/vkDestroyCommandPool call cannot report a failed retire RPC back to
+// the app, and its guest wrapper must still disappear. Preserve just the wire key independently so
+// later lifecycle calls can retry without retaining a stale guest pointer.
+std::set<RecordingLeaseKey> g_orphaned_recording_leases;
+
+void invalidate_recording_locked(CommandBufferImpl* cb, const char* reason) {
+    cb->local_invalid = true;
+    cb->invalid_reason = reason;
+}
+
+void invalidate_recording(CommandBufferImpl* cb, const char* reason) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    invalidate_recording_locked(cb, reason);
+}
+
+// One append boundary owns direct image/buffer extraction for every recorded command. This is the
+// ICD half of the generation lease contract: only references appended before a guest destroy are
+// leaseable; a later command naming a logically dead handle poisons the generation locally.
+void append_recorded_command(CommandBufferImpl* cb, vkrpc::RecordedCommand command) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    const auto note_image = [&](std::uint64_t handle) {
+        if (handle == 0) {
+            return;
+        }
+        if (g_image_device.count(handle) != 0) {
+            cb->direct_images.insert(handle);
+        } else if (g_dead_images.count(handle) != 0) {
+            invalidate_recording_locked(
+                cb, "command references an image destroyed earlier in this process");
+        }
+    };
+    const auto note_buffer = [&](std::uint64_t handle) {
+        if (handle == 0) {
+            return;
+        }
+        if (g_buffers.count(handle) != 0) {
+            cb->direct_buffers.insert(handle);
+        } else if (g_dead_buffers.count(handle) != 0) {
+            invalidate_recording_locked(
+                cb, "command references a buffer destroyed earlier in this process");
+        }
+    };
+
+    note_image(command.image);
+    note_buffer(command.src_buffer);
+    note_buffer(command.indirect_count_buffer);
+    for (const std::uint64_t handle : command.vertex_buffers) {
+        note_buffer(handle);
+    }
+    for (const vkrpc::DependencyInfo2& dependency : command.deps2) {
+        for (const vkrpc::BufferMemoryBarrier2& barrier : dependency.buffer) {
+            note_buffer(barrier.buffer);
+        }
+        for (const vkrpc::ImageMemoryBarrier2& barrier : dependency.image) {
+            note_image(barrier.image);
+        }
+    }
+
+    const auto arg = [&](std::size_t index) {
+        return index < command.args_u64.size() ? command.args_u64[index] : 0;
+    };
+    const vkrpc::CmdKind kind = vkrpc::recorded_command_kind(command);
+    switch (kind) {
+    case vkrpc::CmdKind::BindIndexBuffer:
+    case vkrpc::CmdKind::DrawIndirectByteCount:
+    case vkrpc::CmdKind::BeginConditionalRendering:
+    case vkrpc::CmdKind::FillBuffer:
+        note_buffer(arg(0));
+        break;
+    case vkrpc::CmdKind::CopyQueryPoolResults:
+        note_buffer(arg(1));
+        break;
+    case vkrpc::CmdKind::CopyBuffer:
+        note_buffer(arg(0));
+        note_buffer(arg(1));
+        break;
+    case vkrpc::CmdKind::CopyImageToBuffer:
+        note_image(arg(0));
+        note_buffer(arg(1));
+        break;
+    case vkrpc::CmdKind::BlitImage:
+    case vkrpc::CmdKind::CopyImage:
+    case vkrpc::CmdKind::ResolveImage:
+        note_image(arg(0));
+        note_image(arg(1));
+        break;
+    case vkrpc::CmdKind::BindTransformFeedbackBuffers:
+    case vkrpc::CmdKind::BeginTransformFeedback:
+    case vkrpc::CmdKind::EndTransformFeedback: {
+        const std::size_t count = command.args_i64.size() > 1 && command.args_i64[1] > 0
+                                      ? static_cast<std::size_t>(command.args_i64[1])
+                                      : 0;
+        for (std::size_t i = 0; i < count && i < command.args_u64.size(); ++i) {
+            note_buffer(command.args_u64[i]);
+        }
+        break;
+    }
+    case vkrpc::CmdKind::BindVertexBuffers2: {
+        const std::size_t count = command.args_i64.size() > 1 && command.args_i64[1] > 0
+                                      ? static_cast<std::size_t>(command.args_i64[1])
+                                      : 0;
+        for (std::size_t i = 0; i < count && i < command.args_u64.size(); ++i) {
+            note_buffer(command.args_u64[i]);
+        }
+        break;
+    }
+    case vkrpc::CmdKind::CmdWaitEvents:
+        if (command.args_u64.size() >= vkrpc::kWaitEventsHeaderSlots) {
+            const std::uint64_t events = command.args_u64[0];
+            const std::uint64_t memories = command.args_u64[1];
+            const std::uint64_t buffers = command.args_u64[2];
+            const std::uint64_t images = command.args_u64[3];
+            std::uint64_t cursor =
+                vkrpc::kWaitEventsHeaderSlots + events + memories * vkrpc::kWaitEventsMemorySlots;
+            for (std::uint64_t i = 0; i < buffers && cursor + 2 < command.args_u64.size(); ++i) {
+                note_buffer(command.args_u64[static_cast<std::size_t>(cursor + 2)]);
+                cursor += vkrpc::kWaitEventsBufferSlots;
+            }
+            for (std::uint64_t i = 0; i < images && cursor + 4 < command.args_u64.size(); ++i) {
+                note_image(command.args_u64[static_cast<std::size_t>(cursor + 4)]);
+                cursor += vkrpc::kWaitEventsImageSlots;
+            }
+        }
+        break;
+    default:
+        break;
+    }
+    cb->recording.push_back(std::move(command));
+}
+
+void forget_local_recording_lease_locked(const RecordingLeaseKey& key) {
+    g_orphaned_recording_leases.erase(key);
+    for (auto it = g_local_leased_resources.begin(); it != g_local_leased_resources.end();) {
+        it->second.leases.erase(key);
+        if (it->second.leases.empty()) {
+            it = g_local_leased_resources.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool retire_recording_key_locked(const RecordingLeaseKey& key) {
+    bool has_local_lease = false;
+    for (const auto& [handle, resource] : g_local_leased_resources) {
+        (void) handle;
+        has_local_lease |= resource.leases.count(key) != 0;
+    }
+    if (!has_local_lease) {
+        g_orphaned_recording_leases.erase(key);
+        return true;
+    }
+    try {
+        vkrpc::RetireCommandBufferRecordingsRequest req;
+        req.recordings.push_back({key.first, key.second});
+        const vkrpc::StatusResponse response =
+            vkrpc::retire_command_buffer_recordings(*g_rpc, next_id(), req);
+        if (!response.ok) {
+            std::fprintf(stderr, "vkrelay2-icd: retire_command_buffer_recordings rejected -- %s\n",
+                         response.reason.c_str());
+            return false;
+        }
+    } catch (const std::exception&) {
+        return false;
+    }
+    forget_local_recording_lease_locked(key);
+    return true;
+}
+
+bool retry_orphaned_recording_leases_locked() {
+    const std::vector<RecordingLeaseKey> pending(g_orphaned_recording_leases.begin(),
+                                                 g_orphaned_recording_leases.end());
+    bool ok = true;
+    for (const RecordingLeaseKey& key : pending) {
+        ok = retire_recording_key_locked(key) && ok;
+    }
+    return ok;
+}
+
+bool retire_recording_locked(CommandBufferImpl* cb) {
+    if (cb == nullptr || cb->recording_generation == 0) {
+        return true;
+    }
+    // A previous void free/pool-destroy may have lost its retire RPC. Opportunistically retry it
+    // before this independent retirement; failure does not prevent the current key from retiring.
+    (void) retry_orphaned_recording_leases_locked();
+    const RecordingLeaseKey key{cb->worker, cb->recording_generation};
+    if (!retire_recording_key_locked(key)) {
+        return false;
+    }
+    cb->recording_open = false;
+    cb->executable = false;
+    cb->direct_images.clear();
+    cb->direct_buffers.clear();
+    return true;
+}
 // (GL/zink): cache the FULL format-properties response (32-bit VkFormatProperties +
 // 64-bit VkFormatProperties3) so both the 1.0 and the *2 getters serve one honest forward.
 std::map<std::pair<std::uint64_t, int>, vkrpc::GetPhysicalDeviceFormatPropertiesResponse>
@@ -2909,6 +3144,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
             (enabled_feature_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
         dev->worker_core_indirect_draw_count = pd->caps.core_indirect_draw_count != 0;
         dev->worker_pipeline_specialization = pd->caps.pipeline_specialization != 0;
+        dev->worker_recording_resource_leases = pd->caps.recording_resource_leases_v1 != 0;
         dev->draw_indirect_count_enabled = vkr::icd_policy::indirect_count_device_enabled(
             wants_draw_indirect_count, wants_draw_indirect_count_feature);
         // (bufferDeviceAddress): native lane AND the enabled FEATURE (there is no
@@ -2941,11 +3177,23 @@ VKAPI_ATTR void VKAPI_CALL DestroyDevice(VkDevice device, const VkAllocationCall
     }
     std::lock_guard<std::mutex> lk(g_mu);
     auto* dev = reinterpret_cast<DeviceImpl*>(device);
+    for (const auto& [worker, cb] : g_command_buffers) {
+        (void) worker;
+        if (cb->device_worker == dev->worker) {
+            (void) retire_recording_locked(cb);
+        }
+    }
     try {
         vkrpc::HandleRequest req;
         req.handle = dev->worker;
         (void) vkrpc::destroy_device(*g_rpc, next_id(), req);
     } catch (const std::exception&) {
+    }
+    for (auto it = g_dead_images.begin(); it != g_dead_images.end();) {
+        it = it->second == dev->worker ? g_dead_images.erase(it) : std::next(it);
+    }
+    for (auto it = g_dead_buffers.begin(); it != g_dead_buffers.end();) {
+        it = it->second == dev->worker ? g_dead_buffers.erase(it) : std::next(it);
     }
     delete dev;
 }
@@ -4742,6 +4990,8 @@ VKAPI_ATTR void VKAPI_CALL GetPrivateData(VkDevice device, VkObjectType objectTy
 // allocations, a Linux-side shadow buffer the app maps, and the dirty chunks shipped at
 // flush/submit.
 
+bool coherent_flush_at_submit_locked();
+
 VKAPI_ATTR VkResult VKAPI_CALL CreateBuffer(VkDevice device, const VkBufferCreateInfo* pCreateInfo,
                                             const VkAllocationCallbacks*, VkBuffer* pBuffer) {
     std::lock_guard<std::mutex> lk(g_mu);
@@ -4771,6 +5021,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateBuffer(VkDevice device, const VkBufferCreat
         info.requirements = mr;
         info.size = pCreateInfo->size;
         info.usage = pCreateInfo->usage;
+        info.device = dev->worker;
         g_buffers[r.buffer] = info;
         return VK_SUCCESS;
     } catch (const std::exception&) {
@@ -4778,16 +5029,83 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateBuffer(VkDevice device, const VkBufferCreat
     }
 }
 
-VKAPI_ATTR void VKAPI_CALL DestroyBuffer(VkDevice, VkBuffer buffer, const VkAllocationCallbacks*) {
+VKAPI_ATTR void VKAPI_CALL DestroyBuffer(VkDevice device, VkBuffer buffer,
+                                         const VkAllocationCallbacks*) {
     if (buffer == VK_NULL_HANDLE) {
         return;
     }
     std::lock_guard<std::mutex> lk(g_mu);
+    auto* dev = reinterpret_cast<DeviceImpl*>(device);
     try {
-        vkrpc::HandleRequest req;
-        req.handle = from_handle(buffer);
-        (void) vkrpc::destroy_buffer(*g_rpc, next_id(), req);
-        g_buffers.erase(from_handle(buffer));
+        const std::uint64_t handle = from_handle(buffer);
+        const auto info = g_buffers.find(handle);
+        std::vector<vkrpc::CommandBufferLease> leases;
+        std::set<RecordingLeaseKey> local_keys;
+        for (const auto& [worker, cb] : g_command_buffers) {
+            if (cb->device_worker == dev->worker && cb->recording_generation != 0 &&
+                cb->direct_buffers.count(handle) != 0) {
+                leases.push_back({worker, cb->recording_generation});
+                local_keys.emplace(worker, cb->recording_generation);
+            }
+        }
+        const auto poison_generations = [&](const char* reason) {
+            for (const RecordingLeaseKey& key : local_keys) {
+                const auto cb = g_command_buffers.find(key.first);
+                if (cb != g_command_buffers.end() &&
+                    cb->second->recording_generation == key.second) {
+                    cb->second->local_invalid = true;
+                    cb->second->invalid_reason = reason;
+                    cb->second->executable = false;
+                }
+            }
+        };
+        bool leased = false;
+        if (dev->worker_recording_resource_leases && !leases.empty() &&
+            leases.size() <= vkrpc::kMaxRecordingResourceLeasesPerRequest) {
+            vkrpc::LeasedDestroyRequest req;
+            req.handle = handle;
+            req.leases = leases;
+            const vkrpc::StatusResponse response =
+                vkrpc::destroy_buffer_leased(*g_rpc, next_id(), req);
+            leased = response.ok;
+            if (!response.ok) {
+                poison_generations("worker rejected generation-scoped buffer destroy");
+                std::fprintf(stderr,
+                             "vkrelay2-icd: generation-scoped buffer destroy rejected -- %s\n",
+                             response.reason.c_str());
+                if (response.reason == "recording resource lease capacity exceeded") {
+                    poison_generations("lifetime lease capacity exceeded");
+                    std::fprintf(stderr,
+                                 "vkrelay2-icd: lifetime lease capacity exceeded for buffer %llu; "
+                                 "falling back to immediate destroy\n",
+                                 static_cast<unsigned long long>(handle));
+                }
+                // The guest destroy still occurred. Once every proposed generation is poisoned,
+                // retry the legacy spelling so a semantic leased-op rejection does not strand a
+                // worker object. Existing ownership/parent guards remain authoritative and may
+                // harmlessly reject this retry too.
+                (void) vkrpc::destroy_buffer(*g_rpc, next_id(), {handle});
+            }
+        } else {
+            if (dev->worker_recording_resource_leases &&
+                leases.size() > vkrpc::kMaxRecordingResourceLeasesPerRequest) {
+                std::fprintf(stderr,
+                             "vkrelay2-icd: lifetime lease capacity exceeded for buffer %llu; "
+                             "falling back to immediate destroy\n",
+                             static_cast<unsigned long long>(handle));
+                poison_generations("lifetime lease capacity exceeded");
+            }
+            (void) vkrpc::destroy_buffer(*g_rpc, next_id(), {handle});
+        }
+        if (leased) {
+            g_local_leased_resources[handle] =
+                LocalLeasedResource{info != g_buffers.end() ? info->second.memory : 0, local_keys};
+        }
+        if (info != g_buffers.end()) {
+            remember_dead_resource(g_dead_buffers, g_dead_buffer_order, handle,
+                                   info->second.device);
+        }
+        g_buffers.erase(handle);
     } catch (const std::exception&) {
     }
 }
@@ -4917,6 +5235,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateImage(VkDevice device, const VkImageCreateI
         mr.alignment = r.mem_alignment;
         mr.memoryTypeBits = static_cast<std::uint32_t>(r.mem_type_bits);
         g_image_reqs[r.image] = mr;
+        g_image_device[r.image] = dev->worker;
         if (r.has_subresource_layout) {
             VkSubresourceLayout sl{};
             sl.offset = r.sr_offset;
@@ -4930,20 +5249,85 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateImage(VkDevice device, const VkImageCreateI
     }
 }
 
-VKAPI_ATTR void VKAPI_CALL DestroyImage(VkDevice, VkImage image, const VkAllocationCallbacks*) {
+VKAPI_ATTR void VKAPI_CALL DestroyImage(VkDevice device, VkImage image,
+                                        const VkAllocationCallbacks*) {
     if (image == VK_NULL_HANDLE) {
         return;
     }
     std::lock_guard<std::mutex> lk(g_mu);
+    auto* dev = reinterpret_cast<DeviceImpl*>(device);
     try {
-        vkrpc::HandleRequest req;
-        req.handle = from_handle(image);
+        const std::uint64_t handle = from_handle(image);
+        std::vector<vkrpc::CommandBufferLease> leases;
+        std::set<RecordingLeaseKey> local_keys;
+        for (const auto& [worker, cb] : g_command_buffers) {
+            if (cb->device_worker == dev->worker && cb->recording_generation != 0 &&
+                cb->direct_images.count(handle) != 0) {
+                leases.push_back({worker, cb->recording_generation});
+                local_keys.emplace(worker, cb->recording_generation);
+            }
+        }
+        const auto poison_generations = [&](const char* reason) {
+            for (const RecordingLeaseKey& key : local_keys) {
+                const auto cb = g_command_buffers.find(key.first);
+                if (cb != g_command_buffers.end() &&
+                    cb->second->recording_generation == key.second) {
+                    cb->second->local_invalid = true;
+                    cb->second->invalid_reason = reason;
+                    cb->second->executable = false;
+                }
+            }
+        };
         const std::uint32_t request_id = next_id();
         icd_trace("DestroyImage request=%u image=%llu", request_id,
-                  static_cast<unsigned long long>(req.handle));
-        (void) vkrpc::destroy_image(*g_rpc, request_id, req);
-        g_image_reqs.erase(from_handle(image));
-        g_image_subresource.erase(from_handle(image));
+                  static_cast<unsigned long long>(handle));
+        bool leased = false;
+        if (dev->worker_recording_resource_leases && !leases.empty() &&
+            leases.size() <= vkrpc::kMaxRecordingResourceLeasesPerRequest) {
+            vkrpc::LeasedDestroyRequest req;
+            req.handle = handle;
+            req.leases = leases;
+            const vkrpc::StatusResponse response =
+                vkrpc::destroy_image_leased(*g_rpc, request_id, req);
+            leased = response.ok;
+            if (!response.ok) {
+                poison_generations("worker rejected generation-scoped image destroy");
+                std::fprintf(stderr,
+                             "vkrelay2-icd: generation-scoped image destroy rejected -- %s\n",
+                             response.reason.c_str());
+                if (response.reason == "recording resource lease capacity exceeded") {
+                    poison_generations("lifetime lease capacity exceeded");
+                    std::fprintf(stderr,
+                                 "vkrelay2-icd: lifetime lease capacity exceeded for image %llu; "
+                                 "falling back to immediate destroy\n",
+                                 static_cast<unsigned long long>(handle));
+                }
+                (void) vkrpc::destroy_image(*g_rpc, next_id(), {handle});
+            }
+        } else {
+            if (dev->worker_recording_resource_leases &&
+                leases.size() > vkrpc::kMaxRecordingResourceLeasesPerRequest) {
+                std::fprintf(stderr,
+                             "vkrelay2-icd: lifetime lease capacity exceeded for image %llu; "
+                             "falling back to immediate destroy\n",
+                             static_cast<unsigned long long>(handle));
+                poison_generations("lifetime lease capacity exceeded");
+            }
+            (void) vkrpc::destroy_image(*g_rpc, request_id, {handle});
+        }
+        if (leased) {
+            const auto memory = g_image_memory.find(handle);
+            g_local_leased_resources[handle] = LocalLeasedResource{
+                memory != g_image_memory.end() ? memory->second : 0, local_keys};
+        }
+        const auto owner = g_image_device.find(handle);
+        if (owner != g_image_device.end()) {
+            remember_dead_resource(g_dead_images, g_dead_image_order, handle, owner->second);
+        }
+        g_image_reqs.erase(handle);
+        g_image_subresource.erase(handle);
+        g_image_memory.erase(handle);
+        g_image_device.erase(handle);
     } catch (const std::exception&) {
     }
 }
@@ -4975,6 +5359,9 @@ VKAPI_ATTR VkResult VKAPI_CALL BindImageMemory(VkDevice, VkImage image, VkDevice
         req.memory = from_handle(memory);
         req.memory_offset = static_cast<std::uint64_t>(memoryOffset);
         const vkrpc::StatusResponse r = vkrpc::bind_image_memory(*g_rpc, next_id(), req);
+        if (r.ok) {
+            g_image_memory[req.image] = req.memory;
+        }
         return r.ok ? VK_SUCCESS : fault();
     } catch (const std::exception&) {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -5045,6 +5432,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BindImageMemory2(VkDevice, std::uint32_t bindInfo
             if (!vkrpc::bind_image_memory(*g_rpc, next_id(), req).ok) {
                 return fault();
             }
+            g_image_memory[req.image] = req.memory;
         }
         return VK_SUCCESS;
     } catch (const std::exception&) {
@@ -5341,7 +5729,7 @@ VKAPI_ATTR void VKAPI_CALL CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQu
     c.args_u64.push_back(from_handle(queryPool));
     c.args_i64.push_back(static_cast<long long>(firstQuery));
     c.args_i64.push_back(static_cast<long long>(queryCount));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
@@ -5352,7 +5740,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryP
     c.args_u64.push_back(from_handle(queryPool));
     c.args_i64.push_back(static_cast<long long>(query));
     c.args_i64.push_back(static_cast<long long>(flags));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
@@ -5362,7 +5750,7 @@ VKAPI_ATTR void VKAPI_CALL CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPoo
     c.kind = "end_query";
     c.args_u64.push_back(from_handle(queryPool));
     c.args_i64.push_back(static_cast<long long>(query));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdWriteTimestamp(VkCommandBuffer commandBuffer,
@@ -5374,7 +5762,7 @@ VKAPI_ATTR void VKAPI_CALL CmdWriteTimestamp(VkCommandBuffer commandBuffer,
     c.args_u64.push_back(from_handle(queryPool));
     c.args_i64.push_back(static_cast<long long>(pipelineStage));
     c.args_i64.push_back(static_cast<long long>(query));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // zink's query-RESULT read path: copy query results into a host-visible VkBuffer (with WAIT), which
@@ -5396,7 +5784,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer
     c.args_i64.push_back(static_cast<long long>(dstOffset));
     c.args_i64.push_back(static_cast<long long>(stride));
     c.args_i64.push_back(static_cast<long long>(flags));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
     // Query-result readback (surgical): the dst buffer's memory will hold GPU-written results
     // after this command executes; note JUST that memory on the CB (nothing else ever pays a
     // readback cost). Armed at vkQueueSubmit, promoted to downloadable at a PROVEN sync point
@@ -5474,18 +5862,94 @@ VKAPI_ATTR VkResult VKAPI_CALL AllocateMemory(VkDevice device,
     }
 }
 
-VKAPI_ATTR void VKAPI_CALL FreeMemory(VkDevice, VkDeviceMemory memory,
+VKAPI_ATTR void VKAPI_CALL FreeMemory(VkDevice device, VkDeviceMemory memory,
                                       const VkAllocationCallbacks*) {
     if (memory == VK_NULL_HANDLE) {
         return;
     }
     std::lock_guard<std::mutex> lk(g_mu);
     try {
+        const std::uint64_t handle = from_handle(memory);
+        bool retained_by_lease = false;
+        for (const auto& [resource_handle, resource] : g_local_leased_resources) {
+            (void) resource_handle;
+            retained_by_lease |= resource.memory == handle;
+        }
+        // Logical free removes the guest shadow, but a leased command may still submit later.
+        // Ship the final coherent bytes synchronously before that shadow disappears.
+        if (retained_by_lease && !coherent_flush_at_submit_locked()) {
+            std::fprintf(
+                stderr, "vkrelay2-icd: deferred memory free could not ship final coherent bytes\n");
+            return;
+        }
         vkrpc::HandleRequest req;
-        req.handle = from_handle(memory);
-        (void) vkrpc::free_memory(*g_rpc, next_id(), req);
+        req.handle = handle;
+        vkrpc::StatusResponse response = vkrpc::free_memory(*g_rpc, next_id(), req);
+        bool used_capacity_fallback = false;
+        if (!response.ok &&
+            response.reason == "recording resource retired-memory capacity exceeded") {
+            used_capacity_fallback = true;
+            // Keep the worker's retired-memory state bounded. This is an invalid-usage fallback:
+            // first prove all earlier device work complete, then invalidate and retire only the
+            // generations retaining this allocation's resources. The retry is then an ordinary
+            // physical free. A failed idle/retire leaves the guest shadow intact.
+            auto* dev = reinterpret_cast<DeviceImpl*>(device);
+            vkrpc::HandleRequest idle_req;
+            idle_req.handle = dev->worker;
+            const vkrpc::WaitIdleResponse idle =
+                vkrpc::device_wait_idle(*g_rpc, next_id(), idle_req);
+            if (!idle.ok || idle.result != vkrpc::kVkSuccess) {
+                std::fprintf(stderr,
+                             "vkrelay2-icd: retired-memory capacity fallback could not idle "
+                             "the device\n");
+                return;
+            }
+            // Void CB/pool destruction may have orphaned a wire lease key after a transient RPC
+            // failure. Retire those keys directly before looking up still-live wrappers; unlike
+            // the old path, this cannot lose a retainer merely because its wrapper is gone.
+            if (!retry_orphaned_recording_leases_locked()) {
+                return;
+            }
+            std::set<CommandBufferImpl*> retaining_command_buffers;
+            for (const auto& [resource_handle, resource] : g_local_leased_resources) {
+                (void) resource_handle;
+                if (resource.memory != handle) {
+                    continue;
+                }
+                for (const RecordingLeaseKey& key : resource.leases) {
+                    const auto cb = g_command_buffers.find(key.first);
+                    if (cb != g_command_buffers.end() &&
+                        cb->second->recording_generation == key.second) {
+                        retaining_command_buffers.insert(cb->second);
+                    }
+                }
+            }
+            std::fprintf(stderr,
+                         "vkrelay2-icd: retired-memory capacity exceeded; invalidating %zu "
+                         "retaining command-buffer generation(s)\n",
+                         retaining_command_buffers.size());
+            for (CommandBufferImpl* cb : retaining_command_buffers) {
+                invalidate_recording_locked(cb, "retired-memory lifetime capacity exceeded");
+                cb->executable = false;
+                if (!retire_recording_locked(cb)) {
+                    return;
+                }
+            }
+            response = vkrpc::free_memory(*g_rpc, next_id(), req);
+        }
+        if (!response.ok) {
+            std::fprintf(stderr, "vkrelay2-icd: free_memory rejected -- %s\n",
+                         response.reason.c_str());
+            // Preserve the shadow when a lease-dependent logical free or its bounded-capacity
+            // recovery failed: a later retry still needs the final guest bytes. Ordinary worker
+            // rejections retain the legacy void-entry behavior and clear guest bookkeeping (for
+            // example, an old-worker double free must not strand the local mapping).
+            if (retained_by_lease || used_capacity_fallback) {
+                return;
+            }
+        }
         std::string err;
-        (void) g_tracker.on_free(from_handle(memory), err);
+        (void) g_tracker.on_free(handle, err);
         // Freed memory can never be downloaded: drop it from READY and from every armed
         // submission record, then drop records left with no destinations (an
         // emptied record would only ever promote as a no-op -- erase it instead).
@@ -5597,11 +6061,26 @@ VKAPI_ATTR void VKAPI_CALL DestroyCommandPool(VkDevice, VkCommandPool commandPoo
         return;
     }
     std::lock_guard<std::mutex> lk(g_mu);
+    std::vector<CommandBufferImpl*> owned;
+    const std::uint64_t pool = from_handle(commandPool);
+    for (const auto& [worker, cb] : g_command_buffers) {
+        (void) worker;
+        if (cb->pool_worker == pool) {
+            if (!retire_recording_locked(cb) && cb->recording_generation != 0) {
+                g_orphaned_recording_leases.emplace(cb->worker, cb->recording_generation);
+            }
+            owned.push_back(cb);
+        }
+    }
     try {
         vkrpc::HandleRequest req;
         req.handle = from_handle(commandPool);
         (void) vkrpc::destroy_command_pool(*g_rpc, next_id(), req);
     } catch (const std::exception&) {
+    }
+    for (CommandBufferImpl* cb : owned) {
+        g_command_buffers.erase(cb->worker);
+        delete cb;
     }
 }
 
@@ -5623,6 +6102,8 @@ VKAPI_ATTR VkResult VKAPI_CALL AllocateCommandBuffers(VkDevice device,
             auto* cb = new CommandBufferImpl{};
             set_loader_magic_value(cb);
             cb->worker = r.command_buffers[i];
+            cb->device_worker = dev->worker;
+            cb->pool_worker = req.command_pool;
             cb->vk13_device = dev->vk13_device; // Vulkan 1.3 support: gates the copy2 wrappers
             cb->worker_core_indirect_draw = dev->worker_core_indirect_draw;
             cb->worker_core_indirect_draw_scalar_payload =
@@ -5630,6 +6111,8 @@ VKAPI_ATTR VkResult VKAPI_CALL AllocateCommandBuffers(VkDevice device,
             cb->multi_draw_indirect_enabled = dev->multi_draw_indirect_enabled;
             cb->worker_core_indirect_draw_count = dev->worker_core_indirect_draw_count;
             cb->draw_indirect_count_enabled = dev->draw_indirect_count_enabled;
+            cb->worker_recording_resource_leases = dev->worker_recording_resource_leases;
+            g_command_buffers[cb->worker] = cb;
             pCommandBuffers[i] = reinterpret_cast<VkCommandBuffer>(cb);
         }
         return VK_SUCCESS;
@@ -5647,13 +6130,18 @@ VKAPI_ATTR void VKAPI_CALL FreeCommandBuffers(VkDevice, VkCommandPool commandPoo
         req.command_pool = from_handle(commandPool);
         for (std::uint32_t i = 0; i < count; ++i) {
             auto* cb = reinterpret_cast<CommandBufferImpl*>(pCommandBuffers[i]);
+            if (!retire_recording_locked(cb) && cb->recording_generation != 0) {
+                g_orphaned_recording_leases.emplace(cb->worker, cb->recording_generation);
+            }
             req.command_buffers.push_back(cb->worker);
         }
         (void) vkrpc::free_command_buffers(*g_rpc, next_id(), req);
     } catch (const std::exception&) {
     }
     for (std::uint32_t i = 0; i < count; ++i) {
-        delete reinterpret_cast<CommandBufferImpl*>(pCommandBuffers[i]);
+        auto* cb = reinterpret_cast<CommandBufferImpl*>(pCommandBuffers[i]);
+        g_command_buffers.erase(cb->worker);
+        delete cb;
     }
 }
 
@@ -5661,17 +6149,31 @@ VKAPI_ATTR void VKAPI_CALL FreeCommandBuffers(VkDevice, VkCommandPool commandPoo
 // each command buffer at record_command_buffer time (the pool carries RESET_COMMAND_BUFFER_BIT), so
 // a local success is sufficient -- vkBeginCommandBuffer already clears the ICD-side recording. A
 // real-frame app that resets a pool mid-flight would want this forwarded; revisit if needed.
-VKAPI_ATTR VkResult VKAPI_CALL ResetCommandPool(VkDevice, VkCommandPool, VkCommandPoolResetFlags) {
+VKAPI_ATTR VkResult VKAPI_CALL ResetCommandPool(VkDevice, VkCommandPool commandPool,
+                                                VkCommandPoolResetFlags) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    const std::uint64_t pool = from_handle(commandPool);
+    for (const auto& [worker, cb] : g_command_buffers) {
+        (void) worker;
+        if (cb->pool_worker == pool && !retire_recording_locked(cb)) {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+    }
     return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL ResetCommandBuffer(VkCommandBuffer commandBuffer,
                                                   VkCommandBufferResetFlags) {
     std::lock_guard<std::mutex> lk(g_mu);
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
+    if (!retire_recording_locked(cb)) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     cb->recording.clear();
     cb->local_invalid = false;
     cb->invalid_reason = "";
     cb->readback_dsts.clear();
+    cb->direct_images.clear();
+    cb->direct_buffers.clear();
     return VK_SUCCESS;
 }
 
@@ -6078,11 +6580,25 @@ VKAPI_ATTR VkResult VKAPI_CALL GetSemaphoreCounterValue(VkDevice device, VkSemap
 // --- Command recording (client-side stream; flushed at vkEndCommandBuffer) ---
 VKAPI_ATTR VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer commandBuffer,
                                                   const VkCommandBufferBeginInfo* pBeginInfo) {
+    std::lock_guard<std::mutex> lk(g_mu);
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
+    if (cb->worker_recording_resource_leases && !retire_recording_locked(cb)) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (cb->worker_recording_resource_leases) {
+        ++cb->recording_generation;
+        if (cb->recording_generation == 0) {
+            ++cb->recording_generation;
+        }
+    }
     cb->recording.clear();
     cb->local_invalid = false;
     cb->invalid_reason = "";
     cb->readback_dsts.clear();
+    cb->direct_images.clear();
+    cb->direct_buffers.clear();
+    cb->recording_open = true;
+    cb->executable = false;
     cb->one_time_submit = pBeginInfo != nullptr &&
                           (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) != 0;
     return VK_SUCCESS;
@@ -6101,8 +6617,7 @@ VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier(
     for (std::uint32_t i = 0; i < memoryBarrierCount; ++i) {
         const VkMemoryBarrier& b = pMemoryBarriers[i];
         if (b.pNext != nullptr) {
-            cb->local_invalid = true;
-            cb->invalid_reason = "memory barrier pNext not supported";
+            invalidate_recording(cb, "memory barrier pNext not supported");
             return;
         }
         vkrpc::RecordedCommand c;
@@ -6111,7 +6626,7 @@ VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier(
         c.dst_stage = static_cast<long long>(dstStageMask);
         c.src_access = static_cast<long long>(b.srcAccessMask);
         c.dst_access = static_cast<long long>(b.dstAccessMask);
-        cb->recording.push_back(std::move(c));
+        append_recorded_command(cb, std::move(c));
     }
     for (std::uint32_t i = 0; i < bufferMemoryBarrierCount; ++i) {
         const VkBufferMemoryBarrier& b = pBufferBarriers[i];
@@ -6119,8 +6634,7 @@ VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier(
         // fail-closed reject, never a silent drop.
         if (b.pNext != nullptr || b.srcQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED ||
             b.dstQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED) {
-            cb->local_invalid = true;
-            cb->invalid_reason = "buffer barrier pNext/queue-family transfer not supported";
+            invalidate_recording(cb, "buffer barrier pNext/queue-family transfer not supported");
             return;
         }
         vkrpc::RecordedCommand c;
@@ -6132,7 +6646,7 @@ VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier(
         c.dst_access = static_cast<long long>(b.dstAccessMask);
         c.args_u64.push_back(static_cast<std::uint64_t>(b.offset));
         c.args_u64.push_back(static_cast<std::uint64_t>(b.size)); // WHOLE_SIZE rides as ~0
-        cb->recording.push_back(std::move(c));
+        append_recorded_command(cb, std::move(c));
     }
     for (std::uint32_t i = 0; i < imageMemoryBarrierCount; ++i) {
         const VkImageMemoryBarrier& b = pImageBarriers[i];
@@ -6157,7 +6671,7 @@ VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier(
         c.barrier_level_count = clamp_range(b.subresourceRange.levelCount);
         c.barrier_base_layer = clamp_range(b.subresourceRange.baseArrayLayer);
         c.barrier_layer_count = clamp_range(b.subresourceRange.layerCount);
-        cb->recording.push_back(std::move(c));
+        append_recorded_command(cb, std::move(c));
     }
 }
 
@@ -6171,7 +6685,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetEvent(VkCommandBuffer commandBuffer, VkEvent ev
     c.kind = "set_event";
     c.src_stage = static_cast<long long>(stageMask);
     c.args_u64.push_back(from_handle(event));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdResetEvent(VkCommandBuffer commandBuffer, VkEvent event,
@@ -6181,7 +6695,7 @@ VKAPI_ATTR void VKAPI_CALL CmdResetEvent(VkCommandBuffer commandBuffer, VkEvent 
     c.kind = "reset_event";
     c.src_stage = static_cast<long long>(stageMask);
     c.args_u64.push_back(from_handle(event));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // vkCmdWaitEvents is atomic (it waits on a SET of events and carries the sync1 barrier
@@ -6203,8 +6717,7 @@ CmdWaitEvents(VkCommandBuffer commandBuffer, std::uint32_t eventCount, const VkE
         memoryBarrierCount > vkrpc::kMaxWaitEventsBarriers ||
         bufferMemoryBarrierCount > vkrpc::kMaxWaitEventsBarriers ||
         imageMemoryBarrierCount > vkrpc::kMaxWaitEventsBarriers) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "wait_events count exceeds the supported cap";
+        invalidate_recording(cb, "wait_events count exceeds the supported cap");
         return;
     }
     vkrpc::RecordedCommand c;
@@ -6221,8 +6734,7 @@ CmdWaitEvents(VkCommandBuffer commandBuffer, std::uint32_t eventCount, const VkE
     for (std::uint32_t i = 0; i < memoryBarrierCount; ++i) {
         const VkMemoryBarrier& b = pMemoryBarriers[i];
         if (b.pNext != nullptr) {
-            cb->local_invalid = true;
-            cb->invalid_reason = "wait_events memory barrier pNext not supported";
+            invalidate_recording(cb, "wait_events memory barrier pNext not supported");
             return;
         }
         c.args_u64.push_back(b.srcAccessMask);
@@ -6232,9 +6744,8 @@ CmdWaitEvents(VkCommandBuffer commandBuffer, std::uint32_t eventCount, const VkE
         const VkBufferMemoryBarrier& b = pBufferBarriers[i];
         if (b.pNext != nullptr || b.srcQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED ||
             b.dstQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED) {
-            cb->local_invalid = true;
-            cb->invalid_reason =
-                "wait_events buffer barrier pNext/queue-family transfer not supported";
+            invalidate_recording(
+                cb, "wait_events buffer barrier pNext/queue-family transfer not supported");
             return;
         }
         c.args_u64.push_back(b.srcAccessMask);
@@ -6247,9 +6758,8 @@ CmdWaitEvents(VkCommandBuffer commandBuffer, std::uint32_t eventCount, const VkE
         const VkImageMemoryBarrier& b = pImageBarriers[i];
         if (b.pNext != nullptr || b.srcQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED ||
             b.dstQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED) {
-            cb->local_invalid = true;
-            cb->invalid_reason =
-                "wait_events image barrier pNext/queue-family transfer not supported";
+            invalidate_recording(
+                cb, "wait_events image barrier pNext/queue-family transfer not supported");
             return;
         }
         c.args_u64.push_back(b.srcAccessMask);
@@ -6263,7 +6773,7 @@ CmdWaitEvents(VkCommandBuffer commandBuffer, std::uint32_t eventCount, const VkE
         c.args_u64.push_back(b.subresourceRange.baseArrayLayer);
         c.args_u64.push_back(b.subresourceRange.layerCount);
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // flatten a VkDependencyInfo into the typed DependencyInfo2, FAIL-CLOSED on every
@@ -6381,12 +6891,11 @@ VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     vkrpc::DependencyInfo2 dep;
     const char* reason = "";
     if (!flatten_dependency_info2(pDependencyInfo, dep, reason)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = reason;
+        invalidate_recording(cb, reason);
         return;
     }
     c.deps2.push_back(std::move(dep));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // vkCmdWriteTimestamp2 -- args_u64=[queryPool, stageMask64], args_i64=[query].
@@ -6400,7 +6909,7 @@ VKAPI_ATTR void VKAPI_CALL CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
     c.args_u64.push_back(from_handle(queryPool));
     c.args_u64.push_back(static_cast<std::uint64_t>(stage));
     c.args_i64.push_back(static_cast<long long>(query));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // vkCmdSetEvent2 -- event + one DependencyInfo2. args_u64=[event],
@@ -6413,13 +6922,12 @@ VKAPI_ATTR void VKAPI_CALL CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent e
     vkrpc::DependencyInfo2 dep;
     const char* reason = "";
     if (!flatten_dependency_info2(pDependencyInfo, dep, reason)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = reason;
+        invalidate_recording(cb, reason);
         return;
     }
     c.args_u64.push_back(from_handle(event));
     c.deps2.push_back(std::move(dep));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // vkCmdResetEvent2 -- event + a 64-bit stageMask (no dependency).
@@ -6431,7 +6939,7 @@ VKAPI_ATTR void VKAPI_CALL CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent
     c.kind = "reset_event2";
     c.args_u64.push_back(from_handle(event));
     c.args_u64.push_back(static_cast<std::uint64_t>(stageMask));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // vkCmdWaitEvents2 -- N events paired with N VkDependencyInfo. args_u64=[event x
@@ -6442,13 +6950,11 @@ VKAPI_ATTR void VKAPI_CALL CmdWaitEvents2(VkCommandBuffer commandBuffer, std::ui
                                           const VkDependencyInfo* pDependencyInfos) {
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
     if (eventCount > vkrpc::kMaxSync2Dependencies) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "wait_events2 event count exceeds the supported cap";
+        invalidate_recording(cb, "wait_events2 event count exceeds the supported cap");
         return;
     }
     if (eventCount != 0 && (pEvents == nullptr || pDependencyInfos == nullptr)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "wait_events2 null events/dependencies with a nonzero count";
+        invalidate_recording(cb, "wait_events2 null events/dependencies with a nonzero count");
         return;
     }
     vkrpc::RecordedCommand c;
@@ -6457,14 +6963,13 @@ VKAPI_ATTR void VKAPI_CALL CmdWaitEvents2(VkCommandBuffer commandBuffer, std::ui
         vkrpc::DependencyInfo2 dep;
         const char* reason = "";
         if (!flatten_dependency_info2(&pDependencyInfos[i], dep, reason)) {
-            cb->local_invalid = true;
-            cb->invalid_reason = reason;
+            invalidate_recording(cb, reason);
             return;
         }
         c.args_u64.push_back(from_handle(pEvents[i]));
         c.deps2.push_back(std::move(dep));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image,
@@ -6483,7 +6988,7 @@ VKAPI_ATTR void VKAPI_CALL CmdClearColorImage(VkCommandBuffer commandBuffer, VkI
         c.b = pColor->float32[2];
         c.a = pColor->float32[3];
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // (GL/zink): faithful IN-RENDER-PASS scissored clear. zink emits vkCmdClearAttachments for a
@@ -6519,7 +7024,7 @@ VKAPI_ATTR void VKAPI_CALL CmdClearAttachments(VkCommandBuffer commandBuffer,
         c.args_i64.push_back(static_cast<long long>(r.baseArrayLayer));
         c.args_i64.push_back(static_cast<long long>(r.layerCount));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // Faithful texture upload: staging buffer -> TRANSFER_DST
@@ -6537,8 +7042,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage(VkCommandBuffer commandBuffer, V
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
     const char* why = "";
     if (!vkr::icd_subset::copy_buffer_to_image_ok(dstImageLayout, regionCount, pRegions, &why)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
     vkrpc::RecordedCommand c;
@@ -6563,7 +7067,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage(VkCommandBuffer commandBuffer, V
         c.args_i64.push_back(static_cast<long long>(r.imageExtent.height));
         c.args_i64.push_back(static_cast<long long>(r.imageExtent.depth));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // (GL/zink): faithful image->buffer readback (glReadPixels for offscreen PNG export +
@@ -6598,7 +7102,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyImageToBuffer(VkCommandBuffer commandBuffer, V
         c.args_i64.push_back(static_cast<long long>(r.imageExtent.height));
         c.args_i64.push_back(static_cast<long long>(r.imageExtent.depth));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
     // Offscreen readback: the dst buffer's memory holds GPU-written pixels after this command
     // executes (zink's glReadPixels staging -- OpenSCAD's -o png export). Note JUST that memory on
     // the CB -- the same surgical contract as CmdCopyQueryPoolResults above: armed at
@@ -6625,7 +7129,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBuffer(VkCommandBuffer commandBuffer, VkBuffer
         c.args_u64.push_back(static_cast<std::uint64_t>(pRegions[i].dstOffset));
         c.args_u64.push_back(static_cast<std::uint64_t>(pRegions[i].size));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
     // Buffer-destination readback, the last named silent-stale class: the destination buffer's
     // memory holds GPU-written bytes after this command executes (compute SSBO results, GL's
     // glGetBufferSubData staging). The same surgical contract as CmdCopyImageToBuffer: note
@@ -6652,7 +7156,7 @@ VKAPI_ATTR void VKAPI_CALL CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer
     c.args_u64.push_back(static_cast<std::uint64_t>(dstOffset));
     c.args_u64.push_back(static_cast<std::uint64_t>(size));
     c.args_u64.push_back(static_cast<std::uint64_t>(data));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
     std::lock_guard<std::mutex> lk(g_mu);
     const auto it = g_buffers.find(from_handle(dstBuffer));
     if (it != g_buffers.end() && it->second.memory != 0) {
@@ -6701,7 +7205,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBlitImage(VkCommandBuffer commandBuffer, VkImage s
             c.args_i64.push_back(static_cast<long long>(r.dstOffsets[o].z));
         }
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // (GL/zink): faithful unscaled image->image copy (zink emits vkCmdCopyImage for
@@ -6741,7 +7245,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyImage(VkCommandBuffer commandBuffer, VkImage s
         c.args_i64.push_back(static_cast<long long>(r.extent.height));
         c.args_i64.push_back(static_cast<long long>(r.extent.depth));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // --- Draw command recording ------------------------------
@@ -6757,8 +7261,7 @@ void record_begin_render_pass(CommandBufferImpl* cb, const VkRenderPassBeginInfo
                               VkSubpassContents contents) {
     const char* why = "";
     if (!vkr::icd_subset::begin_render_pass_ok(bi, contents, &why)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
     vkrpc::RecordedCommand c;
@@ -6799,7 +7302,7 @@ void record_begin_render_pass(CommandBufferImpl* cb, const VkRenderPassBeginInfo
               static_cast<unsigned long long>(c.framebuffer), bi->renderArea.offset.x,
               bi->renderArea.offset.y, bi->renderArea.extent.width, bi->renderArea.extent.height,
               c.args_u64.size());
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdBeginRenderPass(VkCommandBuffer commandBuffer,
@@ -6824,7 +7327,7 @@ VKAPI_ATTR void VKAPI_CALL CmdEndRenderPass(VkCommandBuffer commandBuffer) {
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
     vkrpc::RecordedCommand c;
     c.kind = "end_render_pass";
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdEndRenderPass2(VkCommandBuffer commandBuffer,
@@ -6832,7 +7335,7 @@ VKAPI_ATTR void VKAPI_CALL CmdEndRenderPass2(VkCommandBuffer commandBuffer,
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
     vkrpc::RecordedCommand c;
     c.kind = "end_render_pass";
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdBindPipeline(VkCommandBuffer commandBuffer,
@@ -6840,8 +7343,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBindPipeline(VkCommandBuffer commandBuffer,
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
     const char* why = "";
     if (!vkr::icd_subset::bind_pipeline_ok(bindPoint, &why)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
     vkrpc::RecordedCommand c;
@@ -6850,7 +7352,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBindPipeline(VkCommandBuffer commandBuffer,
     // Compute: carry the bind point (the bind_descriptor_sets precedent -- absent =
     // GRAPHICS on old recordings). The worker cross-checks it against the pipeline's KIND.
     c.args_i64.push_back(static_cast<long long>(bindPoint));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // Compute: faithful dispatches. args_u64 = [x, y, z] (0 is a legal no-op); the
@@ -6863,7 +7365,7 @@ VKAPI_ATTR void VKAPI_CALL CmdDispatch(VkCommandBuffer commandBuffer, std::uint3
     c.args_u64.push_back(x);
     c.args_u64.push_back(y);
     c.args_u64.push_back(z);
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
@@ -6873,7 +7375,7 @@ VKAPI_ATTR void VKAPI_CALL CmdDispatchIndirect(VkCommandBuffer commandBuffer, Vk
     c.kind = "dispatch_indirect";
     c.src_buffer = from_handle(buffer);
     c.args_u64.push_back(static_cast<std::uint64_t>(offset));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdSetViewport(VkCommandBuffer commandBuffer,
@@ -6883,8 +7385,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetViewport(VkCommandBuffer commandBuffer,
     const char* why = "";
     if (!vkr::icd_subset::set_viewport_ok(firstViewport, viewportCount, &why) ||
         pViewports == nullptr) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
     // a single dynamic viewport (the pipeline declares viewportCount 1).
@@ -6896,7 +7397,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetViewport(VkCommandBuffer commandBuffer,
     c.vp_h = pViewports[0].height;
     c.vp_min_depth = pViewports[0].minDepth;
     c.vp_max_depth = pViewports[0].maxDepth;
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdSetScissor(VkCommandBuffer commandBuffer, std::uint32_t firstScissor,
@@ -6905,8 +7406,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetScissor(VkCommandBuffer commandBuffer, std::uin
     const char* why = "";
     if (!vkr::icd_subset::set_scissor_ok(firstScissor, scissorCount, &why) ||
         pScissors == nullptr) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
     vkrpc::RecordedCommand c;
@@ -6915,7 +7415,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetScissor(VkCommandBuffer commandBuffer, std::uin
     c.sc_y = pScissors[0].offset.y;
     c.sc_w = static_cast<int>(pScissors[0].extent.width);
     c.sc_h = static_cast<int>(pScissors[0].extent.height);
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // (GL/zink): the core-1.0 dynamic-state set commands a pipeline may declare dynamic. Each
@@ -6925,7 +7425,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetLineWidth(VkCommandBuffer commandBuffer, float 
     vkrpc::RecordedCommand c;
     c.kind = "set_line_width";
     c.args_f64.push_back(static_cast<double>(lineWidth));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetDepthBias(VkCommandBuffer commandBuffer, float constantFactor,
                                            float clamp, float slopeFactor) {
@@ -6934,7 +7434,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetDepthBias(VkCommandBuffer commandBuffer, float 
     c.kind = "set_depth_bias";
     c.args_f64 = {static_cast<double>(constantFactor), static_cast<double>(clamp),
                   static_cast<double>(slopeFactor)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetBlendConstants(VkCommandBuffer commandBuffer,
                                                 const float blendConstants[4]) {
@@ -6944,7 +7444,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetBlendConstants(VkCommandBuffer commandBuffer,
     for (int i = 0; i < 4; ++i) {
         c.args_f64.push_back(static_cast<double>(blendConstants[i]));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetDepthBounds(VkCommandBuffer commandBuffer, float minDepthBounds,
                                              float maxDepthBounds) {
@@ -6952,7 +7452,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetDepthBounds(VkCommandBuffer commandBuffer, floa
     vkrpc::RecordedCommand c;
     c.kind = "set_depth_bounds";
     c.args_f64 = {static_cast<double>(minDepthBounds), static_cast<double>(maxDepthBounds)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetStencilCompareMask(VkCommandBuffer commandBuffer,
                                                     VkStencilFaceFlags faceMask,
@@ -6961,7 +7461,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetStencilCompareMask(VkCommandBuffer commandBuffe
     vkrpc::RecordedCommand c;
     c.kind = "set_stencil_compare_mask";
     c.args_i64 = {static_cast<long long>(faceMask), static_cast<long long>(compareMask)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetStencilWriteMask(VkCommandBuffer commandBuffer,
                                                   VkStencilFaceFlags faceMask,
@@ -6970,7 +7470,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetStencilWriteMask(VkCommandBuffer commandBuffer,
     vkrpc::RecordedCommand c;
     c.kind = "set_stencil_write_mask";
     c.args_i64 = {static_cast<long long>(faceMask), static_cast<long long>(writeMask)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetStencilReference(VkCommandBuffer commandBuffer,
                                                   VkStencilFaceFlags faceMask,
@@ -6979,7 +7479,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetStencilReference(VkCommandBuffer commandBuffer,
     vkrpc::RecordedCommand c;
     c.kind = "set_stencil_reference";
     c.args_i64 = {static_cast<long long>(faceMask), static_cast<long long>(reference)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // (the Vulkan-1.3 opener -- EDS1): VK_EXT_extended_dynamic_state's six state-setters, each
@@ -6993,14 +7493,14 @@ VKAPI_ATTR void VKAPI_CALL CmdSetCullMode(VkCommandBuffer commandBuffer, VkCullM
     vkrpc::RecordedCommand c;
     c.kind = "set_cull_mode";
     c.args_i64 = {static_cast<long long>(cullMode)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetFrontFace(VkCommandBuffer commandBuffer, VkFrontFace frontFace) {
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
     vkrpc::RecordedCommand c;
     c.kind = "set_front_face";
     c.args_i64 = {static_cast<long long>(frontFace)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetPrimitiveTopology(VkCommandBuffer commandBuffer,
                                                    VkPrimitiveTopology primitiveTopology) {
@@ -7008,7 +7508,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetPrimitiveTopology(VkCommandBuffer commandBuffer
     vkrpc::RecordedCommand c;
     c.kind = "set_primitive_topology";
     c.args_i64 = {static_cast<long long>(primitiveTopology)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetDepthTestEnable(VkCommandBuffer commandBuffer,
                                                  VkBool32 depthTestEnable) {
@@ -7016,7 +7516,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetDepthTestEnable(VkCommandBuffer commandBuffer,
     vkrpc::RecordedCommand c;
     c.kind = "set_depth_test_enable";
     c.args_i64 = {static_cast<long long>(depthTestEnable)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetDepthWriteEnable(VkCommandBuffer commandBuffer,
                                                   VkBool32 depthWriteEnable) {
@@ -7024,7 +7524,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetDepthWriteEnable(VkCommandBuffer commandBuffer,
     vkrpc::RecordedCommand c;
     c.kind = "set_depth_write_enable";
     c.args_i64 = {static_cast<long long>(depthWriteEnable)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetDepthCompareOp(VkCommandBuffer commandBuffer,
                                                 VkCompareOp depthCompareOp) {
@@ -7032,7 +7532,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetDepthCompareOp(VkCommandBuffer commandBuffer,
     vkrpc::RecordedCommand c;
     c.kind = "set_depth_compare_op";
     c.args_i64 = {static_cast<long long>(depthCompareOp)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // Vulkan 1.3 support: the remaining EDS1 setters + the core-1.3 EDS2 subset + vkCmdResolveImage.
@@ -7055,7 +7555,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetViewportWithCount(VkCommandBuffer commandBuffer
         c.args_f64.push_back(static_cast<double>(v.minDepth));
         c.args_f64.push_back(static_cast<double>(v.maxDepth));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetScissorWithCount(VkCommandBuffer commandBuffer,
                                                   std::uint32_t scissorCount,
@@ -7071,7 +7571,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetScissorWithCount(VkCommandBuffer commandBuffer,
         c.args_i64.push_back(static_cast<long long>(s.extent.width));
         c.args_i64.push_back(static_cast<long long>(s.extent.height));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdBindVertexBuffers2(
     VkCommandBuffer commandBuffer, std::uint32_t firstBinding, std::uint32_t bindingCount,
@@ -7098,7 +7598,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBindVertexBuffers2(
             c.args_u64.push_back(static_cast<std::uint64_t>(pStrides[i]));
         }
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetDepthBoundsTestEnable(VkCommandBuffer commandBuffer,
                                                        VkBool32 depthBoundsTestEnable) {
@@ -7106,7 +7606,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetDepthBoundsTestEnable(VkCommandBuffer commandBu
     vkrpc::RecordedCommand c;
     c.kind = "set_depth_bounds_test_enable";
     c.args_i64 = {static_cast<long long>(depthBoundsTestEnable)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetStencilTestEnable(VkCommandBuffer commandBuffer,
                                                    VkBool32 stencilTestEnable) {
@@ -7114,7 +7614,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetStencilTestEnable(VkCommandBuffer commandBuffer
     vkrpc::RecordedCommand c;
     c.kind = "set_stencil_test_enable";
     c.args_i64 = {static_cast<long long>(stencilTestEnable)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetStencilOp(VkCommandBuffer commandBuffer,
                                            VkStencilFaceFlags faceMask, VkStencilOp failOp,
@@ -7126,7 +7626,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetStencilOp(VkCommandBuffer commandBuffer,
     c.args_i64 = {static_cast<long long>(faceMask), static_cast<long long>(failOp),
                   static_cast<long long>(passOp), static_cast<long long>(depthFailOp),
                   static_cast<long long>(compareOp)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetRasterizerDiscardEnable(VkCommandBuffer commandBuffer,
                                                          VkBool32 rasterizerDiscardEnable) {
@@ -7134,7 +7634,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetRasterizerDiscardEnable(VkCommandBuffer command
     vkrpc::RecordedCommand c;
     c.kind = "set_rasterizer_discard_enable";
     c.args_i64 = {static_cast<long long>(rasterizerDiscardEnable)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetDepthBiasEnable(VkCommandBuffer commandBuffer,
                                                  VkBool32 depthBiasEnable) {
@@ -7142,7 +7642,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetDepthBiasEnable(VkCommandBuffer commandBuffer,
     vkrpc::RecordedCommand c;
     c.kind = "set_depth_bias_enable";
     c.args_i64 = {static_cast<long long>(depthBiasEnable)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdSetPrimitiveRestartEnable(VkCommandBuffer commandBuffer,
                                                         VkBool32 primitiveRestartEnable) {
@@ -7150,7 +7650,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetPrimitiveRestartEnable(VkCommandBuffer commandB
     vkrpc::RecordedCommand c;
     c.kind = "set_primitive_restart_enable";
     c.args_i64 = {static_cast<long long>(primitiveRestartEnable)};
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage,
                                            VkImageLayout srcImageLayout, VkImage dstImage,
@@ -7184,7 +7684,7 @@ VKAPI_ATTR void VKAPI_CALL CmdResolveImage(VkCommandBuffer commandBuffer, VkImag
         c.args_i64.push_back(static_cast<long long>(r.extent.height));
         c.args_i64.push_back(static_cast<long long>(r.extent.depth));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // Vulkan 1.3 support: the VK_KHR_copy_commands2 family (core 1.3). Each *2 command is
@@ -7201,8 +7701,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBuffer2(VkCommandBuffer commandBuffer,
     // classic down-conversion below erases the distinction before the worker's gates, so the
     // version gate lives here on the command buffer's stamped device flag.
     if (!cb->vk13_device) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy_commands2 requires an apiVersion-1.3 device";
+        invalidate_recording(cb, "copy_commands2 requires an apiVersion-1.3 device");
         return;
     }
     bool pnext_clear = info.pNext == nullptr;
@@ -7210,8 +7709,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBuffer2(VkCommandBuffer commandBuffer,
         pnext_clear = info.pRegions[i].pNext == nullptr;
     }
     if (!pnext_clear) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy2 pNext not supported (fail closed)";
+        invalidate_recording(cb, "copy2 pNext not supported (fail closed)");
         return;
     }
     std::vector<VkBufferCopy> regions(info.regionCount);
@@ -7231,8 +7729,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyImage2(VkCommandBuffer commandBuffer,
     // classic down-conversion below erases the distinction before the worker's gates, so the
     // version gate lives here on the command buffer's stamped device flag.
     if (!cb->vk13_device) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy_commands2 requires an apiVersion-1.3 device";
+        invalidate_recording(cb, "copy_commands2 requires an apiVersion-1.3 device");
         return;
     }
     bool pnext_clear = info.pNext == nullptr;
@@ -7240,8 +7737,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyImage2(VkCommandBuffer commandBuffer,
         pnext_clear = info.pRegions[i].pNext == nullptr;
     }
     if (!pnext_clear) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy2 pNext not supported (fail closed)";
+        invalidate_recording(cb, "copy2 pNext not supported (fail closed)");
         return;
     }
     std::vector<VkImageCopy> regions(info.regionCount);
@@ -7264,8 +7760,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage2(
     // classic down-conversion below erases the distinction before the worker's gates, so the
     // version gate lives here on the command buffer's stamped device flag.
     if (!cb->vk13_device) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy_commands2 requires an apiVersion-1.3 device";
+        invalidate_recording(cb, "copy_commands2 requires an apiVersion-1.3 device");
         return;
     }
     bool pnext_clear = info.pNext == nullptr;
@@ -7273,8 +7768,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage2(
         pnext_clear = info.pRegions[i].pNext == nullptr;
     }
     if (!pnext_clear) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy2 pNext not supported (fail closed)";
+        invalidate_recording(cb, "copy2 pNext not supported (fail closed)");
         return;
     }
     std::vector<VkBufferImageCopy> regions(info.regionCount);
@@ -7298,8 +7792,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyImageToBuffer2(
     // classic down-conversion below erases the distinction before the worker's gates, so the
     // version gate lives here on the command buffer's stamped device flag.
     if (!cb->vk13_device) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy_commands2 requires an apiVersion-1.3 device";
+        invalidate_recording(cb, "copy_commands2 requires an apiVersion-1.3 device");
         return;
     }
     bool pnext_clear = info.pNext == nullptr;
@@ -7307,8 +7800,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyImageToBuffer2(
         pnext_clear = info.pRegions[i].pNext == nullptr;
     }
     if (!pnext_clear) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy2 pNext not supported (fail closed)";
+        invalidate_recording(cb, "copy2 pNext not supported (fail closed)");
         return;
     }
     std::vector<VkBufferImageCopy> regions(info.regionCount);
@@ -7332,8 +7824,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBlitImage2(VkCommandBuffer commandBuffer,
     // classic down-conversion below erases the distinction before the worker's gates, so the
     // version gate lives here on the command buffer's stamped device flag.
     if (!cb->vk13_device) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy_commands2 requires an apiVersion-1.3 device";
+        invalidate_recording(cb, "copy_commands2 requires an apiVersion-1.3 device");
         return;
     }
     bool pnext_clear = info.pNext == nullptr;
@@ -7341,8 +7832,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBlitImage2(VkCommandBuffer commandBuffer,
         pnext_clear = info.pRegions[i].pNext == nullptr;
     }
     if (!pnext_clear) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy2 pNext not supported (fail closed)";
+        invalidate_recording(cb, "copy2 pNext not supported (fail closed)");
         return;
     }
     std::vector<VkImageBlit> regions(info.regionCount);
@@ -7366,8 +7856,7 @@ VKAPI_ATTR void VKAPI_CALL CmdResolveImage2(VkCommandBuffer commandBuffer,
     // classic down-conversion below erases the distinction before the worker's gates, so the
     // version gate lives here on the command buffer's stamped device flag.
     if (!cb->vk13_device) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy_commands2 requires an apiVersion-1.3 device";
+        invalidate_recording(cb, "copy_commands2 requires an apiVersion-1.3 device");
         return;
     }
     bool pnext_clear = info.pNext == nullptr;
@@ -7375,8 +7864,7 @@ VKAPI_ATTR void VKAPI_CALL CmdResolveImage2(VkCommandBuffer commandBuffer,
         pnext_clear = info.pRegions[i].pNext == nullptr;
     }
     if (!pnext_clear) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "copy2 pNext not supported (fail closed)";
+        invalidate_recording(cb, "copy2 pNext not supported (fail closed)");
         return;
     }
     std::vector<VkImageResolve> regions(info.regionCount);
@@ -7407,8 +7895,8 @@ VKAPI_ATTR void VKAPI_CALL CmdBeginRendering(VkCommandBuffer commandBuffer,
                                              const VkRenderingInfo* pRenderingInfo) {
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
     if (pRenderingInfo == nullptr || pRenderingInfo->pNext != nullptr) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "begin_rendering with null info or unsupported VkRenderingInfo pNext";
+        invalidate_recording(cb,
+                             "begin_rendering with null info or unsupported VkRenderingInfo pNext");
         return;
     }
     const VkRenderingInfo& ri = *pRenderingInfo;
@@ -7452,17 +7940,16 @@ VKAPI_ATTR void VKAPI_CALL CmdBeginRendering(VkCommandBuffer commandBuffer,
         push_attachment(*ri.pStencilAttachment);
     }
     if (!ok) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "begin_rendering MSAA resolve / attachment pNext not supported";
+        invalidate_recording(cb, "begin_rendering MSAA resolve / attachment pNext not supported");
         return;
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 VKAPI_ATTR void VKAPI_CALL CmdEndRendering(VkCommandBuffer commandBuffer) {
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
     vkrpc::RecordedCommand c;
     c.kind = "end_rendering";
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdDraw(VkCommandBuffer commandBuffer, std::uint32_t vertexCount,
@@ -7475,7 +7962,7 @@ VKAPI_ATTR void VKAPI_CALL CmdDraw(VkCommandBuffer commandBuffer, std::uint32_t 
     c.instance_count = static_cast<long long>(instanceCount);
     c.first_vertex = static_cast<long long>(firstVertex);
     c.first_instance = static_cast<long long>(firstInstance);
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // (GL/zink): indexed draws. bind_index_buffer args_u64=[buffer, offset],
@@ -7488,7 +7975,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBindIndexBuffer(VkCommandBuffer commandBuffer, VkB
     c.args_u64.push_back(from_handle(buffer));
     c.args_u64.push_back(static_cast<std::uint64_t>(offset));
     c.args_i64.push_back(static_cast<long long>(indexType));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // draw_indexed args_i64=[indexCount, instanceCount, firstIndex, vertexOffset, firstInstance].
@@ -7503,7 +7990,7 @@ VKAPI_ATTR void VKAPI_CALL CmdDrawIndexed(VkCommandBuffer commandBuffer, std::ui
     c.args_i64.push_back(static_cast<long long>(firstIndex));
     c.args_i64.push_back(static_cast<long long>(vertexOffset));
     c.args_i64.push_back(static_cast<long long>(firstInstance));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // Core-1.0 indirect draws. The worker-vocabulary gate prevents a new ICD from sending unknown
@@ -7514,8 +8001,7 @@ void record_core_indirect_draw(VkCommandBuffer commandBuffer, VkBuffer buffer, V
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
     const char* why = "";
     if (!vkr::icd_subset::core_indirect_worker_ok(cb->worker_core_indirect_draw, &why)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
     const std::uint64_t handle = from_handle(buffer);
@@ -7533,13 +8019,12 @@ void record_core_indirect_draw(VkCommandBuffer commandBuffer, VkBuffer buffer, V
     if (!vkr::icd_subset::draw_indirect_ok(live, bound, info.usage, info.size, offset, drawCount,
                                            stride, indexed, cb->multi_draw_indirect_enabled,
                                            &why)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
-    cb->recording.push_back(vkrpc::make_core_indirect_draw_command(
-        handle, static_cast<std::uint64_t>(offset), drawCount, stride, indexed,
-        cb->worker_core_indirect_draw_scalar_payload));
+    append_recorded_command(cb, vkrpc::make_core_indirect_draw_command(
+                                    handle, static_cast<std::uint64_t>(offset), drawCount, stride,
+                                    indexed, cb->worker_core_indirect_draw_scalar_payload));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
@@ -7565,8 +8050,7 @@ void record_core_indirect_count_draw(VkCommandBuffer commandBuffer, VkBuffer buf
     const char* why = "";
     if (!vkr::icd_subset::core_indirect_count_worker_ok(cb->worker_core_indirect_draw_count,
                                                         &why)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
     const std::uint64_t handle = from_handle(buffer);
@@ -7592,13 +8076,13 @@ void record_core_indirect_count_draw(VkCommandBuffer commandBuffer, VkBuffer buf
             cb->draw_indirect_count_enabled, live, live && info.memory != 0, info.usage, info.size,
             count_live, count_live && count_info.memory != 0, count_info.usage, count_info.size,
             offset, countBufferOffset, maxDrawCount, stride, indexed, &why)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
-    cb->recording.push_back(vkrpc::make_core_indirect_count_draw_command(
-        handle, static_cast<std::uint64_t>(offset), count_handle,
-        static_cast<std::uint64_t>(countBufferOffset), maxDrawCount, stride, indexed));
+    append_recorded_command(cb, vkrpc::make_core_indirect_count_draw_command(
+                                    handle, static_cast<std::uint64_t>(offset), count_handle,
+                                    static_cast<std::uint64_t>(countBufferOffset), maxDrawCount,
+                                    stride, indexed));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer,
@@ -7644,7 +8128,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBindTransformFeedbackBuffersEXT(
             c.args_u64.push_back(static_cast<std::uint64_t>(pSizes[i]));
         }
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // begin/end_transform_feedback share one payload shape: args_i64=[firstCounterBuffer,
@@ -7669,7 +8153,7 @@ void record_transform_feedback_scope(VkCommandBuffer commandBuffer, const char* 
             c.args_u64.push_back(static_cast<std::uint64_t>(pCounterBufferOffsets[i]));
         }
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
@@ -7707,7 +8191,7 @@ VKAPI_ATTR void VKAPI_CALL CmdDrawIndirectByteCountEXT(
     c.args_i64.push_back(static_cast<long long>(counterBufferOffset));
     c.args_i64.push_back(static_cast<long long>(counterOffset));
     c.args_i64.push_back(static_cast<long long>(vertexStride));
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // begin_conditional_rendering (GL 3.0 glBeginConditionalRender): args_u64=[buffer];
@@ -7725,14 +8209,14 @@ VKAPI_ATTR void VKAPI_CALL CmdBeginConditionalRenderingEXT(
         c.args_i64.push_back(static_cast<long long>(pConditionalRenderingBegin->offset));
         c.args_i64.push_back(static_cast<long long>(pConditionalRenderingBegin->flags));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdEndConditionalRenderingEXT(VkCommandBuffer commandBuffer) {
     auto* cb = reinterpret_cast<CommandBufferImpl*>(commandBuffer);
     vkrpc::RecordedCommand c;
     c.kind = "end_conditional_rendering";
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 // (GL/zink): push constants. desc_layout = pipeline layout; args_i64=[stageFlags, offset,
@@ -7750,7 +8234,7 @@ VKAPI_ATTR void VKAPI_CALL CmdPushConstants(VkCommandBuffer commandBuffer, VkPip
     if (pValues != nullptr && size > 0) {
         c.args_blob.assign(static_cast<const char*>(pValues), size);
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdBindVertexBuffers(VkCommandBuffer commandBuffer,
@@ -7762,8 +8246,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBindVertexBuffers(VkCommandBuffer commandBuffer,
     const char* why = "";
     if (!vkr::icd_subset::bind_vertex_buffers_ok(firstBinding, bindingCount, pBuffers, pOffsets,
                                                  &why)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
     vkrpc::RecordedCommand c;
@@ -7773,7 +8256,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBindVertexBuffers(VkCommandBuffer commandBuffer,
         c.vertex_buffers.push_back(from_handle(pBuffers[i]));
         c.vertex_buffer_offsets.push_back(static_cast<std::uint64_t>(pOffsets[i]));
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
@@ -7787,13 +8270,11 @@ VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
     const char* why = "";
     if (!vkr::icd_subset::bind_descriptor_sets_ok(bindPoint, firstSet, descriptorSetCount,
                                                   dynamicOffsetCount, &why)) {
-        cb->local_invalid = true;
-        cb->invalid_reason = why;
+        invalidate_recording(cb, why);
         return;
     }
     if (pDescriptorSets == nullptr) {
-        cb->local_invalid = true;
-        cb->invalid_reason = "bind_descriptor_sets has a null descriptor-set array";
+        invalidate_recording(cb, "bind_descriptor_sets has a null descriptor-set array");
         return;
     }
     // (GL/zink): faithful forwarding. args_i64[0] = bindPoint; args_u64 = the dynamic
@@ -7812,7 +8293,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
             c.args_u64.push_back(static_cast<std::uint64_t>(pDynamicOffsets[i]));
         }
     }
-    cb->recording.push_back(std::move(c));
+    append_recorded_command(cb, std::move(c));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer commandBuffer) {
@@ -7822,11 +8303,13 @@ VKAPI_ATTR VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer commandBuffer) {
     // than forward a silently-canonicalized stream.
     if (cb->local_invalid) {
         std::fprintf(stderr, "vkrelay2-icd: command buffer rejected -- %s\n", cb->invalid_reason);
+        (void) retire_recording_locked(cb);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     try {
         vkrpc::RecordCommandBufferRequest req;
         req.command_buffer = cb->worker;
+        req.recording_generation = cb->recording_generation;
         req.one_time_submit = cb->one_time_submit;
         req.commands = cb->recording;
         const std::uint32_t request_id = next_id();
@@ -7845,9 +8328,14 @@ VKAPI_ATTR VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer commandBuffer) {
         if (!r.ok) {
             std::fprintf(stderr, "vkrelay2-icd: record_command_buffer rejected -- %s\n",
                          r.reason.c_str());
+            (void) retire_recording_locked(cb);
+        } else {
+            cb->recording_open = false;
+            cb->executable = true;
         }
         return r.ok ? VK_SUCCESS : fault();
     } catch (const std::exception&) {
+        (void) retire_recording_locked(cb);
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
 }

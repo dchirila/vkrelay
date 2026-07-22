@@ -38,6 +38,7 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
     RealVulkanBackend(std::string gpu_name, std::string gpu_luid, bool gpu_required,
                       const display::DisplayLayout* display_layout = nullptr);
     ~RealVulkanBackend() override; // destroys any instances/devices still live
+    vkrpc::LifetimeLeaseStats lifetime_lease_stats() const override;
 
     // Implemented against the real loader: capability negotiation, the
     // instance/device creation spine, and real device queues.
@@ -157,6 +158,8 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
     // synthesis); wait_for_fences reports VK_TIMEOUT honestly.
     vkrpc::StatusResponse
     record_command_buffer(const vkrpc::RecordCommandBufferRequest& req) override;
+    vkrpc::StatusResponse retire_command_buffer_recordings(
+        const vkrpc::RetireCommandBufferRecordingsRequest& req) override;
     vkrpc::QueueSubmitResponse queue_submit(const vkrpc::QueueSubmitRequest& req) override;
     vkrpc::QueueSubmitResponse queue_submit2(const vkrpc::QueueSubmit2Request& req) override;
     vkrpc::StatusResponse reset_fences(const vkrpc::ResetFencesRequest& req) override;
@@ -228,6 +231,7 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
         const vkrpc::GetPhysicalDeviceMemoryPropertiesRequest& req) override;
     vkrpc::CreateBufferResponse create_buffer(const vkrpc::CreateBufferRequest& req) override;
     vkrpc::StatusResponse destroy_buffer(const vkrpc::HandleRequest& req) override;
+    vkrpc::StatusResponse destroy_buffer_leased(const vkrpc::LeasedDestroyRequest& req) override;
     vkrpc::StatusResponse bind_buffer_memory(const vkrpc::BindBufferMemoryRequest& req) override;
     // (bufferDeviceAddress): the real host VkDeviceAddress verbatim, via the core PFN
     // resolved at create_device. Fail-closed on a device without the feature, an unknown/unbound
@@ -278,6 +282,7 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
         const vkrpc::GetPhysicalDeviceCapabilityChainRequest& req) override;
     vkrpc::CreateImageResponse create_image(const vkrpc::CreateImageRequest& req) override;
     vkrpc::StatusResponse destroy_image(const vkrpc::HandleRequest& req) override;
+    vkrpc::StatusResponse destroy_image_leased(const vkrpc::LeasedDestroyRequest& req) override;
     vkrpc::StatusResponse bind_image_memory(const vkrpc::BindImageMemoryRequest& req) override;
 
     // Sampler + combined-image-sampler + texture upload : the bounded
@@ -801,6 +806,7 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
         VkCommandBuffer vk = VK_NULL_HANDLE;
         std::uint64_t device = 0;
         std::uint64_t pool = 0;
+        std::uint64_t recording_generation = 0;
         bool recorded = false;
         std::set<std::uint64_t> referenced_surfaces;   // queue_submit locks their slots
         std::set<std::uint64_t> referenced_swapchains; // invalidated when one is destroyed
@@ -858,12 +864,20 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
                                  std::string& err);
     // Invalidates any recorded command buffer that baked in `handle` (a draw object being
     // destroyed), so a later queue_submit refuses it rather than replaying a freed host handle.
-    void invalidate_cbs_referencing(std::uint64_t handle);
+    using RecordingLeaseKey = std::pair<std::uint64_t, std::uint64_t>;
+    void
+    invalidate_cbs_referencing(std::uint64_t handle,
+                               const std::set<RecordingLeaseKey>* preserved_recordings = nullptr);
+    void release_recording_lease(const RecordingLeaseKey& key);
+    void release_recording_leases_for_command_buffer(std::uint64_t command_buffer,
+                                                     std::uint64_t before_generation = ~0ull);
+    void release_retired_memory_if_unused(std::uint64_t memory);
     // The CB -> set -> {buffer | sampler | image-view} destroy consult (for buffers,
     // extended to sampler/image-view referents). Marks any descriptor slot currently
     // referencing `resource` dangling (uninitialized) and invalidates any recorded command buffer
     // that baked the owning set. Called by destroy_buffer / destroy_image_view / destroy_sampler.
-    void dangle_sets_referencing(std::uint64_t resource);
+    void dangle_sets_referencing(std::uint64_t resource,
+                                 const std::set<RecordingLeaseKey>* preserved_recordings = nullptr);
     // True if `set` (on `device`) is draw-ready: every slot
     // its layout requires is initialized and still references a live, same-device resource of the
     // binding's type (UNIFORM_BUFFER buffer, or COMBINED_IMAGE_SAMPLER sampler + view over a
@@ -1063,6 +1077,19 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
     std::map<std::uint64_t, RealPipelineLayout> pipeline_layouts_;
     std::map<std::uint64_t, RealPipeline> pipelines_;
     std::map<std::uint64_t, RealBuffer> buffers_; // buffer table
+    struct RetiredImage {
+        RealImage image;
+        std::set<RecordingLeaseKey> leases;
+    };
+    struct RetiredBuffer {
+        RealBuffer buffer;
+        std::set<RecordingLeaseKey> leases;
+    };
+    std::map<std::uint64_t, RetiredImage> retired_images_;
+    std::map<std::uint64_t, RetiredBuffer> retired_buffers_;
+    std::set<std::uint64_t> retired_memories_;
+    std::size_t recording_resource_lease_edges_ = 0;
+    std::size_t recording_resource_capacity_rejections_ = 0;
     // Descriptor surface tables.
     std::map<std::uint64_t, RealDescriptorSetLayout> descriptor_set_layouts_;
     std::map<std::uint64_t, RealDescriptorPool> descriptor_pools_;

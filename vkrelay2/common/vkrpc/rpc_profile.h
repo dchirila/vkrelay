@@ -223,6 +223,12 @@ inline const char* profile_op_name_cstr(std::uint32_t op) {
         return "get_device_buffer_memory_requirements";
     case RpcOp::GetDeviceImageMemoryRequirements:
         return "get_device_image_memory_requirements";
+    case RpcOp::DestroyImageLeased:
+        return "destroy_image_leased";
+    case RpcOp::DestroyBufferLeased:
+        return "destroy_buffer_leased";
+    case RpcOp::RetireCommandBufferRecordings:
+        return "retire_command_buffer_recordings";
     }
     return nullptr; // the retired gap + anything future/unknown
 }

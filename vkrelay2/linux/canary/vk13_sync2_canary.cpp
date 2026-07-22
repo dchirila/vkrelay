@@ -40,6 +40,7 @@ namespace {
 constexpr std::uint32_t kElems = 4096; // / local_size 64 = 64 groups
 constexpr std::uint32_t kScale = 3;
 constexpr std::uint32_t kBias = 7;
+constexpr std::uint32_t kLeaseElems = 64;
 
 bool has_ext(const std::vector<VkExtensionProperties>& exts, const char* name) {
     for (const auto& e : exts) {
@@ -167,9 +168,12 @@ int main() {
     VkFence fence = VK_NULL_HANDLE;
     VkEvent event = VK_NULL_HANDLE;
     VkBuffer buf_in = VK_NULL_HANDLE, buf_out = VK_NULL_HANDLE, buf_ubo = VK_NULL_HANDLE,
-             buf_read = VK_NULL_HANDLE;
+             buf_read = VK_NULL_HANDLE, buf_lease = VK_NULL_HANDLE, buf_lease_read = VK_NULL_HANDLE;
     VkDeviceMemory mem_in = VK_NULL_HANDLE, mem_out = VK_NULL_HANDLE, mem_ubo = VK_NULL_HANDLE,
-                   mem_read = VK_NULL_HANDLE;
+                   mem_read = VK_NULL_HANDLE, mem_lease = VK_NULL_HANDLE,
+                   mem_lease_read = VK_NULL_HANDLE;
+    VkImage image_lease = VK_NULL_HANDLE;
+    VkDeviceMemory mem_image_lease = VK_NULL_HANDLE;
     PFN_vkCmdPipelineBarrier2KHR pfn_barrier2 = nullptr;
     PFN_vkCmdWriteTimestamp2KHR pfn_ts2 = nullptr;
     PFN_vkQueueSubmit2KHR pfn_submit2 = nullptr;
@@ -227,6 +231,14 @@ int main() {
             }
             return UINT32_MAX;
         };
+        auto pick_any = [&](std::uint32_t bits) {
+            for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+                if ((bits & (1u << i)) != 0) {
+                    return i;
+                }
+            }
+            return UINT32_MAX;
+        };
         auto make_buffer = [&](VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer* buf,
                                VkDeviceMemory* mem) {
             VkBufferCreateInfo bci{};
@@ -258,8 +270,41 @@ int main() {
                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                          &buf_out, &mem_out) ||
             !make_buffer(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &buf_ubo, &mem_ubo) ||
-            !make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buf_read, &mem_read)) {
+            !make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buf_read, &mem_read) ||
+            !make_buffer(kLeaseElems * sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         &buf_lease, &mem_lease) ||
+            !make_buffer(kLeaseElems * sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         &buf_lease_read, &mem_lease_read)) {
             std::printf("VK13-SYNC2-CANARY: FAIL (buffer/memory setup)\n");
+            goto teardown;
+        }
+        VkImageCreateInfo image_ci{};
+        image_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        image_ci.imageType = VK_IMAGE_TYPE_2D;
+        image_ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        image_ci.extent = {1, 1, 1};
+        image_ci.mipLevels = 1;
+        image_ci.arrayLayers = 1;
+        image_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        image_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        image_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(device, &image_ci, nullptr, &image_lease) != VK_SUCCESS) {
+            goto teardown;
+        }
+        VkMemoryRequirements image_mr{};
+        vkGetImageMemoryRequirements(device, image_lease, &image_mr);
+        const std::uint32_t image_memory_type = pick_any(image_mr.memoryTypeBits);
+        if (image_memory_type == UINT32_MAX) {
+            goto teardown;
+        }
+        VkMemoryAllocateInfo image_mai{};
+        image_mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        image_mai.allocationSize = image_mr.size;
+        image_mai.memoryTypeIndex = image_memory_type;
+        if (vkAllocateMemory(device, &image_mai, nullptr, &mem_image_lease) != VK_SUCCESS ||
+            vkBindImageMemory(device, image_lease, mem_image_lease, 0) != VK_SUCCESS) {
             goto teardown;
         }
 
@@ -281,6 +326,20 @@ int main() {
             goto teardown;
         }
         std::memset(read_ptr, 0, bytes); // poison: stale zeros must NOT pass the assert
+        void* lease_ptr = nullptr;
+        if (vkMapMemory(device, mem_lease, 0, VK_WHOLE_SIZE, 0, &lease_ptr) != VK_SUCCESS) {
+            goto teardown;
+        }
+        for (std::uint32_t i = 0; i < kLeaseElems; ++i) {
+            static_cast<std::uint32_t*>(lease_ptr)[i] = 0x5a170000u + i;
+        }
+        vkUnmapMemory(device, mem_lease); // coherent: deliberately no explicit flush
+        void* lease_read_ptr = nullptr;
+        if (vkMapMemory(device, mem_lease_read, 0, VK_WHOLE_SIZE, 0, &lease_read_ptr) !=
+            VK_SUCCESS) {
+            goto teardown;
+        }
+        std::memset(lease_read_ptr, 0, kLeaseElems * sizeof(std::uint32_t));
 
         VkShaderModuleCreateInfo smci{};
         smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -417,8 +476,40 @@ int main() {
         di.memoryBarrierCount = 1;
         di.pMemoryBarriers = &mb;
         pfn_barrier2(cmd, &di);
+        VkImageMemoryBarrier2 image_barrier{};
+        image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        image_barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        image_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        image_barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        image_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        image_barrier.image = image_lease;
+        image_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        image_barrier.subresourceRange.levelCount = 1;
+        image_barrier.subresourceRange.layerCount = 1;
+        VkDependencyInfo image_dependency{};
+        image_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        image_dependency.imageMemoryBarrierCount = 1;
+        image_dependency.pImageMemoryBarriers = &image_barrier;
+        pfn_barrier2(cmd, &image_dependency);
         VkBufferCopy region{0, 0, bytes};
         vkCmdCopyBuffer(cmd, buf_out, buf_read, 1, &region);
+        // Lifetime-lease tolerance proof. The source is directly referenced before its guest
+        // destroy; both the buffer and its coherent memory disappear before vkEndCommandBuffer.
+        // The worker must retain the exact generation and the ICD must ship the final dirty bytes
+        // at logical free so the later submit still copies the expected payload.
+        VkBufferCopy lease_region{0, 0, kLeaseElems * sizeof(std::uint32_t)};
+        vkCmdCopyBuffer(cmd, buf_lease, buf_lease_read, 1, &lease_region);
+        vkDestroyBuffer(device, buf_lease, nullptr);
+        buf_lease = VK_NULL_HANDLE;
+        vkFreeMemory(device, mem_lease, nullptr);
+        mem_lease = VK_NULL_HANDLE;
+        vkDestroyImage(device, image_lease, nullptr);
+        image_lease = VK_NULL_HANDLE;
+        vkFreeMemory(device, mem_image_lease, nullptr);
+        mem_image_lease = VK_NULL_HANDLE;
         // vkCmdSetEvent2 (empty dependency) -- the device sets the event; the host reads it after.
         VkDependencyInfo empty_di{};
         empty_di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -469,6 +560,18 @@ int main() {
         }
         std::printf("VK13-SYNC2-CANARY: compute-RAW-across-barrier2 byte-exact (%u values)\n",
                     kElems);
+
+        const auto* lease_words = static_cast<const std::uint32_t*>(lease_read_ptr);
+        for (std::uint32_t i = 0; i < kLeaseElems; ++i) {
+            if (lease_words[i] != 0x5a170000u + i) {
+                std::printf("VK13-SYNC2-CANARY: FAIL (lifetime lease byte %u got=%u want=%u)\n", i,
+                            lease_words[i], 0x5a170000u + i);
+                goto teardown;
+            }
+        }
+        std::printf("VK13-SYNC2-CANARY: recording lifetime lease preserved %u coherent values\n",
+                    kLeaseElems);
+        std::printf("VK13-SYNC2-CANARY: sync2 image lifetime lease survived destroy before End\n");
 
         // --- vkCmdWriteTimestamp2: the query is written (when the queue supports timestamps). ---
         if (timestamps_ok) {
@@ -535,15 +638,21 @@ teardown:
     if (module != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, module, nullptr);
     }
-    for (VkBuffer b : {buf_in, buf_out, buf_ubo, buf_read}) {
+    for (VkBuffer b : {buf_in, buf_out, buf_ubo, buf_read, buf_lease, buf_lease_read}) {
         if (b != VK_NULL_HANDLE) {
             vkDestroyBuffer(device, b, nullptr);
         }
     }
-    for (VkDeviceMemory m : {mem_in, mem_out, mem_ubo, mem_read}) {
+    for (VkDeviceMemory m : {mem_in, mem_out, mem_ubo, mem_read, mem_lease, mem_lease_read}) {
         if (m != VK_NULL_HANDLE) {
             vkFreeMemory(device, m, nullptr);
         }
+    }
+    if (image_lease != VK_NULL_HANDLE) {
+        vkDestroyImage(device, image_lease, nullptr);
+    }
+    if (mem_image_lease != VK_NULL_HANDLE) {
+        vkFreeMemory(device, mem_image_lease, nullptr);
     }
     if (device != VK_NULL_HANDLE) {
         vkDestroyDevice(device, nullptr);

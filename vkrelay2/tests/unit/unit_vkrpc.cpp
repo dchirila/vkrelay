@@ -6790,6 +6790,318 @@ void test_image_command_invalidation_mock() {
                                    std::to_string(img.image) + " (destroy_image)");
 }
 
+void test_recording_resource_leases_mock() {
+    // Additive codecs: generation 0 / absent capability are the legacy spelling.
+    vkrpc::RecordCommandBufferRequest wire_request;
+    wire_request.command_buffer = 7;
+    wire_request.recording_generation = 9;
+    const auto json_request = vkrpc::RecordCommandBufferRequest::from_body(wire_request.to_body());
+    VKR_CHECK_EQ(json_request.recording_generation, 9ull);
+    std::string wire_error;
+    const auto raw_request =
+        vkrpc::RecordCommandBufferRequest::from_wire(wire_request.to_wire(), wire_error);
+    VKR_CHECK(wire_error.empty());
+    VKR_CHECK_EQ(raw_request.recording_generation, 9ull);
+    vkrpc::LeasedDestroyRequest destroy_wire;
+    destroy_wire.handle = 11;
+    destroy_wire.leases = {{7, 9}, {8, 3}};
+    const auto destroy_roundtrip = vkrpc::LeasedDestroyRequest::from_body(destroy_wire.to_body());
+    VKR_CHECK_EQ(destroy_roundtrip.handle, 11ull);
+    VKR_CHECK_EQ(destroy_roundtrip.leases.size(), static_cast<std::size_t>(2));
+    vkrpc::RetireCommandBufferRecordingsRequest retire_wire;
+    retire_wire.recordings = destroy_wire.leases;
+    VKR_CHECK_EQ(vkrpc::RetireCommandBufferRecordingsRequest::from_body(retire_wire.to_body())
+                     .recordings.size(),
+                 static_cast<std::size_t>(2));
+    vkrpc::DeviceCaps lease_caps;
+    lease_caps.recording_resource_leases_v1 = 1;
+    VKR_CHECK_EQ(vkrpc::DeviceCaps::from_body(lease_caps.to_body()).recording_resource_leases_v1,
+                 1u);
+    VKR_CHECK_EQ(
+        vkrpc::DeviceCaps::from_body(json::Value::make_object()).recording_resource_leases_v1, 0u);
+
+    const std::vector<protocol::GpuDevice> devices = protocol::probe_mocked();
+    vkrpc::MockVulkanBackend backend(devices.front().name);
+    const auto instance = backend.create_instance({});
+    vkrpc::EnumeratePhysicalDevicesRequest enumerate;
+    enumerate.instance = instance.instance;
+    const std::uint64_t physical =
+        backend.enumerate_physical_devices(enumerate).devices.front().handle;
+    vkrpc::CreateDeviceRequest create_device;
+    create_device.instance = instance.instance;
+    create_device.physical_device = physical;
+    const auto device = backend.create_device(create_device);
+    VKR_CHECK(device.ok);
+    vkrpc::CreateCommandPoolRequest create_pool;
+    create_pool.device = device.device;
+    create_pool.queue_family_index = device.queue_family_index;
+    const std::uint64_t pool = backend.create_command_pool(create_pool).command_pool;
+    vkrpc::AllocateCommandBuffersRequest allocate_cbs;
+    allocate_cbs.command_pool = pool;
+    allocate_cbs.count = 2;
+    const auto cbs = backend.allocate_command_buffers(allocate_cbs).command_buffers;
+    vkrpc::GetDeviceQueueRequest get_queue;
+    get_queue.device = device.device;
+    get_queue.queue_family_index = device.queue_family_index;
+    get_queue.queue_index = 0;
+    const std::uint64_t queue = backend.get_device_queue(get_queue).queue;
+
+    vkrpc::CreateImageRequest create_image;
+    create_image.device = device.device;
+    create_image.image_type = vkrpc::kImageType2D;
+    create_image.format = vkrpc::kFormatR8G8B8A8Unorm;
+    create_image.width = 16;
+    create_image.height = 16;
+    create_image.depth = 1;
+    create_image.mip_levels = 1;
+    create_image.array_layers = 1;
+    create_image.samples = 1;
+    create_image.tiling = vkrpc::kImageTilingOptimal;
+    create_image.usage = vkrpc::kImageUsageTransferDst;
+    create_image.sharing_mode = 0;
+    create_image.initial_layout = 0;
+    const auto image = backend.create_image(create_image);
+    VKR_CHECK(image.ok);
+    vkrpc::AllocateMemoryRequest allocate_memory;
+    allocate_memory.device = device.device;
+    allocate_memory.allocation_size = image.mem_size;
+    allocate_memory.memory_type_index = 0;
+    const auto memory = backend.allocate_memory(allocate_memory);
+    VKR_CHECK(memory.ok);
+    VKR_CHECK(backend.bind_image_memory({image.image, memory.memory, 0}).ok);
+
+    // The leased opcode preserves the ordinary destroy's parent/child authority at the original
+    // wire position: a live view rejects the image destroy and no retired state is created.
+    const auto guarded_image = backend.create_image(create_image);
+    VKR_CHECK(guarded_image.ok);
+    allocate_memory.allocation_size = guarded_image.mem_size;
+    const auto guarded_memory = backend.allocate_memory(allocate_memory);
+    VKR_CHECK(guarded_memory.ok);
+    VKR_CHECK(backend.bind_image_memory({guarded_image.image, guarded_memory.memory, 0}).ok);
+    vkrpc::CreateImageViewRequest guarded_view_request;
+    guarded_view_request.image = guarded_image.image;
+    guarded_view_request.view_type = 1;
+    guarded_view_request.format = vkrpc::kFormatR8G8B8A8Unorm;
+    guarded_view_request.swizzle_r = guarded_view_request.swizzle_g =
+        guarded_view_request.swizzle_b = guarded_view_request.swizzle_a = 0;
+    guarded_view_request.aspect = vkrpc::kImageAspectColor;
+    guarded_view_request.base_mip_level = 0;
+    guarded_view_request.level_count = 1;
+    guarded_view_request.base_array_layer = 0;
+    guarded_view_request.layer_count = 1;
+    const auto guarded_view = backend.create_image_view(guarded_view_request);
+    VKR_CHECK(guarded_view.ok);
+    vkrpc::LeasedDestroyRequest guarded_destroy;
+    guarded_destroy.handle = guarded_image.image;
+    guarded_destroy.leases = {{cbs[0], 1}};
+    const vkrpc::StatusResponse guarded_rejection = backend.destroy_image_leased(guarded_destroy);
+    VKR_CHECK(!guarded_rejection.ok);
+    VKR_CHECK_EQ(guarded_rejection.reason, "image has live image views; destroy them first");
+    VKR_CHECK_EQ(backend.lifetime_lease_stats().retired_resources, static_cast<std::size_t>(0));
+    VKR_CHECK(backend.destroy_image_view({guarded_view.image_view}).ok);
+    VKR_CHECK(backend.destroy_image({guarded_image.image}).ok);
+    VKR_CHECK(backend.free_memory({guarded_memory.memory}).ok);
+
+    vkrpc::RecordedCommand barrier;
+    barrier.kind = "pipeline_barrier";
+    barrier.image = image.image;
+    barrier.old_layout = 0;
+    barrier.new_layout = 7;
+    barrier.src_stage = 1;
+    barrier.dst_stage = 0x1000;
+    barrier.src_access = 0;
+    barrier.dst_access = 0;
+    barrier.aspect = vkrpc::kImageAspectColor;
+    barrier.barrier_base_mip = 0;
+    barrier.barrier_level_count = 1;
+    barrier.barrier_base_layer = 0;
+    barrier.barrier_layer_count = 1;
+    vkrpc::RecordCommandBufferRequest recording;
+    recording.command_buffer = cbs[0];
+    recording.recording_generation = 1;
+    recording.commands = {barrier};
+
+    // The ICD announces the exact not-yet-delivered generation at the destroy's original wire
+    // position. Only that key can resolve the logically retired image afterward.
+    vkrpc::LeasedDestroyRequest leased_destroy;
+    leased_destroy.handle = image.image;
+    leased_destroy.leases = {{cbs[0], 1}};
+    vkrpc::LeasedDestroyRequest skipped_generation = leased_destroy;
+    skipped_generation.leases = {{cbs[0], 3}};
+    VKR_CHECK(!backend.destroy_image_leased(skipped_generation).ok);
+    VKR_CHECK(backend.destroy_image_leased(leased_destroy).ok);
+    VKR_CHECK(backend.record_command_buffer(recording).ok);
+    vkrpc::QueueSubmitRequest submit;
+    submit.queue = queue;
+    submit.command_buffers = {cbs[0]};
+    VKR_CHECK(backend.queue_submit(submit).ok);
+
+    // The object is gone from the ordinary live registry at the destroy's wire position.
+    vkrpc::CreateImageViewRequest view;
+    view.image = image.image;
+    view.view_type = 1;
+    view.format = vkrpc::kFormatR8G8B8A8Unorm;
+    view.swizzle_r = view.swizzle_g = view.swizzle_b = view.swizzle_a = 0;
+    view.aspect = vkrpc::kImageAspectColor;
+    view.base_mip_level = 0;
+    view.level_count = 1;
+    view.base_array_layer = 0;
+    view.layer_count = 1;
+    VKR_CHECK(!backend.create_image_view(view).ok);
+    vkrpc::RecordCommandBufferRequest wrong_generation = recording;
+    wrong_generation.command_buffer = cbs[1];
+    VKR_CHECK(!backend.record_command_buffer(wrong_generation).ok);
+
+    // Free is logically accepted but physically retained behind the image. Retirement releases
+    // image then allocation; both handles are unavailable immediately and remain unavailable.
+    VKR_CHECK(backend.free_memory({memory.memory}).ok);
+    VKR_CHECK(!backend.bind_image_memory({image.image, memory.memory, 0}).ok);
+    vkrpc::RetireCommandBufferRecordingsRequest retire;
+    retire.recordings = {{cbs[0], 1}};
+    VKR_CHECK(backend.retire_command_buffer_recordings(retire).ok);
+    const vkrpc::StatusResponse freed_again = backend.free_memory({memory.memory});
+    VKR_CHECK(!freed_again.ok);
+    VKR_CHECK_EQ(freed_again.reason, "unknown handle for this object type");
+    VKR_CHECK(!backend.record_command_buffer(recording).ok);
+    recording.recording_generation = 2;
+    VKR_CHECK(!backend.record_command_buffer(recording).ok);
+
+    // Buffer twin: a generation recorded while live remains submittable after leased destroy.
+    vkrpc::CreateBufferRequest create_buffer;
+    create_buffer.device = device.device;
+    create_buffer.size = 64;
+    create_buffer.usage = vkrpc::kBufferUsageVertexBuffer;
+    create_buffer.sharing_mode = 0;
+    const auto buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(buffer.ok);
+    allocate_memory.allocation_size = buffer.mem_size;
+    allocate_memory.memory_type_index = 1;
+    const auto buffer_memory = backend.allocate_memory(allocate_memory);
+    VKR_CHECK(buffer_memory.ok);
+    VKR_CHECK(backend.bind_buffer_memory({buffer.buffer, buffer_memory.memory, 0}).ok);
+    vkrpc::RecordedCommand bind;
+    bind.kind = "bind_vertex_buffers";
+    bind.first_binding = 0;
+    bind.vertex_buffers = {buffer.buffer};
+    bind.vertex_buffer_offsets = {0};
+    vkrpc::RecordCommandBufferRequest buffer_recording;
+    buffer_recording.command_buffer = cbs[1];
+    buffer_recording.recording_generation = 1;
+    buffer_recording.commands = {bind};
+    VKR_CHECK(backend.record_command_buffer(buffer_recording).ok);
+    vkrpc::LeasedDestroyRequest buffer_destroy;
+    buffer_destroy.handle = buffer.buffer;
+    buffer_destroy.leases = {{cbs[1], 1}};
+    VKR_CHECK(backend.destroy_buffer_leased(buffer_destroy).ok);
+    submit.command_buffers = {cbs[1]};
+    VKR_CHECK(backend.queue_submit(submit).ok);
+    retire.recordings = {{cbs[1], 1}};
+    VKR_CHECK(backend.retire_command_buffer_recordings(retire).ok);
+    VKR_CHECK(backend.free_memory({buffer_memory.memory}).ok);
+    const vkrpc::LifetimeLeaseStats lease_stats = backend.lifetime_lease_stats();
+    VKR_CHECK_EQ(lease_stats.retired_resources, static_cast<std::size_t>(0));
+    VKR_CHECK_EQ(lease_stats.retired_memories, static_cast<std::size_t>(0));
+    VKR_CHECK_EQ(lease_stats.lease_edges, static_cast<std::size_t>(0));
+    VKR_CHECK_EQ(lease_stats.capacity_rejections, static_cast<std::size_t>(0));
+
+    // Per-device retained-resource cap: rejection is atomic and the exact pending generation can
+    // release the whole bounded set. Keep this one loop terse; it is a state-machine capacity pin,
+    // not 4096 independent behavioral assertions.
+    vkrpc::LeasedDestroyRequest bounded_destroy;
+    bounded_destroy.leases = {{cbs[0], 2}};
+    for (std::size_t i = 0; i < vkrpc::kMaxRetiredRecordingResourcesPerDevice; ++i) {
+        const auto retained = backend.create_buffer(create_buffer);
+        if (!retained.ok) {
+            VKR_CHECK(false);
+            break;
+        }
+        bounded_destroy.handle = retained.buffer;
+        if (!backend.destroy_buffer_leased(bounded_destroy).ok) {
+            VKR_CHECK(false);
+            break;
+        }
+    }
+    const vkrpc::LifetimeLeaseStats at_capacity = backend.lifetime_lease_stats();
+    VKR_CHECK_EQ(at_capacity.retired_resources, vkrpc::kMaxRetiredRecordingResourcesPerDevice);
+    VKR_CHECK_EQ(at_capacity.lease_edges, vkrpc::kMaxRetiredRecordingResourcesPerDevice);
+    const auto overflow_buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(overflow_buffer.ok);
+    bounded_destroy.handle = overflow_buffer.buffer;
+    const vkrpc::StatusResponse overflow = backend.destroy_buffer_leased(bounded_destroy);
+    VKR_CHECK(!overflow.ok);
+    VKR_CHECK_EQ(overflow.reason, "recording resource lease capacity exceeded");
+    const vkrpc::LifetimeLeaseStats after_overflow = backend.lifetime_lease_stats();
+    VKR_CHECK_EQ(after_overflow.retired_resources, at_capacity.retired_resources);
+    VKR_CHECK_EQ(after_overflow.lease_edges, at_capacity.lease_edges);
+    VKR_CHECK_EQ(after_overflow.capacity_rejections, static_cast<std::size_t>(1));
+    VKR_CHECK(backend.destroy_buffer({overflow_buffer.buffer}).ok);
+    retire.recordings = {{cbs[0], 2}};
+    VKR_CHECK(backend.retire_command_buffer_recordings(retire).ok);
+    const vkrpc::LifetimeLeaseStats after_capacity_release = backend.lifetime_lease_stats();
+    VKR_CHECK_EQ(after_capacity_release.retired_resources, static_cast<std::size_t>(0));
+    VKR_CHECK_EQ(after_capacity_release.lease_edges, static_cast<std::size_t>(0));
+
+    // Re-recording a later generation retires leases owned by the replaced generation.
+    const auto rerecord_buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(rerecord_buffer.ok);
+    bounded_destroy.handle = rerecord_buffer.buffer;
+    VKR_CHECK(backend.destroy_buffer_leased(bounded_destroy).ok); // pending generation 2
+    vkrpc::RecordCommandBufferRequest empty_recording;
+    empty_recording.command_buffer = cbs[0];
+    empty_recording.recording_generation = 2;
+    VKR_CHECK(backend.record_command_buffer(empty_recording).ok);
+    VKR_CHECK_EQ(backend.lifetime_lease_stats().retired_resources, static_cast<std::size_t>(1));
+    empty_recording.recording_generation = 3;
+    VKR_CHECK(backend.record_command_buffer(empty_recording).ok);
+    VKR_CHECK_EQ(backend.lifetime_lease_stats().retired_resources, static_cast<std::size_t>(0));
+
+    // FreeCommandBuffers is a physical retirement boundary.
+    const auto free_cb_buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(free_cb_buffer.ok);
+    vkrpc::LeasedDestroyRequest free_cb_destroy;
+    free_cb_destroy.handle = free_cb_buffer.buffer;
+    free_cb_destroy.leases = {{cbs[1], 2}};
+    VKR_CHECK(backend.destroy_buffer_leased(free_cb_destroy).ok);
+    vkrpc::FreeCommandBuffersRequest free_cb;
+    free_cb.command_pool = pool;
+    free_cb.command_buffers = {cbs[1]};
+    VKR_CHECK(backend.free_command_buffers(free_cb).ok);
+    VKR_CHECK_EQ(backend.lifetime_lease_stats().retired_resources, static_cast<std::size_t>(0));
+
+    // A failed End/record keeps the pending exact lease until the ICD's explicit retirement.
+    allocate_cbs.count = 1;
+    const auto failed_cb = backend.allocate_command_buffers(allocate_cbs).command_buffers.front();
+    const auto failed_buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(failed_buffer.ok);
+    vkrpc::LeasedDestroyRequest failed_destroy;
+    failed_destroy.handle = failed_buffer.buffer;
+    failed_destroy.leases = {{failed_cb, 1}};
+    VKR_CHECK(backend.destroy_buffer_leased(failed_destroy).ok);
+    vkrpc::RecordCommandBufferRequest failed_record;
+    failed_record.command_buffer = failed_cb;
+    failed_record.recording_generation = 1;
+    failed_record.commands = {bind}; // exposed, then a structural validation failure
+    failed_record.commands[0].vertex_buffers = {failed_buffer.buffer};
+    failed_record.commands[0].first_binding = 1;
+    VKR_CHECK(!backend.record_command_buffer(failed_record).ok);
+    VKR_CHECK_EQ(backend.lifetime_lease_stats().retired_resources, static_cast<std::size_t>(1));
+    retire.recordings = {{failed_cb, 1}};
+    VKR_CHECK(backend.retire_command_buffer_recordings(retire).ok);
+    VKR_CHECK_EQ(backend.lifetime_lease_stats().retired_resources, static_cast<std::size_t>(0));
+
+    // DestroyCommandPool implicitly frees every CB and releases even a pending next generation.
+    const auto pool_buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(pool_buffer.ok);
+    vkrpc::LeasedDestroyRequest pool_destroy;
+    pool_destroy.handle = pool_buffer.buffer;
+    pool_destroy.leases = {{failed_cb, 2}};
+    VKR_CHECK(backend.destroy_buffer_leased(pool_destroy).ok);
+    VKR_CHECK(backend.destroy_command_pool({pool}).ok);
+    const vkrpc::LifetimeLeaseStats after_pool_destroy = backend.lifetime_lease_stats();
+    VKR_CHECK_EQ(after_pool_destroy.retired_resources, static_cast<std::size_t>(0));
+    VKR_CHECK_EQ(after_pool_destroy.lease_edges, static_cast<std::size_t>(0));
+}
+
 // Sampler, combined-image-sampler, and texture-upload wire round-trips.
 void test_sampler_cis_wire() {
     // CreateSampler request/response.
@@ -7040,6 +7352,10 @@ void test_combined_image_sampler_mock() {
     cbq.sharing_mode = 0;
     const std::uint64_t ubo = backend.create_buffer(cbq).buffer;
     VKR_CHECK(backend.bind_buffer_memory({ubo, umem, 0}).ok);
+    // A second UBO is also a direct vertex-buffer reference in the lease-overlap pin below.
+    cbq.usage = vkrpc::kBufferUsageUniformBuffer | vkrpc::kBufferUsageVertexBuffer;
+    const std::uint64_t overlap_buffer = backend.create_buffer(cbq).buffer;
+    VKR_CHECK(backend.bind_buffer_memory({overlap_buffer, umem, 256}).ok);
 
     // The 2-binding set layout: 0 = UNIFORM_BUFFER/VERTEX, 1 = COMBINED_IMAGE_SAMPLER/FRAGMENT.
     vkrpc::CreateDescriptorSetLayoutRequest dslr;
@@ -7067,8 +7383,9 @@ void test_combined_image_sampler_mock() {
     const std::uint64_t set = alloc_set();
     const std::uint64_t set_partial = alloc_set(); // UBO-only (proves CIS draw-readiness)
     const std::uint64_t set_neg = alloc_set();     // poison target for the negatives
+    const std::uint64_t set_overlap = alloc_set(); // direct + descriptor lease overlap
 
-    auto write_ubo = [&](std::uint64_t dst) {
+    auto write_ubo = [&](std::uint64_t dst, std::uint64_t buffer) {
         vkrpc::UpdateDescriptorSetsRequest r;
         r.device = dev;
         vkrpc::WriteDescriptorSetDesc w;
@@ -7077,7 +7394,7 @@ void test_combined_image_sampler_mock() {
         w.dst_array_element = 0;
         w.descriptor_type = vkrpc::kDescriptorTypeUniformBuffer;
         w.descriptor_count = 1;
-        w.buffer_infos.push_back({ubo, 0, vkrpc::kVkWholeSize});
+        w.buffer_infos.push_back({buffer, 0, vkrpc::kVkWholeSize});
         r.writes.push_back(w);
         return r;
     };
@@ -7095,12 +7412,17 @@ void test_combined_image_sampler_mock() {
         return r;
     };
     // Good writes to `set` (both bindings).
-    VKR_CHECK(backend.update_descriptor_sets(write_ubo(set)).ok);
+    VKR_CHECK(backend.update_descriptor_sets(write_ubo(set, ubo)).ok);
     VKR_CHECK(backend
                   .update_descriptor_sets(
                       write_cis(set, sampler, tview, vkrpc::kImageLayoutShaderReadOnlyOptimal))
                   .ok);
-    VKR_CHECK(backend.update_descriptor_sets(write_ubo(set_partial)).ok); // CIS left uninitialized
+    VKR_CHECK(backend.update_descriptor_sets(write_ubo(set_partial, ubo)).ok); // CIS uninitialized
+    VKR_CHECK(backend.update_descriptor_sets(write_ubo(set_overlap, overlap_buffer)).ok);
+    VKR_CHECK(backend
+                  .update_descriptor_sets(write_cis(set_overlap, sampler, tview,
+                                                    vkrpc::kImageLayoutShaderReadOnlyOptimal))
+                  .ok);
     // CIS write negatives (each poisons set_neg, re-validated by being unused afterward):
     // the faithful update still rejects a dead sampler / dead view (the resource must exist on the
     // device); image-layout value and write-type-vs-binding-type are the host driver's authority
@@ -7246,9 +7568,11 @@ void test_combined_image_sampler_mock() {
     const std::uint64_t pipe = backend.create_graphics_pipelines(gpr).pipeline;
     VKR_CHECK(pipe != 0);
 
-    auto record_draw = [&](std::uint64_t cmd, std::uint64_t which_set) {
+    auto record_draw = [&](std::uint64_t cmd, std::uint64_t which_set, std::uint64_t generation = 0,
+                           std::uint64_t direct_buffer = 0) {
         vkrpc::RecordCommandBufferRequest rc;
         rc.command_buffer = cmd;
+        rc.recording_generation = generation;
         vkrpc::RecordedCommand begin;
         begin.kind = "begin_render_pass";
         begin.render_pass = rp;
@@ -7275,7 +7599,17 @@ void test_combined_image_sampler_mock() {
         draw.first_instance = 0;
         vkrpc::RecordedCommand end;
         end.kind = "end_render_pass";
-        rc.commands = {begin, bindp, vp, sci, binds, draw, end};
+        rc.commands = {begin, bindp, vp, sci, binds};
+        if (direct_buffer != 0) {
+            vkrpc::RecordedCommand bind_vertex;
+            bind_vertex.kind = "bind_vertex_buffers";
+            bind_vertex.first_binding = 0;
+            bind_vertex.vertex_buffers = {direct_buffer};
+            bind_vertex.vertex_buffer_offsets = {0};
+            rc.commands.push_back(std::move(bind_vertex));
+        }
+        rc.commands.push_back(std::move(draw));
+        rc.commands.push_back(std::move(end));
         return backend.record_command_buffer(rc);
     };
     auto submit = [&](std::uint64_t cmd) {
@@ -7293,6 +7627,22 @@ void test_combined_image_sampler_mock() {
     const std::uint64_t cmd_partial = alloc_cmd();
     VKR_CHECK(
         !record_draw(cmd_partial, set_partial).ok); // CIS slot uninitialized -> not draw-ready
+
+    // Descriptor resources are not independently leased in v1, but an exact generation that also
+    // references the same buffer directly is safe: the retired host buffer remains alive. The set
+    // bookkeeping may dangle for future recordings while this already-recorded generation stays
+    // executable.
+    const std::uint64_t cmd_overlap = alloc_cmd();
+    VKR_CHECK(record_draw(cmd_overlap, set_overlap, 1, overlap_buffer).ok);
+    vkrpc::LeasedDestroyRequest overlap_destroy;
+    overlap_destroy.handle = overlap_buffer;
+    overlap_destroy.leases = {{cmd_overlap, 1}};
+    VKR_CHECK(backend.destroy_buffer_leased(overlap_destroy).ok);
+    VKR_CHECK(submit(cmd_overlap).ok);
+    vkrpc::RetireCommandBufferRecordingsRequest overlap_retire;
+    overlap_retire.recordings = {{cmd_overlap, 1}};
+    VKR_CHECK(backend.retire_command_buffer_recordings(overlap_retire).ok);
+    VKR_CHECK_EQ(backend.lifetime_lease_stats().retired_resources, static_cast<std::size_t>(0));
 
     // Destroy consult -- destroying the bound sampler dangles `set` and invalidates the recorded
     // CB.
@@ -10715,6 +11065,7 @@ int main() {
     test_image_depth_wire();
     test_image_depth_mock();
     test_image_command_invalidation_mock();
+    test_recording_resource_leases_mock();
     test_sampler_cis_wire();
     test_combined_image_sampler_mock();
     test_texture_upload_mock();

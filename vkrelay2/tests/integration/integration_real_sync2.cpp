@@ -136,7 +136,113 @@ int main() {
     VKR_CHECK(ges.ok);
     VKR_CHECK_EQ(ges.result, static_cast<int>(VK_EVENT_SET));
 
-    std::fprintf(stderr, "integration_real_sync2: vkCmdPipelineBarrier2 + vkCmdSetEvent2 + "
-                         "vkQueueSubmit2 all served on the real GPU\n");
+    // Generation-scoped buffer lease: logical destroy happens before the record request reaches
+    // the worker, yet only the pre-announced generation can resolve the retired host buffer.
+    vkrpc::CreateBufferRequest create_buffer;
+    create_buffer.device = cd.device;
+    create_buffer.size = 64;
+    create_buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    create_buffer.sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
+    const auto buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(buffer.ok);
+    vkrpc::GetPhysicalDeviceMemoryPropertiesRequest memory_query;
+    memory_query.physical_device = en.devices.front().handle;
+    const auto memory_properties = backend.get_physical_device_memory_properties(memory_query);
+    VKR_CHECK(memory_properties.ok);
+    int memory_type = -1;
+    for (std::size_t i = 0; i < memory_properties.types.size() && i < 32; ++i) {
+        const std::uint64_t flags = memory_properties.types[i].property_flags;
+        const bool admitted = (flags & VK_MEMORY_PROPERTY_PROTECTED_BIT) == 0 &&
+                              ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 ||
+                               (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0);
+        if (admitted && (buffer.mem_type_bits & (1ull << i)) != 0) {
+            memory_type = static_cast<int>(i);
+            break;
+        }
+    }
+    VKR_CHECK(memory_type >= 0);
+    vkrpc::AllocateMemoryRequest allocate_memory;
+    allocate_memory.device = cd.device;
+    allocate_memory.allocation_size = buffer.mem_size;
+    allocate_memory.memory_type_index = memory_type;
+    const auto memory = backend.allocate_memory(allocate_memory);
+    VKR_CHECK(memory.ok);
+    VKR_CHECK(backend.bind_buffer_memory({buffer.buffer, memory.memory, 0}).ok);
+
+    vkrpc::LeasedDestroyRequest leased_destroy;
+    leased_destroy.handle = buffer.buffer;
+    leased_destroy.leases = {{bufs.command_buffers[0], 1}};
+    VKR_CHECK(backend.destroy_buffer_leased(leased_destroy).ok);
+    vkrpc::RecordCommandBufferRequest leased_record;
+    leased_record.command_buffer = bufs.command_buffers[0];
+    leased_record.recording_generation = 1;
+    vkrpc::RecordedCommand leased_barrier;
+    leased_barrier.kind = "pipeline_barrier2";
+    vkrpc::DependencyInfo2 leased_dependency;
+    vkrpc::BufferMemoryBarrier2 buffer_barrier;
+    buffer_barrier.src_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    buffer_barrier.dst_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    buffer_barrier.src_queue_family = vkrpc::kVkQueueFamilyIgnored;
+    buffer_barrier.dst_queue_family = vkrpc::kVkQueueFamilyIgnored;
+    buffer_barrier.buffer = buffer.buffer;
+    buffer_barrier.offset = 0;
+    buffer_barrier.size = 64;
+    leased_dependency.buffer.push_back(buffer_barrier);
+    leased_barrier.deps2.push_back(leased_dependency);
+    leased_record.commands.push_back(leased_barrier);
+    VKR_CHECK(backend.record_command_buffer(leased_record).ok);
+    vkrpc::QueueSubmit2Request leased_submit;
+    leased_submit.queue = q.queue;
+    vkrpc::SubmitInfo2 leased_info;
+    leased_info.command_buffers = {bufs.command_buffers[0]};
+    leased_submit.submits.push_back(leased_info);
+    VKR_CHECK(backend.queue_submit2(leased_submit).ok);
+    VKR_CHECK(backend.device_wait_idle({cd.device}).ok);
+    vkrpc::RetireCommandBufferRecordingsRequest retire;
+    retire.recordings = {{bufs.command_buffers[0], 1}};
+    VKR_CHECK(backend.retire_command_buffer_recordings(retire).ok);
+    VKR_CHECK(backend.free_memory({memory.memory}).ok);
+
+    // The after-successful-record twin: a leased destroy of the current generation must preserve
+    // its host command buffer and keep it submittable.
+    const auto post_record_buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(post_record_buffer.ok);
+    allocate_memory.allocation_size = post_record_buffer.mem_size;
+    const auto post_record_memory = backend.allocate_memory(allocate_memory);
+    VKR_CHECK(post_record_memory.ok);
+    VKR_CHECK(
+        backend.bind_buffer_memory({post_record_buffer.buffer, post_record_memory.memory, 0}).ok);
+    leased_record.recording_generation = 2;
+    leased_record.commands[0].deps2[0].buffer[0].buffer = post_record_buffer.buffer;
+    VKR_CHECK(backend.record_command_buffer(leased_record).ok);
+    leased_destroy.handle = post_record_buffer.buffer;
+    leased_destroy.leases = {{bufs.command_buffers[0], 2}};
+    VKR_CHECK(backend.destroy_buffer_leased(leased_destroy).ok);
+    VKR_CHECK(backend.queue_submit2(leased_submit).ok);
+    VKR_CHECK(backend.device_wait_idle({cd.device}).ok);
+    retire.recordings = {{bufs.command_buffers[0], 2}};
+    VKR_CHECK(backend.retire_command_buffer_recordings(retire).ok);
+    VKR_CHECK(backend.free_memory({post_record_memory.memory}).ok);
+
+    // Session-abort/device-teardown backstop: deliberately leave one logically retired resource
+    // and allocation behind. RealVulkanBackend's destructor must wait idle, destroy the retired
+    // host buffer (which is absent from the live map), then free its memory before the device.
+    const auto teardown_buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(teardown_buffer.ok);
+    allocate_memory.allocation_size = teardown_buffer.mem_size;
+    const auto teardown_memory = backend.allocate_memory(allocate_memory);
+    VKR_CHECK(teardown_memory.ok);
+    VKR_CHECK(backend.bind_buffer_memory({teardown_buffer.buffer, teardown_memory.memory, 0}).ok);
+    leased_destroy.handle = teardown_buffer.buffer;
+    leased_destroy.leases = {{bufs.command_buffers[0], 3}};
+    VKR_CHECK(backend.destroy_buffer_leased(leased_destroy).ok);
+    VKR_CHECK(backend.free_memory({teardown_memory.memory}).ok);
+    const vkrpc::LifetimeLeaseStats teardown_stats = backend.lifetime_lease_stats();
+    VKR_CHECK_EQ(teardown_stats.retired_resources, static_cast<std::size_t>(1));
+    VKR_CHECK_EQ(teardown_stats.retired_memories, static_cast<std::size_t>(1));
+    VKR_CHECK_EQ(teardown_stats.lease_edges, static_cast<std::size_t>(1));
+
+    std::fprintf(stderr, "integration_real_sync2: sync2 replay/submit and generation-scoped "
+                         "buffer leases all served on the real GPU\n");
     return vkr::test::finish("integration_real_sync2");
 }
