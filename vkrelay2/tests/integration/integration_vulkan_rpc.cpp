@@ -126,6 +126,7 @@ int main(int argc, char** argv) {
         VKR_CHECK_EQ(caps.negotiated_api_major, 1);
         VKR_CHECK_EQ(caps.negotiated_api_minor, 3);
         VKR_CHECK(!caps.device.device_name.empty());
+        VKR_CHECK_EQ(caps.device.pipeline_specialization, 1u);
         if (chosen != nullptr) {
             VKR_CHECK_EQ(caps.device.device_name, chosen->name);
         }
@@ -195,6 +196,33 @@ int main(int argc, char** argv) {
         const vkrpc::CreateDeviceResponse cd = vkrpc::create_device(rpc, 8, cdr);
         VKR_CHECK(cd.ok);
         VKR_CHECK(cd.device != 0);
+
+        // Both specialization raw opcodes cross the live serve loop. The mock rejects these
+        // deliberately incomplete pipeline requests at the object-model layer; an unrecognized
+        // opcode or malformed raw decoder path would instead make the helper throw on RPC status.
+        vkrpc::SpecializationInfoDesc spec;
+        spec.present = 1;
+        spec.map_entries = {{5, 0, 4}};
+        spec.data = std::string("\x2a\0\0\0", 4);
+        vkrpc::CreateGraphicsPipelinesRequest raw_gp;
+        raw_gp.device = cd.device;
+        raw_gp.layout = 0xdead;
+        raw_gp.render_pass = 0xbeef;
+        vkrpc::ShaderStageDesc raw_stage;
+        raw_stage.stage = 1;
+        raw_stage.module = 0xcafe;
+        raw_stage.entry = "main";
+        raw_stage.specialization = spec;
+        raw_gp.stages = {raw_stage};
+        VKR_CHECK(!vkrpc::create_graphics_pipelines_raw(rpc, 80, raw_gp).ok);
+
+        vkrpc::CreateComputePipelinesRequest raw_cp;
+        raw_cp.device = cd.device;
+        raw_cp.layout = 0xdead;
+        raw_cp.shader_module = 0xcafe;
+        raw_cp.entry_point = "main";
+        raw_cp.specialization = spec;
+        VKR_CHECK(!vkrpc::create_compute_pipelines_raw(rpc, 81, raw_cp).ok);
 
         // Selection enforced: a physical device not enumerated from this instance
         // is rejected (body-level !ok; the stream stays usable).

@@ -103,6 +103,11 @@ struct DeviceCaps {
     // Additive: 0 = an older worker, so the ICD masks the feature and extension and rejects the
     // void command locally instead of sending an unknown vocabulary/wire group.
     std::uint32_t core_indirect_draw_count = 0;
+    // Pipeline specialization protocol surface: 1 iff this worker serves BOTH raw pipeline-create
+    // ops, their binary-tail codecs, validation, and graphics/compute backend rebuild paths.
+    // Additive: absent/0 is an old worker, so a newer ICD rejects a non-null
+    // pSpecializationInfo locally and never sends new vocabulary.
+    std::uint32_t pipeline_specialization = 0;
 
     json::Value to_body() const;
     static DeviceCaps from_body(const json::Value& body);
@@ -1732,7 +1737,35 @@ struct CreatePipelineLayoutResponse {
     static CreatePipelineLayoutResponse from_body(const json::Value& body);
 };
 
-// One pipeline shader stage (exactly VERTEX + FRAGMENT, entry "main").
+// VkSpecializationInfo's bounded, Vulkan-free normalized form. `present` distinguishes a null
+// pSpecializationInfo from a legal non-null empty struct. Wide signed fields retain hostile
+// negative / over-u32 wire values until validation proves every narrowing cast.
+constexpr std::size_t kMaxSpecializationMapEntriesPerStage = 256;
+constexpr std::size_t kMaxSpecializationMapEntriesPerRequest = 512;
+constexpr std::size_t kMaxSpecializationDataBytesPerStage = 64u * 1024u;
+constexpr std::size_t kMaxSpecializationDataBytesPerGraphicsRequest = 5u * 64u * 1024u;
+constexpr std::size_t kMaxPipelineEntryPointNameBytes = 4096;
+
+struct SpecializationMapEntryDesc {
+    long long constant_id = -1;
+    long long offset = -1;
+    long long size = -1;
+};
+
+struct SpecializationInfoDesc {
+    int present = 0;
+    std::vector<SpecializationMapEntryDesc> map_entries;
+    std::string data;
+};
+
+// Shared by the ICD after bounded extraction and independently by mock + real workers before
+// mutation/host calls. The input order is shader-stage order. Does not reflect SPIR-V widths or
+// ids; the host driver owns those shader-semantic checks.
+bool pipeline_specialization_ok(const std::vector<const SpecializationInfoDesc*>& infos,
+                                std::size_t max_request_data_bytes, std::string& reason);
+bool pipeline_entry_point_name_ok(const std::string& name, std::string& reason);
+
+// One pipeline shader stage.
 struct ShaderStageDesc {
     int stage = -1;           // VkShaderStageFlagBits (VERTEX / FRAGMENT)
     std::uint64_t module = 0; // a shader module handle
@@ -1743,6 +1776,7 @@ struct ShaderStageDesc {
     // absent). Both additive; the backends gate them on the device's enabled vk13 bits.
     long long stage_flags = 0;
     int required_subgroup_size = 0;
+    SpecializationInfoDesc specialization;
 };
 
 // One vertex-input binding / attribute. is bufferless (zero of each);
@@ -1920,6 +1954,11 @@ struct CreateGraphicsPipelinesRequest {
 
     json::Value to_body() const;
     static CreateGraphicsPipelinesRequest from_body(const json::Value& body);
+    // Raw op body: [u32 json_len LE][legacy request JSON + per-stage specialization metadata]
+    // [stage pData bytes concatenated in stage order]. The legacy JSON codecs intentionally do
+    // not carry specialization.
+    std::string to_wire(std::string& err) const;
+    static CreateGraphicsPipelinesRequest from_wire(const std::string& body, std::string& err);
 };
 
 struct CreateGraphicsPipelinesResponse {
@@ -1933,8 +1972,8 @@ struct CreateGraphicsPipelinesResponse {
 
 // --- Compute pipelines + dispatch ---------------------------------
 // One pipeline per RPC (the graphics shape). The bounded subset: one COMPUTE stage, entry
-// point carried, NO specialization constants / pNext / flags / derivatives (named ICD
-// rejects). `pipeline_cache` rides for shape-symmetry with graphics but is ALWAYS 0 from the
+// point and optional specialization constants carried; no unserved pNext/flags/derivatives.
+// `pipeline_cache` rides for shape-symmetry with graphics but is ALWAYS 0 from the
 // ICD (the app's cache is a local no-op there); backends reject non-zero.
 struct CreateComputePipelinesRequest {
     std::uint64_t device = 0;
@@ -1947,9 +1986,12 @@ struct CreateComputePipelinesRequest {
     // device's enabled vk13 bits at both ends (the ShaderStageDesc fields, compute spelling).
     long long stage_flags = 0;
     int required_subgroup_size = 0;
+    SpecializationInfoDesc specialization;
 
     json::Value to_body() const;
     static CreateComputePipelinesRequest from_body(const json::Value& body);
+    std::string to_wire(std::string& err) const;
+    static CreateComputePipelinesRequest from_wire(const std::string& body, std::string& err);
 };
 
 struct CreateComputePipelinesResponse {
@@ -4247,9 +4289,15 @@ StatusResponse destroy_pipeline_layout(RpcChannel& channel, std::uint32_t reques
 CreateGraphicsPipelinesResponse
 create_graphics_pipelines(RpcChannel& channel, std::uint32_t request_id,
                           const CreateGraphicsPipelinesRequest& req);
+CreateGraphicsPipelinesResponse
+create_graphics_pipelines_raw(RpcChannel& channel, std::uint32_t request_id,
+                              const CreateGraphicsPipelinesRequest& req);
 CreateComputePipelinesResponse create_compute_pipelines(RpcChannel& channel,
                                                         std::uint32_t request_id,
                                                         const CreateComputePipelinesRequest& req);
+CreateComputePipelinesResponse
+create_compute_pipelines_raw(RpcChannel& channel, std::uint32_t request_id,
+                             const CreateComputePipelinesRequest& req);
 StatusResponse destroy_pipeline(RpcChannel& channel, std::uint32_t request_id,
                                 const HandleRequest& req);
 // Host-visible memory + buffers. write_memory_ranges sends a BINARY body

@@ -45,8 +45,8 @@ The current RPC and ICD implementation covers these major families:
   layout;
 - descriptor set layouts, pools, allocation, updates, update-after-bind and variable-count portions
   of descriptor indexing, inline uniform blocks, and layout-support queries;
-- shader modules, pipeline layouts, graphics pipelines, compute pipelines, render passes,
-  render-pass2, framebuffers, and imageless framebuffers;
+- shader modules, pipeline layouts, graphics and compute pipelines with specialization constants,
+  render passes, render-pass2, framebuffers, and imageless framebuffers;
 - vertex/index/indirect buffers, uniform and sampled-image access, push constants, direct and
   indexed draw, core indirect and indexed-indirect draw, Vulkan 1.2 and KHR indirect-count draw,
   dispatch, dispatch indirect, transfers, clears, blits, resolves, and query copy;
@@ -92,6 +92,15 @@ Command admission validates the indirect and count buffers independently, includ
 usage, lifetime, alignment, stride, maximum draw count, and overflow-safe ranges. The worker then
 repeats those checks against its own object table before recording the host command.
 
+### Pipeline specialization capability
+
+Graphics and compute `VkSpecializationInfo` payloads use capability-gated raw pipeline-create RPCs.
+An ICD paired with an older worker continues to use the legacy JSON operations for unspecialized
+pipelines, but rejects any non-null specialization info locally with a named diagnostic instead of
+sending unknown vocabulary or dropping the constants. An older ICD paired with a newer worker
+continues to use the unchanged legacy operations. Upgrade both halves before relying on
+specialization constants.
+
 ## Memory Visibility
 
 The application cannot directly map Windows device memory. For host-visible allocations, the ICD
@@ -126,7 +135,6 @@ The following valid Vulkan shapes are currently rejected rather than approximate
 - more than one exposed queue or unsupported queue-family ownership transfers;
 - secondary command buffers and `vkCmdExecuteCommands`;
 - graphics pipelines that rely on static viewport/scissor state;
-- shader specialization constants;
 - pipeline derivatives;
 - dedicated-allocation `pNext` state;
 - render-pass input, resolve, and preserve attachments outside the currently carried forms;

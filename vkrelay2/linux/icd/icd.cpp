@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -189,6 +190,9 @@ struct DeviceImpl {
     bool multi_draw_indirect_enabled = false;
     bool worker_core_indirect_draw_count = false;
     bool draw_indirect_count_enabled = false;
+    // Both raw pipeline-create ops + specialization validation/rebuild. False for an old worker;
+    // pipeline_stage_shape_ok then preserves the old named local rejection.
+    bool worker_pipeline_specialization = false;
     // descriptorIndexing: the enabled kDIFeature* bits. CreateDevice folds the app's
     // enabled-feature chain into these (served subset only -- an unserved or off-lane enable is
     // FEATURE_NOT_PRESENT), and the per-binding flag admission, UAB pools, and variable-count
@@ -2904,6 +2908,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice,
         dev->multi_draw_indirect_enabled =
             (enabled_feature_bits & vkrpc::kFeatureMultiDrawIndirect) != 0;
         dev->worker_core_indirect_draw_count = pd->caps.core_indirect_draw_count != 0;
+        dev->worker_pipeline_specialization = pd->caps.pipeline_specialization != 0;
         dev->draw_indirect_count_enabled = vkr::icd_policy::indirect_count_device_enabled(
             wants_draw_indirect_count, wants_draw_indirect_count_feature);
         // (bufferDeviceAddress): native lane AND the enabled FEATURE (there is no
@@ -4084,6 +4089,81 @@ void clear_pipeline_feedback(const void* pnext) {
     }
 }
 
+// Bounded Vulkan-pointer extraction for specialization constants. Capability admission happens
+// before this helper, so an old worker is rejected without touching application arrays. Caps and
+// aggregate totals are checked before pointers or payloads, then null/count consistency, then the
+// shared normalized semantic predicate. The C++ layer can prove non-nullness but cannot safely
+// probe arbitrary application pointers beyond the Vulkan valid-usage contract.
+bool extract_pipeline_specializations(
+    const std::vector<const VkSpecializationInfo*>& source,
+    const std::vector<vkrpc::SpecializationInfoDesc*>& destination,
+    std::size_t max_request_data_bytes, std::string& reason) {
+    if (source.size() != destination.size()) {
+        reason = "pipeline specialization source/destination stage count mismatch";
+        return false;
+    }
+    std::size_t total_entries = 0;
+    std::size_t total_data = 0;
+    for (const VkSpecializationInfo* info : source) {
+        if (info == nullptr) {
+            continue;
+        }
+        if (info->mapEntryCount > vkrpc::kMaxSpecializationMapEntriesPerStage) {
+            reason = "pipeline specialization map entry count exceeds per-stage cap";
+            return false;
+        }
+        if (info->dataSize > vkrpc::kMaxSpecializationDataBytesPerStage) {
+            reason = "pipeline specialization data size exceeds per-stage cap";
+            return false;
+        }
+        if (total_entries > std::numeric_limits<std::size_t>::max() - info->mapEntryCount ||
+            total_data > std::numeric_limits<std::size_t>::max() - info->dataSize) {
+            reason = "pipeline specialization request totals overflow";
+            return false;
+        }
+        total_entries += info->mapEntryCount;
+        total_data += info->dataSize;
+    }
+    if (total_entries > vkrpc::kMaxSpecializationMapEntriesPerRequest) {
+        reason = "pipeline specialization map entry count exceeds request cap";
+        return false;
+    }
+    if (total_data > max_request_data_bytes) {
+        reason = "pipeline specialization data size exceeds request cap";
+        return false;
+    }
+    for (const VkSpecializationInfo* info : source) {
+        const char* pointer_reason = "";
+        if (!vkr::icd_subset::pipeline_specialization_pointer_shape_ok(info, &pointer_reason)) {
+            reason = pointer_reason;
+            return false;
+        }
+    }
+
+    std::vector<const vkrpc::SpecializationInfoDesc*> normalized;
+    normalized.reserve(destination.size());
+    for (std::size_t stage = 0; stage < source.size(); ++stage) {
+        vkrpc::SpecializationInfoDesc& out = *destination[stage];
+        out = vkrpc::SpecializationInfoDesc{};
+        const VkSpecializationInfo* info = source[stage];
+        if (info != nullptr) {
+            out.present = 1;
+            out.map_entries.reserve(info->mapEntryCount);
+            for (std::uint32_t i = 0; i < info->mapEntryCount; ++i) {
+                const VkSpecializationMapEntry& entry = info->pMapEntries[i];
+                out.map_entries.push_back({static_cast<long long>(entry.constantID),
+                                           static_cast<long long>(entry.offset),
+                                           static_cast<long long>(entry.size)});
+            }
+            if (info->dataSize != 0) {
+                out.data.assign(static_cast<const char*>(info->pData), info->dataSize);
+            }
+        }
+        normalized.push_back(&out);
+    }
+    return vkrpc::pipeline_specialization_ok(normalized, max_request_data_bytes, reason);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(
     VkDevice device, VkPipelineCache pipelineCache, std::uint32_t createInfoCount,
     const VkGraphicsPipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks*,
@@ -4109,7 +4189,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(
                 dev->vk13_device, dev->vertex_attr_divisor_enabled,
                 dev->transform_feedback_enabled && dev->geometry_streams_feature_enabled &&
                     dev->worker_rasterization_stream,
-                &why)) {
+                &why, dev->worker_pipeline_specialization)) {
             std::fprintf(stderr, "vkrelay2-icd: rejecting graphics pipeline -- %s\n", why);
             return VK_ERROR_INITIALIZATION_FAILED;
         }
@@ -4131,7 +4211,14 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(
         // demo) supplies one.
         (void) pipelineCache;
         req.pipeline_cache = 0;
+        req.stages.reserve(ci.stageCount);
         for (std::uint32_t i = 0; i < ci.stageCount; ++i) {
+            if (ci.pStages[i].pName == nullptr ||
+                std::strlen(ci.pStages[i].pName) > vkrpc::kMaxPipelineEntryPointNameBytes) {
+                std::fprintf(stderr, "vkrelay2-icd: rejecting graphics pipeline -- pipeline stage "
+                                     "entry-point name is null or exceeds 4096-byte cap\n");
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
             vkrpc::ShaderStageDesc s;
             s.stage = static_cast<int>(ci.pStages[i].stage);
             s.module = from_handle(ci.pStages[i].module);
@@ -4151,6 +4238,24 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(
                 }
             }
             req.stages.push_back(std::move(s));
+        }
+        {
+            std::vector<const VkSpecializationInfo*> source;
+            std::vector<vkrpc::SpecializationInfoDesc*> destination;
+            source.reserve(ci.stageCount);
+            destination.reserve(req.stages.size());
+            for (std::uint32_t i = 0; i < ci.stageCount; ++i) {
+                source.push_back(ci.pStages[i].pSpecializationInfo);
+                destination.push_back(&req.stages[i].specialization);
+            }
+            std::string specialization_why;
+            if (!extract_pipeline_specializations(
+                    source, destination, vkrpc::kMaxSpecializationDataBytesPerGraphicsRequest,
+                    specialization_why)) {
+                std::fprintf(stderr, "vkrelay2-icd: rejecting graphics pipeline -- %s\n",
+                             specialization_why.c_str());
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
         }
         if (ci.pInputAssemblyState != nullptr) {
             req.topology = static_cast<int>(ci.pInputAssemblyState->topology);
@@ -4425,8 +4530,12 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(
                 static_cast<unsigned long long>(dynamic_hash),
                 static_cast<unsigned long long>(req.render_pass), req.subpass);
         }
+        const bool has_specialization = std::any_of(
+            req.stages.begin(), req.stages.end(),
+            [](const vkrpc::ShaderStageDesc& stage) { return stage.specialization.present != 0; });
         const vkrpc::CreateGraphicsPipelinesResponse r =
-            vkrpc::create_graphics_pipelines(*g_rpc, next_id(), req);
+            has_specialization ? vkrpc::create_graphics_pipelines_raw(*g_rpc, next_id(), req)
+                               : vkrpc::create_graphics_pipelines(*g_rpc, next_id(), req);
         if (!r.ok) {
             // The worker's carried refusal reason is the ONLY way a user (or a triage run) can
             // see WHICH subset boundary an app's pipeline hit -- swallowing it made every
@@ -4471,7 +4580,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateComputePipelines(
                 (dev->vk13_feature_bits & vkrpc::kVk13FeaturePipelineCreationCacheControl) != 0,
                 (dev->vk13_feature_bits & vkrpc::kVk13FeatureSubgroupSizeControl) != 0,
                 (dev->vk13_feature_bits & vkrpc::kVk13FeatureComputeFullSubgroups) != 0,
-                dev->vk13_device, &why)) {
+                dev->vk13_device, &why, dev->worker_pipeline_specialization)) {
             std::fprintf(stderr, "vkrelay2-icd: rejecting compute pipeline -- %s\n", why);
             return VK_ERROR_INITIALIZATION_FAILED;
         }
@@ -4489,6 +4598,12 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateComputePipelines(
         req.layout = from_handle(ci.layout);
         req.shader_module = from_handle(ci.stage.module);
         req.entry_point = ci.stage.pName;
+        if (req.entry_point.size() > vkrpc::kMaxPipelineEntryPointNameBytes) {
+            std::fprintf(stderr,
+                         "vkrelay2-icd: rejecting compute pipeline -- pipeline stage entry-point "
+                         "name exceeds 4096-byte cap\n");
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
         // Vulkan 1.3 support (subgroupSizeControl): the admitted stage flags + required-size pNext.
         req.stage_flags = static_cast<long long>(ci.stage.flags);
         for (auto* n = static_cast<const VkBaseInStructure*>(ci.stage.pNext); n != nullptr;
@@ -4500,9 +4615,25 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateComputePipelines(
                         ->requiredSubgroupSize);
             }
         }
+        {
+            const std::vector<const VkSpecializationInfo*> source = {ci.stage.pSpecializationInfo};
+            const std::vector<vkrpc::SpecializationInfoDesc*> destination = {&req.specialization};
+            std::string specialization_why;
+            if (!extract_pipeline_specializations(source, destination,
+                                                  vkrpc::kMaxSpecializationDataBytesPerStage,
+                                                  specialization_why)) {
+                std::fprintf(stderr, "vkrelay2-icd: rejecting compute pipeline -- %s\n",
+                             specialization_why.c_str());
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+        }
         const vkrpc::CreateComputePipelinesResponse r =
-            vkrpc::create_compute_pipelines(*g_rpc, next_id(), req);
+            req.specialization.present != 0
+                ? vkrpc::create_compute_pipelines_raw(*g_rpc, next_id(), req)
+                : vkrpc::create_compute_pipelines(*g_rpc, next_id(), req);
         if (!r.ok) {
+            std::fprintf(stderr, "vkrelay2-icd: create compute pipeline failed -- %s\n",
+                         r.reason.c_str());
             return fault();
         }
         pPipelines[0] = to_handle<VkPipeline>(r.pipeline);

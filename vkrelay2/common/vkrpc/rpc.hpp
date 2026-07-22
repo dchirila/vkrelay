@@ -307,6 +307,11 @@ enum class RpcOp : std::uint32_t {
     // returns void, so a range/handle error is validation-layer territory, not an app-visible
     // result).
     ResetQueryPool = 91,
+    // Pipeline specialization constants need a binary tail for the raw pData bytes. Keep the
+    // legacy JSON pipeline ops byte-stable and use separate vocabulary (the op-78 precedent), so
+    // old ICD -> new worker remains unambiguous and no body sniffing is required.
+    CreateGraphicsPipelinesRaw = 92,
+    CreateComputePipelinesRaw = 93,
 };
 
 enum class RpcStatus : std::uint32_t {

@@ -16,10 +16,12 @@
 #include <vulkan/vulkan.h>
 
 #include "tests/compute_spv.h"
+#include "tests/specialization_compute_spv.h"
 
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -28,6 +30,11 @@ namespace {
 constexpr std::uint32_t kElems = 4096; // / local_size 64 = 64 groups
 constexpr std::uint32_t kScale = 3;
 constexpr std::uint32_t kBias = 7;
+
+bool specialization_required() {
+    const char* value = std::getenv("VKRELAY2_REQUIRE_PIPELINE_SPECIALIZATION");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
 
 void logf(const char* fmt, ...) {
     va_list ap;
@@ -59,9 +66,12 @@ int main() {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     VkShaderModule module = VK_NULL_HANDLE;
+    VkShaderModule specialization_module = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline specialization_default_pipeline = VK_NULL_HANDLE;
+    VkPipeline specialization_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     VkCommandPool cpool = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
@@ -282,12 +292,13 @@ int main() {
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool = cpool;
         cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        if (vkAllocateCommandBuffers(device, &cbai, &cmd) != VK_SUCCESS) {
+        cbai.commandBufferCount = 3;
+        VkCommandBuffer cmds[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+        if (vkAllocateCommandBuffers(device, &cbai, cmds) != VK_SUCCESS) {
             logf("FAIL (command buffer)");
             goto teardown;
         }
+        VkCommandBuffer cmd = cmds[0];
         VkCommandBufferBeginInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -351,6 +362,101 @@ int main() {
             goto teardown;
         }
         logf("all %u results EXACT (out[i] == in[i]*%u + %u + i)", kElems, kScale, kBias);
+        logf("BASELINE-PASS (compute pipeline + dispatch + exact readback)");
+
+        // Specialization proof shader (offline-generated):
+        //   layout(constant_id=2) const uint output_value=0x11223344u;
+        //   layout(set=0,binding=1) buffer Out { uint data_out[]; };
+        //   void main() { data_out[0]=output_value; }
+        // This setup deliberately occurs AFTER the original compute proof, so an old worker keeps
+        // an independently observable baseline result. Strict milestone runs set
+        // VKRELAY2_REQUIRE_PIPELINE_SPECIALIZATION=1; ordinary baseline smoke may skip only the
+        // pSpecializationInfo admission failure.
+        VkShaderModuleCreateInfo spec_smci{};
+        spec_smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        spec_smci.codeSize = sizeof(kSpecializationComputeSpv);
+        spec_smci.pCode = kSpecializationComputeSpv;
+        if (vkCreateShaderModule(device, &spec_smci, nullptr, &specialization_module) !=
+            VK_SUCCESS) {
+            logf("FAIL (specialization vkCreateShaderModule after baseline passed)");
+            goto teardown;
+        }
+        VkComputePipelineCreateInfo spec_cpci = cpci;
+        spec_cpci.stage.module = specialization_module;
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &spec_cpci, nullptr,
+                                     &specialization_default_pipeline) != VK_SUCCESS) {
+            logf("FAIL (default specialization shader pipeline after baseline passed)");
+            goto teardown;
+        }
+        constexpr std::uint32_t kSpecializedWord = 0xa1b2c3d4u;
+        VkSpecializationMapEntry spec_entry{2, 0, sizeof(kSpecializedWord)};
+        VkSpecializationInfo spec_info{};
+        spec_info.mapEntryCount = 1;
+        spec_info.pMapEntries = &spec_entry;
+        spec_info.dataSize = sizeof(kSpecializedWord);
+        spec_info.pData = &kSpecializedWord;
+        spec_cpci.stage.pSpecializationInfo = &spec_info;
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &spec_cpci, nullptr,
+                                     &specialization_pipeline) != VK_SUCCESS) {
+            if (specialization_required()) {
+                logf("FAIL (specialized vkCreateComputePipelines required after baseline passed)");
+                goto teardown;
+            }
+            logf("SPECIALIZATION-SKIP (baseline passed; worker/ICD did not admit "
+                 "pSpecializationInfo)");
+            logf("PASS (baseline compute proof; specialization unavailable on this worker)");
+            rc = 0;
+            goto teardown;
+        }
+
+        auto run_specialization = [&](VkCommandBuffer spec_cmd, VkPipeline spec_pipeline,
+                                      std::uint32_t expected, const char* label) {
+            VkCommandBufferBeginInfo spec_bi{};
+            spec_bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            spec_bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            if (vkBeginCommandBuffer(spec_cmd, &spec_bi) != VK_SUCCESS) {
+                return false;
+            }
+            vkCmdBindPipeline(spec_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, spec_pipeline);
+            vkCmdBindDescriptorSets(spec_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &dset,
+                                    0, nullptr);
+            vkCmdDispatch(spec_cmd, 1, 1, 1);
+            VkBufferMemoryBarrier spec_bar{};
+            spec_bar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            spec_bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            spec_bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            spec_bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            spec_bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            spec_bar.buffer = buf_out;
+            spec_bar.offset = 0;
+            spec_bar.size = sizeof(std::uint32_t);
+            vkCmdPipelineBarrier(spec_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &spec_bar, 0,
+                                 nullptr);
+            VkBufferCopy spec_copy{0, 0, sizeof(std::uint32_t)};
+            vkCmdCopyBuffer(spec_cmd, buf_out, buf_read, 1, &spec_copy);
+            if (vkEndCommandBuffer(spec_cmd) != VK_SUCCESS ||
+                vkResetFences(device, 1, &fence) != VK_SUCCESS) {
+                return false;
+            }
+            VkSubmitInfo spec_submit{};
+            spec_submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            spec_submit.commandBufferCount = 1;
+            spec_submit.pCommandBuffers = &spec_cmd;
+            if (vkQueueSubmit(queue, 1, &spec_submit, fence) != VK_SUCCESS ||
+                vkWaitForFences(device, 1, &fence, VK_TRUE, ~0ull) != VK_SUCCESS) {
+                return false;
+            }
+            const std::uint32_t got = static_cast<const std::uint32_t*>(read_ptr)[0];
+            logf("specialization %s word=0x%08x expected=0x%08x", label, got, expected);
+            return got == expected;
+        };
+        if (!run_specialization(cmds[1], specialization_default_pipeline, 0x11223344u, "default") ||
+            !run_specialization(cmds[2], specialization_pipeline, kSpecializedWord,
+                                "specialized")) {
+            logf("FAIL (compute specialization values did not reach the GPU)");
+            goto teardown;
+        }
         logf("PASS");
         rc = 0;
     }
@@ -370,6 +476,12 @@ teardown:
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, pipeline, nullptr);
         }
+        if (specialization_default_pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device, specialization_default_pipeline, nullptr);
+        }
+        if (specialization_pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device, specialization_pipeline, nullptr);
+        }
         if (layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(device, layout, nullptr);
         }
@@ -378,6 +490,9 @@ teardown:
         }
         if (module != VK_NULL_HANDLE) {
             vkDestroyShaderModule(device, module, nullptr);
+        }
+        if (specialization_module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(device, specialization_module, nullptr);
         }
         for (VkBuffer b : {buf_in, buf_out, buf_ubo, buf_read}) {
             if (b != VK_NULL_HANDLE) {

@@ -199,6 +199,10 @@ inline const char* profile_op_name_cstr(std::uint32_t op) {
         return "record_command_buffer_raw";
     case RpcOp::CreateComputePipelines:
         return "create_compute_pipelines";
+    case RpcOp::CreateGraphicsPipelinesRaw:
+        return "create_graphics_pipelines_raw";
+    case RpcOp::CreateComputePipelinesRaw:
+        return "create_compute_pipelines_raw";
     case RpcOp::CreateEventOp:
         return "create_event";
     case RpcOp::DestroyEvent:

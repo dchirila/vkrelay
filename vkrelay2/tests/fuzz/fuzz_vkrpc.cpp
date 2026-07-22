@@ -146,6 +146,10 @@ void exercise(const std::string& buf) {
             std::string cwerr;
             (void) vkr::sidecar::SidecarDebugCaptureWindowResponse::from_wire(msg.body, cwerr);
         }
+        std::string pipeline_err;
+        (void) vkr::vkrpc::CreateGraphicsPipelinesRequest::from_wire(buf, pipeline_err);
+        pipeline_err.clear();
+        (void) vkr::vkrpc::CreateComputePipelinesRequest::from_wire(buf, pipeline_err);
 
         // 2) Framed path: decode a frame, then the RPC header from its payload.
         std::size_t consumed = 0;

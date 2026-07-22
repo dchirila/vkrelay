@@ -72,7 +72,6 @@ Focused completeness work:
 - implement the indexed transform-feedback query pair needed for honest
   `GL_ARB_transform_feedback_overflow_query` support;
 - make readback downloads range-precise instead of copying full allocations;
-- carry compute specialization constants;
 - admit equal explicit queue-family indices in otherwise non-transfer buffer barriers; and
 - provide a repeatable validation-layer run mode with known Mesa SPIR-V noise classified.
 
@@ -98,7 +97,6 @@ one fail-closed run should replace speculation with its exact named-reject list.
 | Gap | Current behavior | Effort |
 |---|---|---|
 | Aggregate descriptor indexing and image-class bindless access | Aggregate feature false; buffer-only subset | Med–High |
-| Specialization constants | `pSpecializationInfo` rejected | Low–Med |
 | Secondary command buffers | Inline-only recording model | High |
 | Render-pass resolve attachments | Input/resolve/preserve references rejected | Med |
 | Linux external-FD memory/semaphore/fence | No external handle types advertised | Policy decision: continue honest rejection or define a documented shim tier |

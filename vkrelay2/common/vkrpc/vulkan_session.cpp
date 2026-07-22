@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -1412,6 +1413,7 @@ json::Value DeviceCaps::to_body() const {
           json::Value(static_cast<long long>(core_indirect_draw_scalar_payload)));
     b.set("core_indirect_draw_count",
           json::Value(static_cast<long long>(core_indirect_draw_count)));
+    b.set("pipeline_specialization", json::Value(static_cast<long long>(pipeline_specialization)));
     return b;
 }
 
@@ -1437,6 +1439,8 @@ DeviceCaps DeviceCaps::from_body(const json::Value& body) {
         get_i64(body, "core_indirect_draw_scalar_payload", 0)); // absent -> 0
     d.core_indirect_draw_count =
         static_cast<std::uint32_t>(get_i64(body, "core_indirect_draw_count", 0)); // absent -> 0
+    d.pipeline_specialization =
+        static_cast<std::uint32_t>(get_i64(body, "pipeline_specialization", 0)); // absent -> 0
     return d;
 }
 
@@ -4120,6 +4124,226 @@ CreatePipelineLayoutResponse CreatePipelineLayoutResponse::from_body(const json:
     return r;
 }
 
+bool pipeline_specialization_ok(const std::vector<const SpecializationInfoDesc*>& infos,
+                                std::size_t max_request_data_bytes, std::string& reason) {
+    reason.clear();
+    std::size_t total_entries = 0;
+    std::size_t total_data = 0;
+    // Shape and caps first, in stage order. Additions are checked before they are performed even
+    // though the per-stage caps make overflow unreachable for an ordinary pipeline request.
+    for (const SpecializationInfoDesc* info : infos) {
+        if (info == nullptr) {
+            reason = "pipeline specialization descriptor is null";
+            return false;
+        }
+        if (info->present != 0 && info->present != 1) {
+            reason = "pipeline specialization presence must be 0 or 1";
+            return false;
+        }
+        if (info->present == 0 && (!info->map_entries.empty() || !info->data.empty())) {
+            reason = "absent pipeline specialization carries entries or data";
+            return false;
+        }
+        if (info->map_entries.size() > kMaxSpecializationMapEntriesPerStage) {
+            reason = "pipeline specialization map entry count exceeds per-stage cap";
+            return false;
+        }
+        if (info->data.size() > kMaxSpecializationDataBytesPerStage) {
+            reason = "pipeline specialization data size exceeds per-stage cap";
+            return false;
+        }
+        if (total_entries > std::numeric_limits<std::size_t>::max() - info->map_entries.size() ||
+            total_data > std::numeric_limits<std::size_t>::max() - info->data.size()) {
+            reason = "pipeline specialization request totals overflow";
+            return false;
+        }
+        total_entries += info->map_entries.size();
+        total_data += info->data.size();
+    }
+    if (total_entries > kMaxSpecializationMapEntriesPerRequest) {
+        reason = "pipeline specialization map entry count exceeds request cap";
+        return false;
+    }
+    if (total_data > max_request_data_bytes) {
+        reason = "pipeline specialization data size exceeds request cap";
+        return false;
+    }
+
+    for (const SpecializationInfoDesc* info : infos) {
+        for (const SpecializationMapEntryDesc& entry : info->map_entries) {
+            if (entry.constant_id < 0 ||
+                static_cast<unsigned long long>(entry.constant_id) > UINT32_MAX) {
+                reason = "pipeline specialization constantID is outside uint32";
+                return false;
+            }
+            if (entry.offset < 0 || static_cast<unsigned long long>(entry.offset) > UINT32_MAX) {
+                reason = "pipeline specialization offset is outside uint32";
+                return false;
+            }
+            if (entry.size < 0 || static_cast<unsigned long long>(entry.size) >
+                                      std::numeric_limits<std::size_t>::max()) {
+                reason = "pipeline specialization size is negative or not representable";
+                return false;
+            }
+            const std::size_t offset = static_cast<std::size_t>(entry.offset);
+            const std::size_t size = static_cast<std::size_t>(entry.size);
+            if (offset >= info->data.size()) {
+                reason = "pipeline specialization offset must be less than dataSize";
+                return false;
+            }
+            if (size > info->data.size() - offset) {
+                reason = "pipeline specialization size exceeds dataSize minus offset";
+                return false;
+            }
+        }
+        std::set<long long> ids;
+        for (const SpecializationMapEntryDesc& entry : info->map_entries) {
+            if (!ids.insert(entry.constant_id).second) {
+                reason = "pipeline specialization constantID values must be unique";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool pipeline_entry_point_name_ok(const std::string& name, std::string& reason) {
+    reason.clear();
+    if (name.size() > kMaxPipelineEntryPointNameBytes) {
+        reason = "pipeline stage entry-point name exceeds 4096-byte cap";
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+json::Value* mutable_object_field(json::Value& object, const char* key) {
+    if (!object.is_object()) {
+        return nullptr;
+    }
+    for (auto& [name, value] : object.as_object()) {
+        if (name == key) {
+            return &value;
+        }
+    }
+    return nullptr;
+}
+
+json::Value specialization_header(const SpecializationInfoDesc& info) {
+    json::Value spec = json::Value::make_object();
+    json::Array entries;
+    for (const SpecializationMapEntryDesc& entry : info.map_entries) {
+        json::Array triplet;
+        triplet.emplace_back(json::Value(entry.constant_id));
+        triplet.emplace_back(json::Value(entry.offset));
+        triplet.emplace_back(json::Value(entry.size));
+        entries.emplace_back(json::Value(std::move(triplet)));
+    }
+    spec.set("entries", json::Value(std::move(entries)));
+    spec.set("data_size", json::Value(static_cast<long long>(info.data.size())));
+    return spec;
+}
+
+bool decode_specialization_header(const json::Value& stage, SpecializationInfoDesc& info,
+                                  std::size_t& data_size, std::string& err) {
+    info = SpecializationInfoDesc{};
+    data_size = 0;
+    const json::Value* spec = stage.find("specialization");
+    if (spec == nullptr) {
+        return true;
+    }
+    if (!spec->is_object()) {
+        err = "pipeline specialization header is not an object";
+        return false;
+    }
+    info.present = 1;
+    const json::Value* entries = spec->find("entries");
+    const json::Value* size = spec->find("data_size");
+    if (entries == nullptr || !entries->is_array()) {
+        err = "pipeline specialization entries is not an array";
+        return false;
+    }
+    if (entries->as_array().size() > kMaxSpecializationMapEntriesPerStage) {
+        err = "pipeline specialization map entry count exceeds per-stage cap";
+        return false;
+    }
+    if (size == nullptr || !size->is_integer() || size->as_int() < 0 ||
+        static_cast<unsigned long long>(size->as_int()) > kMaxSpecializationDataBytesPerStage) {
+        err = "pipeline specialization data_size is invalid or exceeds per-stage cap";
+        return false;
+    }
+    data_size = static_cast<std::size_t>(size->as_int());
+    for (const json::Value& encoded : entries->as_array()) {
+        if (!encoded.is_array() || encoded.as_array().size() != 3) {
+            err = "pipeline specialization entry is not a three-scalar array";
+            return false;
+        }
+        const json::Array& values = encoded.as_array();
+        if (!values[0].is_integer() || !values[1].is_integer() || !values[2].is_integer()) {
+            err = "pipeline specialization entry contains a non-integer scalar";
+            return false;
+        }
+        info.map_entries.push_back({values[0].as_int(), values[1].as_int(), values[2].as_int()});
+    }
+    return true;
+}
+
+bool decode_pipeline_wire_header(const std::string& body, const char* label, json::Value& header,
+                                 std::size_t& tail_offset, std::string& err) {
+    err.clear();
+    if (body.size() < 4) {
+        err = std::string(label) + " body shorter than 4-byte length prefix";
+        return false;
+    }
+    const std::uint32_t json_len =
+        protocol::load_le32(reinterpret_cast<const unsigned char*>(body.data()));
+    if (json_len > kMaxBinaryJsonHeaderBytes) {
+        err = std::string(label) + " json header exceeds cap";
+        return false;
+    }
+    if (static_cast<std::size_t>(4) + json_len > body.size()) {
+        err = std::string(label) + " json header runs past end of body";
+        return false;
+    }
+    std::string json_err;
+    if (!json::Value::try_parse(body.substr(4, json_len), header, json_err)) {
+        err = std::string(label) + " json header parse: " + json_err;
+        return false;
+    }
+    if (!header.is_object()) {
+        err = std::string(label) + " json header is not an object";
+        return false;
+    }
+    tail_offset = static_cast<std::size_t>(4) + json_len;
+    return true;
+}
+
+std::string encode_pipeline_wire(json::Value header,
+                                 const std::vector<const SpecializationInfoDesc*>& infos,
+                                 const char* label, std::string& err) {
+    err.clear();
+    const std::string json_text = header.dump(0);
+    if (json_text.size() > kMaxBinaryJsonHeaderBytes) {
+        err = std::string(label) + " json header exceeds cap";
+        return {};
+    }
+    std::string out(4, '\0');
+    protocol::store_le32(static_cast<std::uint32_t>(json_text.size()),
+                         reinterpret_cast<unsigned char*>(&out[0]));
+    out += json_text;
+    for (const SpecializationInfoDesc* info : infos) {
+        out += info->data;
+    }
+    if (out.size() + kRpcHeaderBytes > protocol::kMaxFrameBytes) {
+        err = std::string(label) + " encoded RPC frame exceeds cap";
+        return {};
+    }
+    return out;
+}
+
+} // namespace
+
 json::Value CreateGraphicsPipelinesRequest::to_body() const {
     json::Value b = json::Value::make_object();
     b.set("device", handle_value(device));
@@ -4426,6 +4650,85 @@ CreateGraphicsPipelinesRequest CreateGraphicsPipelinesRequest::from_body(const j
     return r;
 }
 
+std::string CreateGraphicsPipelinesRequest::to_wire(std::string& err) const {
+    std::vector<const SpecializationInfoDesc*> infos;
+    infos.reserve(stages.size());
+    for (const ShaderStageDesc& stage : stages) {
+        if (!pipeline_entry_point_name_ok(stage.entry, err)) {
+            return {};
+        }
+        infos.push_back(&stage.specialization);
+    }
+    if (!pipeline_specialization_ok(infos, kMaxSpecializationDataBytesPerGraphicsRequest, err)) {
+        return {};
+    }
+    json::Value header = to_body();
+    json::Value* encoded_stages = mutable_object_field(header, "stages");
+    if (encoded_stages == nullptr || !encoded_stages->is_array() ||
+        encoded_stages->as_array().size() != stages.size()) {
+        err = "graphics pipeline raw header stage array is inconsistent";
+        return {};
+    }
+    for (std::size_t i = 0; i < stages.size(); ++i) {
+        if (stages[i].specialization.present != 0) {
+            encoded_stages->as_array()[i].set("specialization",
+                                              specialization_header(stages[i].specialization));
+        }
+    }
+    return encode_pipeline_wire(std::move(header), infos, "graphics pipeline raw", err);
+}
+
+CreateGraphicsPipelinesRequest CreateGraphicsPipelinesRequest::from_wire(const std::string& body,
+                                                                         std::string& err) {
+    json::Value header;
+    std::size_t tail_offset = 0;
+    if (!decode_pipeline_wire_header(body, "graphics pipeline raw", header, tail_offset, err)) {
+        return {};
+    }
+    CreateGraphicsPipelinesRequest r = from_body(header);
+    const json::Value* encoded_stages = header.find("stages");
+    if (encoded_stages == nullptr || !encoded_stages->is_array() ||
+        encoded_stages->as_array().size() != r.stages.size()) {
+        err = "graphics pipeline raw stage array is missing or inconsistent";
+        return {};
+    }
+    std::vector<std::size_t> data_sizes(r.stages.size(), 0);
+    std::size_t total_entries = 0;
+    std::size_t total_data = 0;
+    for (std::size_t i = 0; i < r.stages.size(); ++i) {
+        if (!decode_specialization_header(encoded_stages->as_array()[i], r.stages[i].specialization,
+                                          data_sizes[i], err)) {
+            return {};
+        }
+        if (total_entries > std::numeric_limits<std::size_t>::max() -
+                                r.stages[i].specialization.map_entries.size() ||
+            total_data > std::numeric_limits<std::size_t>::max() - data_sizes[i]) {
+            err = "graphics pipeline specialization totals overflow";
+            return {};
+        }
+        total_entries += r.stages[i].specialization.map_entries.size();
+        total_data += data_sizes[i];
+    }
+    if (total_entries > kMaxSpecializationMapEntriesPerRequest) {
+        err = "pipeline specialization map entry count exceeds request cap";
+        return {};
+    }
+    if (total_data > kMaxSpecializationDataBytesPerGraphicsRequest) {
+        err = "pipeline specialization data size exceeds request cap";
+        return {};
+    }
+    if (body.size() - tail_offset != total_data) {
+        err = "graphics pipeline raw tail length does not match specialization data sizes";
+        return {};
+    }
+    std::size_t cursor = tail_offset;
+    for (std::size_t i = 0; i < r.stages.size(); ++i) {
+        r.stages[i].specialization.data.assign(body, cursor, data_sizes[i]);
+        cursor += data_sizes[i];
+    }
+    return r;
+}
+
 json::Value CreateGraphicsPipelinesResponse::to_body() const {
     json::Value b = json::Value::make_object();
     b.set("ok", json::Value(ok));
@@ -4466,6 +4769,45 @@ CreateComputePipelinesRequest CreateComputePipelinesRequest::from_body(const jso
     r.entry_point = get_string(body, "entry_point");
     r.stage_flags = get_i64(body, "stage_flags", 0);
     r.required_subgroup_size = get_int(body, "required_subgroup_size", 0);
+    return r;
+}
+
+std::string CreateComputePipelinesRequest::to_wire(std::string& err) const {
+    if (!pipeline_entry_point_name_ok(entry_point, err)) {
+        return {};
+    }
+    const std::vector<const SpecializationInfoDesc*> infos = {&specialization};
+    if (!pipeline_specialization_ok(infos, kMaxSpecializationDataBytesPerStage, err)) {
+        return {};
+    }
+    json::Value header = to_body();
+    if (specialization.present != 0) {
+        header.set("specialization", specialization_header(specialization));
+    }
+    return encode_pipeline_wire(std::move(header), infos, "compute pipeline raw", err);
+}
+
+CreateComputePipelinesRequest CreateComputePipelinesRequest::from_wire(const std::string& body,
+                                                                       std::string& err) {
+    json::Value header;
+    std::size_t tail_offset = 0;
+    if (!decode_pipeline_wire_header(body, "compute pipeline raw", header, tail_offset, err)) {
+        return {};
+    }
+    CreateComputePipelinesRequest r = from_body(header);
+    std::size_t data_size = 0;
+    if (!decode_specialization_header(header, r.specialization, data_size, err)) {
+        return {};
+    }
+    if (r.specialization.map_entries.size() > kMaxSpecializationMapEntriesPerRequest) {
+        err = "pipeline specialization map entry count exceeds request cap";
+        return {};
+    }
+    if (body.size() - tail_offset != data_size) {
+        err = "compute pipeline raw tail length does not match specialization data_size";
+        return {};
+    }
+    r.specialization.data.assign(body, tail_offset, data_size);
     return r;
 }
 
@@ -6161,6 +6503,7 @@ DeviceCaps MockVulkanBackend::device_caps() const {
     caps.core_indirect_draw = 1;
     caps.core_indirect_draw_scalar_payload = 1;
     caps.core_indirect_draw_count = 1;
+    caps.pipeline_specialization = 1;
     return caps;
 }
 
@@ -11649,6 +11992,18 @@ MockVulkanBackend::create_graphics_pipelines(const CreateGraphicsPipelinesReques
         resp.reason = "unknown device handle";
         return resp;
     }
+    {
+        std::vector<const SpecializationInfoDesc*> infos;
+        infos.reserve(req.stages.size());
+        for (const ShaderStageDesc& stage : req.stages) {
+            infos.push_back(&stage.specialization);
+        }
+        if (!pipeline_specialization_ok(infos, kMaxSpecializationDataBytesPerGraphicsRequest,
+                                        resp.reason)) {
+            resp.ok = false;
+            return resp;
+        }
+    }
     // Vulkan 1.3 support (subgroupSizeControl): the stage shapes are gated on the enabled vk13
     // bits, mock == real (validate-only here). REQUIRE_FULL_SUBGROUPS is compute-only, so any
     // graphics stage carrying it rejects via the allowed mask.
@@ -11689,6 +12044,10 @@ MockVulkanBackend::create_graphics_pipelines(const CreateGraphicsPipelinesReques
             return resp;
         }
         for (const ShaderStageDesc& s : req.stages) {
+            if (!pipeline_entry_point_name_ok(s.entry, resp.reason)) {
+                resp.ok = false;
+                return resp;
+            }
             if (s.stage <= 0 || (s.stage & ~kGraphicsStages) != 0 ||
                 (s.stage & (s.stage - 1)) != 0) {
                 resp.ok = false;
@@ -11972,6 +12331,11 @@ MockVulkanBackend::create_compute_pipelines(const CreateComputePipelinesRequest&
         resp.reason = "unknown device handle";
         return resp;
     }
+    if (!pipeline_specialization_ok({&req.specialization}, kMaxSpecializationDataBytesPerStage,
+                                    resp.reason)) {
+        resp.ok = false;
+        return resp;
+    }
     // Vulkan 1.3 support (subgroupSizeControl): mirror the real backend's stage-shape gates
     // (validate-only). ALLOW_VARYING = 0x1; REQUIRE_FULL_SUBGROUPS = 0x2 additionally needs the
     // computeFullSubgroups bit.
@@ -12011,6 +12375,10 @@ MockVulkanBackend::create_compute_pipelines(const CreateComputePipelinesRequest&
     if (req.entry_point.empty()) {
         resp.ok = false;
         resp.reason = "compute pipeline entry point must be non-empty";
+        return resp;
+    }
+    if (!pipeline_entry_point_name_ok(req.entry_point, resp.reason)) {
+        resp.ok = false;
         return resp;
     }
     const std::uint64_t h = next_handle_++;
@@ -12523,6 +12891,22 @@ void serve_vulkan_rpc(RpcChannel& channel, VulkanBackend& backend) {
                     reply(presp.to_body());
                 }
                 break;
+            case RpcOp::CreateGraphicsPipelinesRaw: {
+                std::string wire_err;
+                const CreateGraphicsPipelinesRequest preq =
+                    CreateGraphicsPipelinesRequest::from_wire(req.body, wire_err);
+                if (!wire_err.empty()) {
+                    VKR_WARN(kComponent) << "create_graphics_pipelines_raw rejected: " << wire_err;
+                    resp.status = static_cast<std::uint32_t>(RpcStatus::BadRequest);
+                    channel.send(resp);
+                    break;
+                }
+                const CreateGraphicsPipelinesResponse presp =
+                    backend.create_graphics_pipelines(preq);
+                op_trace.create_graphics_pipeline(req.request_id, preq, presp);
+                reply(presp.to_body());
+                break;
+            }
             case RpcOp::CreateComputePipelines:
                 if (parse_body()) {
                     reply(backend
@@ -12531,6 +12915,19 @@ void serve_vulkan_rpc(RpcChannel& channel, VulkanBackend& backend) {
                               .to_body());
                 }
                 break;
+            case RpcOp::CreateComputePipelinesRaw: {
+                std::string wire_err;
+                const CreateComputePipelinesRequest preq =
+                    CreateComputePipelinesRequest::from_wire(req.body, wire_err);
+                if (!wire_err.empty()) {
+                    VKR_WARN(kComponent) << "create_compute_pipelines_raw rejected: " << wire_err;
+                    resp.status = static_cast<std::uint32_t>(RpcStatus::BadRequest);
+                    channel.send(resp);
+                    break;
+                }
+                reply(backend.create_compute_pipelines(preq).to_body());
+                break;
+            }
             case RpcOp::DestroyPipeline:
                 if (parse_body()) {
                     reply(backend.destroy_pipeline(HandleRequest::from_body(body)).to_body());
@@ -13161,15 +13558,57 @@ StatusResponse destroy_pipeline_layout(RpcChannel& channel, std::uint32_t reques
 CreateGraphicsPipelinesResponse
 create_graphics_pipelines(RpcChannel& channel, std::uint32_t request_id,
                           const CreateGraphicsPipelinesRequest& req) {
+    for (const ShaderStageDesc& stage : req.stages) {
+        if (stage.specialization.present != 0 || !stage.specialization.map_entries.empty() ||
+            !stage.specialization.data.empty()) {
+            CreateGraphicsPipelinesResponse resp;
+            resp.reason = "legacy graphics pipeline RPC cannot carry specialization constants";
+            return resp;
+        }
+    }
     return CreateGraphicsPipelinesResponse::from_body(
         call_rpc(channel, RpcOp::CreateGraphicsPipelines, request_id, req.to_body()));
+}
+
+CreateGraphicsPipelinesResponse
+create_graphics_pipelines_raw(RpcChannel& channel, std::uint32_t request_id,
+                              const CreateGraphicsPipelinesRequest& req) {
+    std::string err;
+    const std::string wire = req.to_wire(err);
+    if (!err.empty()) {
+        CreateGraphicsPipelinesResponse resp;
+        resp.reason = err;
+        return resp;
+    }
+    return CreateGraphicsPipelinesResponse::from_body(
+        call_rpc_raw(channel, RpcOp::CreateGraphicsPipelinesRaw, request_id, wire));
 }
 
 CreateComputePipelinesResponse create_compute_pipelines(RpcChannel& channel,
                                                         std::uint32_t request_id,
                                                         const CreateComputePipelinesRequest& req) {
+    if (req.specialization.present != 0 || !req.specialization.map_entries.empty() ||
+        !req.specialization.data.empty()) {
+        CreateComputePipelinesResponse resp;
+        resp.reason = "legacy compute pipeline RPC cannot carry specialization constants";
+        return resp;
+    }
     return CreateComputePipelinesResponse::from_body(
         call_rpc(channel, RpcOp::CreateComputePipelines, request_id, req.to_body()));
+}
+
+CreateComputePipelinesResponse
+create_compute_pipelines_raw(RpcChannel& channel, std::uint32_t request_id,
+                             const CreateComputePipelinesRequest& req) {
+    std::string err;
+    const std::string wire = req.to_wire(err);
+    if (!err.empty()) {
+        CreateComputePipelinesResponse resp;
+        resp.reason = err;
+        return resp;
+    }
+    return CreateComputePipelinesResponse::from_body(
+        call_rpc_raw(channel, RpcOp::CreateComputePipelinesRaw, request_id, wire));
 }
 
 StatusResponse destroy_pipeline(RpcChannel& channel, std::uint32_t request_id,

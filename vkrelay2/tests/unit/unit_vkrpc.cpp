@@ -20,6 +20,21 @@ using namespace vkr;
 
 namespace {
 
+class NoIoConnection final : public transport::Connection {
+  public:
+    std::size_t read_some(void*, std::size_t) override {
+        throw transport::TransportError("unexpected read");
+    }
+    void write_all(const void*, std::size_t) override {
+        ++writes;
+        throw transport::TransportError("unexpected write");
+    }
+    void close() override {}
+    void cancel() override {}
+
+    int writes = 0;
+};
+
 void test_device_loss_policy() {
     VKR_CHECK(!vkrpc::present_fence_retire_requested(nullptr));
     VKR_CHECK(!vkrpc::present_fence_retire_requested(""));
@@ -6464,7 +6479,15 @@ void test_image_depth_mock() {
     auto make_pipe = [&](std::uint64_t rpass, bool depth_state) {
         vkrpc::CreateGraphicsPipelinesRequest r;
         r.device = dev;
-        r.stages = {{1, vs, "main"}, {16, fs, "main"}};
+        vkrpc::ShaderStageDesc vertex;
+        vertex.stage = 1;
+        vertex.module = vs;
+        vertex.entry = "main";
+        vkrpc::ShaderStageDesc fragment;
+        fragment.stage = 16;
+        fragment.module = fs;
+        fragment.entry = "main";
+        r.stages = {vertex, fragment};
         r.topology = 3;
         r.vertex_binding_count = 0;
         r.vertex_attribute_count = 0;
@@ -10286,6 +10309,259 @@ void test_compute_dispatch() {
     }
 }
 
+void test_pipeline_specialization() {
+    using vkrpc::SpecializationInfoDesc;
+    using vkrpc::SpecializationMapEntryDesc;
+    auto ok = [](const std::vector<const SpecializationInfoDesc*>& infos,
+                 std::size_t max_data = vkrpc::kMaxSpecializationDataBytesPerGraphicsRequest) {
+        std::string reason;
+        return vkrpc::pipeline_specialization_ok(infos, max_data, reason);
+    };
+    auto rejected_as =
+        [](const std::vector<const SpecializationInfoDesc*>& infos, const char* expected,
+           std::size_t max_data = vkrpc::kMaxSpecializationDataBytesPerGraphicsRequest) {
+            std::string reason;
+            VKR_CHECK(!vkrpc::pipeline_specialization_ok(infos, max_data, reason));
+            VKR_CHECK_EQ(reason, std::string(expected));
+        };
+
+    SpecializationInfoDesc absent;
+    VKR_CHECK(ok({&absent}));
+    SpecializationInfoDesc empty;
+    empty.present = 1;
+    VKR_CHECK(ok({&empty}));
+    SpecializationInfoDesc data_without_entries = empty;
+    data_without_entries.data = "unused";
+    VKR_CHECK(ok({&data_without_entries}));
+
+    // Registry-derived do-not-reject pins: odd offsets/sizes and overlapping byte ranges are
+    // legal. Zero-sized entries are legal too, provided their offset is inside dataSize.
+    SpecializationInfoDesc overlap = empty;
+    overlap.data = "abcdef";
+    overlap.map_entries = {{1, 1, 3}, {2, 2, 1}, {3, 0, 0}};
+    VKR_CHECK(ok({&overlap}));
+
+    SpecializationInfoDesc bad = overlap;
+    bad.present = 2;
+    rejected_as({&bad}, "pipeline specialization presence must be 0 or 1");
+    bad = absent;
+    bad.data = "x";
+    rejected_as({&bad}, "absent pipeline specialization carries entries or data");
+    bad = empty;
+    bad.map_entries.resize(vkrpc::kMaxSpecializationMapEntriesPerStage + 1);
+    rejected_as({&bad}, "pipeline specialization map entry count exceeds per-stage cap");
+    bad = empty;
+    bad.data.resize(vkrpc::kMaxSpecializationDataBytesPerStage + 1);
+    rejected_as({&bad}, "pipeline specialization data size exceeds per-stage cap");
+
+    SpecializationInfoDesc at_entry_cap = empty;
+    at_entry_cap.data = "x";
+    for (std::size_t i = 0; i < vkrpc::kMaxSpecializationMapEntriesPerStage; ++i) {
+        at_entry_cap.map_entries.push_back({static_cast<long long>(i), 0, 0});
+    }
+    VKR_CHECK(ok({&at_entry_cap, &at_entry_cap})); // exactly 512 request entries
+    SpecializationInfoDesc one_more = empty;
+    one_more.data = "x";
+    one_more.map_entries.push_back({1000, 0, 0});
+    rejected_as({&at_entry_cap, &at_entry_cap, &one_more},
+                "pipeline specialization map entry count exceeds request cap");
+
+    SpecializationInfoDesc at_data_cap = empty;
+    at_data_cap.data.resize(vkrpc::kMaxSpecializationDataBytesPerStage, 'd');
+    VKR_CHECK(ok({&at_data_cap}, vkrpc::kMaxSpecializationDataBytesPerStage));
+    rejected_as({&at_data_cap, &at_data_cap},
+                "pipeline specialization data size exceeds request cap",
+                vkrpc::kMaxSpecializationDataBytesPerStage);
+
+    bad = overlap;
+    bad.map_entries[0].constant_id = -1;
+    rejected_as({&bad}, "pipeline specialization constantID is outside uint32");
+    bad = overlap;
+    bad.map_entries[0].constant_id = 4294967296ll;
+    rejected_as({&bad}, "pipeline specialization constantID is outside uint32");
+    bad = overlap;
+    bad.map_entries[0].offset = -1;
+    rejected_as({&bad}, "pipeline specialization offset is outside uint32");
+    bad = overlap;
+    bad.map_entries[0].offset = 4294967296ll;
+    rejected_as({&bad}, "pipeline specialization offset is outside uint32");
+    bad = overlap;
+    bad.map_entries[0].size = -1;
+    rejected_as({&bad}, "pipeline specialization size is negative or not representable");
+    bad = overlap;
+    bad.map_entries[0] = {1, static_cast<long long>(bad.data.size()), 0};
+    rejected_as({&bad}, "pipeline specialization offset must be less than dataSize");
+    bad = overlap;
+    bad.map_entries[0] = {1, 4, 3};
+    rejected_as({&bad}, "pipeline specialization size exceeds dataSize minus offset");
+    bad = overlap;
+    bad.map_entries = {{7, 0, 1}, {7, 1, 1}};
+    rejected_as({&bad}, "pipeline specialization constantID values must be unique");
+    // Reason precedence: range errors beat duplicate-ID errors.
+    bad.map_entries = {{7, 0, 1}, {7, 6, 0}};
+    rejected_as({&bad}, "pipeline specialization offset must be less than dataSize");
+
+    vkrpc::CreateGraphicsPipelinesRequest gp;
+    vkrpc::ShaderStageDesc vs;
+    vs.stage = 1;
+    vs.module = 10;
+    vs.entry = "main";
+    vs.specialization = overlap;
+    vkrpc::ShaderStageDesc fs;
+    fs.stage = 16;
+    fs.module = 11;
+    fs.entry = "main";
+    fs.specialization.present = 1;
+    fs.specialization.map_entries = {{19, 1, 2}};
+    fs.specialization.data = "XYZ"; // distinct tail pins exact per-stage association
+    gp.stages = {vs, fs};
+    std::string err;
+    const std::string graphics_wire = gp.to_wire(err);
+    VKR_CHECK(err.empty() && !graphics_wire.empty());
+    auto gp_rt = vkrpc::CreateGraphicsPipelinesRequest::from_wire(graphics_wire, err);
+    VKR_CHECK(err.empty());
+    VKR_CHECK_EQ(gp_rt.stages.size(), static_cast<std::size_t>(2));
+    VKR_CHECK_EQ(gp_rt.stages[0].specialization.present, 1);
+    VKR_CHECK_EQ(gp_rt.stages[0].specialization.data, std::string("abcdef"));
+    VKR_CHECK_EQ(gp_rt.stages[0].specialization.map_entries.size(), static_cast<std::size_t>(3));
+    VKR_CHECK_EQ(gp_rt.stages[1].specialization.present, 1);
+    VKR_CHECK_EQ(gp_rt.stages[1].specialization.data, std::string("XYZ"));
+    VKR_CHECK_EQ(gp_rt.stages[1].specialization.map_entries.size(), static_cast<std::size_t>(1));
+    VKR_CHECK_EQ(gp_rt.stages[1].specialization.map_entries[0].constant_id, 19);
+    // A present-empty info is semantically distinct from a null info.
+    fs.specialization = {};
+    fs.specialization.present = 1;
+    gp.stages = {fs};
+    const std::string empty_wire = gp.to_wire(err);
+    VKR_CHECK(err.empty() && !empty_wire.empty());
+    const auto empty_rt = vkrpc::CreateGraphicsPipelinesRequest::from_wire(empty_wire, err);
+    VKR_CHECK(err.empty());
+    VKR_CHECK_EQ(empty_rt.stages[0].specialization.present, 1);
+    VKR_CHECK(empty_rt.stages[0].specialization.data.empty());
+    VKR_CHECK(empty_rt.stages[0].specialization.map_entries.empty());
+    // Legacy ops remain specialization-free, and decoding owns an independent copy of the tail.
+    gp.stages = {vs, fs};
+    const auto legacy = vkrpc::CreateGraphicsPipelinesRequest::from_body(gp.to_body());
+    VKR_CHECK_EQ(legacy.stages[0].specialization.present, 0);
+    gp.stages[0].specialization.data[0] = 'Z';
+    VKR_CHECK_EQ(gp_rt.stages[0].specialization.data, std::string("abcdef"));
+
+    vkrpc::CreateComputePipelinesRequest cp;
+    cp.device = 1;
+    cp.layout = 2;
+    cp.shader_module = 3;
+    cp.entry_point = "main";
+    cp.specialization = overlap;
+    const std::string compute_wire = cp.to_wire(err);
+    VKR_CHECK(err.empty() && !compute_wire.empty());
+    const auto cp_rt = vkrpc::CreateComputePipelinesRequest::from_wire(compute_wire, err);
+    VKR_CHECK(err.empty());
+    VKR_CHECK_EQ(cp_rt.specialization.data, std::string("abcdef"));
+    VKR_CHECK_EQ(
+        vkrpc::CreateComputePipelinesRequest::from_body(cp.to_body()).specialization.present, 0);
+
+    // The legacy JSON codec stays byte-compatible, but its SEND helpers must reject rather than
+    // silently drop a caller-supplied specialization. The no-I/O connection proves rejection
+    // happens before an envelope is written.
+    NoIoConnection no_io;
+    vkrpc::RpcChannel no_io_rpc(no_io);
+    const auto legacy_gp_send = vkrpc::create_graphics_pipelines(no_io_rpc, 1, gp);
+    VKR_CHECK(!legacy_gp_send.ok);
+    VKR_CHECK_EQ(legacy_gp_send.reason,
+                 std::string("legacy graphics pipeline RPC cannot carry specialization constants"));
+    const auto legacy_cp_send = vkrpc::create_compute_pipelines(no_io_rpc, 2, cp);
+    VKR_CHECK(!legacy_cp_send.ok);
+    VKR_CHECK_EQ(legacy_cp_send.reason,
+                 std::string("legacy compute pipeline RPC cannot carry specialization constants"));
+    VKR_CHECK_EQ(no_io.writes, 0);
+
+    vkrpc::CreateGraphicsPipelinesRequest long_name_gp = gp;
+    long_name_gp.stages[0].entry.assign(vkrpc::kMaxPipelineEntryPointNameBytes + 1, 'n');
+    VKR_CHECK(long_name_gp.to_wire(err).empty());
+    VKR_CHECK_EQ(err, std::string("pipeline stage entry-point name exceeds 4096-byte cap"));
+    vkrpc::CreateComputePipelinesRequest long_name_cp = cp;
+    long_name_cp.entry_point.assign(vkrpc::kMaxPipelineEntryPointNameBytes + 1, 'n');
+    VKR_CHECK(long_name_cp.to_wire(err).empty());
+    VKR_CHECK_EQ(err, std::string("pipeline stage entry-point name exceeds 4096-byte cap"));
+
+    // Total decoder faults: prefix/header/JSON/type/triplet and exact-tail framing.
+    auto frame = [](const std::string& json, const std::string& tail = std::string()) {
+        std::string body(4, '\0');
+        protocol::store_le32(static_cast<std::uint32_t>(json.size()),
+                             reinterpret_cast<unsigned char*>(&body[0]));
+        body += json;
+        body += tail;
+        return body;
+    };
+    (void) vkrpc::CreateGraphicsPipelinesRequest::from_wire("x", err);
+    VKR_CHECK(!err.empty());
+    std::string over_header(4, '\0');
+    protocol::store_le32(static_cast<std::uint32_t>(vkrpc::kMaxBinaryJsonHeaderBytes + 1),
+                         reinterpret_cast<unsigned char*>(&over_header[0]));
+    (void) vkrpc::CreateGraphicsPipelinesRequest::from_wire(over_header, err);
+    VKR_CHECK(!err.empty());
+    std::string overrun(4, '\0');
+    protocol::store_le32(10, reinterpret_cast<unsigned char*>(&overrun[0]));
+    (void) vkrpc::CreateGraphicsPipelinesRequest::from_wire(overrun, err);
+    VKR_CHECK(!err.empty());
+    (void) vkrpc::CreateGraphicsPipelinesRequest::from_wire(frame("{"), err);
+    VKR_CHECK(!err.empty());
+    (void) vkrpc::CreateGraphicsPipelinesRequest::from_wire(
+        frame("{\"stages\":[{\"specialization\":7}]}"), err);
+    VKR_CHECK(!err.empty());
+    (void) vkrpc::CreateGraphicsPipelinesRequest::from_wire(
+        frame("{\"stages\":[{\"specialization\":{\"entries\":[[1,2]],\"data_size\":0}}]}"), err);
+    VKR_CHECK(!err.empty());
+    std::string trailing = graphics_wire;
+    trailing.push_back('x');
+    (void) vkrpc::CreateGraphicsPipelinesRequest::from_wire(trailing, err);
+    VKR_CHECK(!err.empty());
+    std::string short_tail = graphics_wire;
+    short_tail.pop_back();
+    (void) vkrpc::CreateGraphicsPipelinesRequest::from_wire(short_tail, err);
+    VKR_CHECK(!err.empty());
+
+    // Capability is additive; omission is the old-worker value.
+    vkrpc::DeviceCaps caps;
+    caps.pipeline_specialization = 1;
+    VKR_CHECK_EQ(vkrpc::DeviceCaps::from_body(caps.to_body()).pipeline_specialization, 1u);
+    json::Value old_caps = json::Value::make_object();
+    VKR_CHECK_EQ(vkrpc::DeviceCaps::from_body(old_caps).pipeline_specialization, 0u);
+
+    // Mock boundary independently runs the same validator before minting pipeline state.
+    const auto devices = protocol::probe_mocked();
+    vkrpc::MockVulkanBackend backend(devices.front().name);
+    MockDrawFixture fixture(backend, 32);
+    auto mock_gp = fixture.make_pipeline();
+    mock_gp.stages[0].specialization = overlap;
+    VKR_CHECK(backend.create_graphics_pipelines(mock_gp).ok);
+    mock_gp.stages[0].entry.assign(vkrpc::kMaxPipelineEntryPointNameBytes + 1, 'n');
+    const auto mock_long_name = backend.create_graphics_pipelines(mock_gp);
+    VKR_CHECK(!mock_long_name.ok);
+    VKR_CHECK_EQ(mock_long_name.reason,
+                 std::string("pipeline stage entry-point name exceeds 4096-byte cap"));
+    mock_gp.stages[0].entry = "main";
+    mock_gp.stages[0].specialization = bad; // range error wins before duplicate
+    const auto mock_bad = backend.create_graphics_pipelines(mock_gp);
+    VKR_CHECK(!mock_bad.ok);
+    VKR_CHECK_EQ(mock_bad.pipeline, 0ull);
+    VKR_CHECK_EQ(mock_bad.reason,
+                 std::string("pipeline specialization offset must be less than dataSize"));
+
+    vkrpc::CreateComputePipelinesRequest mock_cp;
+    mock_cp.device = fixture.device.device;
+    mock_cp.layout = fixture.pipeline_layout.pipeline_layout;
+    mock_cp.shader_module = fixture.vertex_shader.shader_module;
+    mock_cp.entry_point = "main";
+    mock_cp.specialization = overlap;
+    VKR_CHECK(backend.create_compute_pipelines(mock_cp).ok);
+    mock_cp.entry_point.assign(vkrpc::kMaxPipelineEntryPointNameBytes + 1, 'n');
+    const auto mock_cp_long_name = backend.create_compute_pipelines(mock_cp);
+    VKR_CHECK(!mock_cp_long_name.ok);
+    VKR_CHECK_EQ(mock_cp_long_name.reason,
+                 std::string("pipeline stage entry-point name exceeds 4096-byte cap"));
+}
+
 int main() {
     test_device_loss_policy();
     test_rpc_profile();
@@ -10342,6 +10618,7 @@ int main() {
     test_zink_caps_mock();
     test_mock_toplevel_registry_i9();
     test_mock_chrome_paint();
+    test_pipeline_specialization();
     test_compute_dispatch();
     return vkr::test::finish("unit_vkrpc");
 }

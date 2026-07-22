@@ -8,6 +8,9 @@ between minor releases.
 
 ### Graphics
 
+- Added Vulkan graphics and compute pipeline specialization constants, including capability-gated
+  binary-tail RPC transport, bounded fail-closed validation, exact preservation of non-null empty
+  specialization info, and observable default/overridden/dual-stage GPU coverage.
 - Added core `vkCmdDrawIndirect` and `vkCmdDrawIndexedIndirect` recording and real-host replay,
   closing the missing core-1.0 command surface. The implementation includes additive worker
   capability negotiation, `multiDrawIndirect` feature gating, overflow-safe buffer-range

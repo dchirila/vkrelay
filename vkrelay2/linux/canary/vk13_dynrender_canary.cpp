@@ -33,10 +33,12 @@
 
 #include <vulkan/vulkan.h>
 
-#include "tests/triangle_spv.h"
+#include "tests/specialization_frag_spv.h"
+#include "tests/specialization_vert_spv.h"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -45,6 +47,11 @@ namespace {
 constexpr std::uint32_t kDim = 256;
 constexpr VkDeviceSize kBufBytes = static_cast<VkDeviceSize>(kDim) * kDim * 4;
 constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+bool specialization_required() {
+    const char* value = std::getenv("VKRELAY2_REQUIRE_PIPELINE_SPECIALIZATION");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
 
 bool check(VkResult r, const char* what) {
     if (r != VK_SUCCESS) {
@@ -255,10 +262,12 @@ int main() {
     VkDeviceMemory buf_mem = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline green_pipeline = VK_NULL_HANDLE;
+    VkPipeline empty_pipeline = VK_NULL_HANDLE;
+    VkPipeline dual_pipeline = VK_NULL_HANDLE;
     VkShaderModule vert = VK_NULL_HANDLE;
     VkShaderModule frag = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     PFN_vkCmdBeginRenderingKHR pfn_begin = nullptr;
     PFN_vkCmdEndRenderingKHR pfn_end = nullptr;
@@ -350,8 +359,8 @@ int main() {
             goto teardown;
         }
 
-        vert = make_shader(device, vkr::triangle_spv::kVert, vkr::triangle_spv::kVertBytes);
-        frag = make_shader(device, vkr::triangle_spv::kFrag, vkr::triangle_spv::kFragBytes);
+        vert = make_shader(device, kSpecializationVertSpv, sizeof(kSpecializationVertSpv));
+        frag = make_shader(device, kSpecializationFragSpv, sizeof(kSpecializationFragSpv));
         if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
             std::printf("VK13-DYNREND-CANARY: FAIL (vkCreateShaderModule)\n");
             goto teardown;
@@ -444,8 +453,10 @@ int main() {
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool = pool;
         cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = 1;
-        if (!check(vkAllocateCommandBuffers(device, &cbai, &cmd), "vkAllocateCommandBuffers")) {
+        cbai.commandBufferCount = 4;
+        VkCommandBuffer commands[4] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                       VK_NULL_HANDLE};
+        if (!check(vkAllocateCommandBuffers(device, &cbai, commands), "vkAllocateCommandBuffers")) {
             goto teardown;
         }
         VkFenceCreateInfo fci{};
@@ -463,91 +474,170 @@ int main() {
         clear.color.float32[3] = 1.0f;
         const unsigned char clear_bytes[4] = {0, 0, 255, 255};
 
-        VkCommandBufferBeginInfo bi{};
-        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (!check(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer")) {
-            goto teardown;
-        }
-        // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL (dynamic rendering does no automatic transition).
-        image_barrier(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED,
-                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
-                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        auto render_and_check = [&](VkCommandBuffer draw_cmd, VkPipeline draw_pipeline, bool first,
+                                    const unsigned char (&expected_center)[4],
+                                    const unsigned char (&expected_probe)[4], const char* label) {
+            VkCommandBufferBeginInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            if (vkBeginCommandBuffer(draw_cmd, &bi) != VK_SUCCESS) {
+                return false;
+            }
+            image_barrier(
+                draw_cmd, image,
+                first ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, first ? 0 : VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                first ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            VkRenderingAttachmentInfo color{};
+            color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            color.imageView = view;
+            color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            color.clearValue = clear;
+            VkRenderingInfo ri{};
+            ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            ri.renderArea.extent = {kDim, kDim};
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachments = &color;
+            pfn_begin(draw_cmd, &ri);
+            vkCmdBindPipeline(draw_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, draw_pipeline);
+            VkViewport viewport{};
+            viewport.width = static_cast<float>(kDim);
+            viewport.height = static_cast<float>(kDim);
+            viewport.maxDepth = 1.0f;
+            vkCmdSetViewport(draw_cmd, 0, 1, &viewport);
+            VkRect2D scissor{};
+            scissor.extent = {kDim, kDim};
+            vkCmdSetScissor(draw_cmd, 0, 1, &scissor);
+            vkCmdDraw(draw_cmd, 3, 1, 0, 0);
+            pfn_end(draw_cmd);
+            image_barrier(draw_cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {kDim, kDim, 1};
+            vkCmdCopyImageToBuffer(draw_cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1,
+                                   &region);
+            if (vkEndCommandBuffer(draw_cmd) != VK_SUCCESS ||
+                (!first && vkResetFences(device, 1, &fence) != VK_SUCCESS)) {
+                return false;
+            }
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &draw_cmd;
+            if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS ||
+                vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+                return false;
+            }
+            void* p = nullptr;
+            if (vkMapMemory(device, buf_mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
+                return false;
+            }
+            const auto* pixels = static_cast<const unsigned char*>(p);
+            unsigned char center[4];
+            unsigned char probe[4];
+            unsigned char corner[4];
+            const VkDeviceSize center_off =
+                (static_cast<VkDeviceSize>(kDim / 2) * kDim + kDim / 2) * 4;
+            const VkDeviceSize probe_off =
+                (static_cast<VkDeviceSize>(kDim / 2) * kDim + 3 * kDim / 8) * 4;
+            std::memcpy(center, pixels + center_off, 4);
+            std::memcpy(probe, pixels + probe_off, 4);
+            std::memcpy(corner, pixels, 4);
+            vkUnmapMemory(device, buf_mem);
+            std::printf("VK13-DYNREND-CANARY: specialization %s center=%02x%02x%02x%02x "
+                        "probe=%02x%02x%02x%02x corner=%02x%02x%02x%02x\n",
+                        label, center[0], center[1], center[2], center[3], probe[0], probe[1],
+                        probe[2], probe[3], corner[0], corner[1], corner[2], corner[3]);
+            return std::memcmp(center, expected_center, 4) == 0 &&
+                   std::memcmp(probe, expected_probe, 4) == 0 &&
+                   std::memcmp(corner, clear_bytes, 4) == 0;
+        };
 
-        VkRenderingAttachmentInfo color{};
-        color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        color.imageView = view;
-        color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        color.clearValue = clear;
-        VkRenderingInfo ri{};
-        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent = {kDim, kDim};
-        ri.layerCount = 1;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachments = &color;
-        pfn_begin(cmd, &ri); // vkCmdBeginRenderingKHR -- the command under test
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        VkViewport viewport{};
-        viewport.width = static_cast<float>(kDim);
-        viewport.height = static_cast<float>(kDim);
-        viewport.maxDepth = 1.0f;
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
-        VkRect2D scissor{};
-        scissor.extent = {kDim, kDim};
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-        pfn_end(cmd); // vkCmdEndRenderingKHR
-        // COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL, then copy out.
-        image_barrier(cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                      VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                      VK_PIPELINE_STAGE_TRANSFER_BIT);
-        VkBufferImageCopy region{};
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageExtent = {kDim, kDim, 1};
-        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
-        if (!check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer")) {
+        const unsigned char red[4] = {255, 0, 0, 255};
+        const unsigned char green[4] = {0, 255, 0, 255};
+        const unsigned char magenta[4] = {255, 0, 255, 255};
+        if (!render_and_check(commands[0], pipeline, true, red, red, "default")) {
+            std::printf("VK13-DYNREND-CANARY: FAIL (dynamic-rendering baseline pixels wrong)\n");
             goto teardown;
         }
-        VkSubmitInfo si{};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
-        if (!check(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit")) {
-            goto teardown;
-        }
-        vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+        std::printf("VK13-DYNREND-CANARY: BASELINE-PASS (dynamic rendering exact pixels)\n");
 
-        void* p = nullptr;
-        if (!check(vkMapMemory(device, buf_mem, 0, VK_WHOLE_SIZE, 0, &p), "vkMapMemory")) {
+        // Offline shader contract:
+        //   VS constant_id 0: value 9 shrinks the triangle to quarter scale.
+        //   FS constant_id 1: default red, value 7 green, value 13 magenta.
+        // Build these only AFTER the original dynamic-rendering proof. Strict milestone runs set
+        // VKRELAY2_REQUIRE_PIPELINE_SPECIALIZATION=1; ordinary baseline smoke may skip only the
+        // first pSpecializationInfo admission failure on an old worker.
+        const std::uint32_t green_selector = 7;
+        VkSpecializationMapEntry fs_entry{1, 0, sizeof(green_selector)};
+        VkSpecializationInfo fs_green{};
+        fs_green.mapEntryCount = 1;
+        fs_green.pMapEntries = &fs_entry;
+        fs_green.dataSize = sizeof(green_selector);
+        fs_green.pData = &green_selector;
+        stages[1].pSpecializationInfo = &fs_green;
+        if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpci, nullptr, &green_pipeline) !=
+            VK_SUCCESS) {
+            if (specialization_required()) {
+                std::printf("VK13-DYNREND-CANARY: FAIL (graphics specialization required after "
+                            "baseline passed)\n");
+                goto teardown;
+            }
+            std::printf("VK13-DYNREND-CANARY: SPECIALIZATION-SKIP (baseline passed; worker/ICD "
+                        "did not admit pSpecializationInfo)\n");
+            std::printf("VK13-DYNREND-CANARY: PASS (dynamic-rendering baseline; specialization "
+                        "unavailable on this worker)\n");
+            rc = 0;
             goto teardown;
         }
-        const auto* pixels = static_cast<const unsigned char*>(p);
-        unsigned char center[4];
-        unsigned char corner[4];
-        const VkDeviceSize center_off = (static_cast<VkDeviceSize>(kDim / 2) * kDim + kDim / 2) * 4;
-        std::memcpy(center, pixels + center_off, 4);
-        std::memcpy(corner, pixels + 0, 4); // the (0,0) corner the triangle does not cover
-        vkUnmapMemory(device, buf_mem);
 
-        std::printf("VK13-DYNREND-CANARY: center=%02x%02x%02x%02x corner=%02x%02x%02x%02x "
-                    "clear=%02x%02x%02x%02x\n",
-                    center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2],
-                    corner[3], clear_bytes[0], clear_bytes[1], clear_bytes[2], clear_bytes[3]);
-        const bool corner_is_clear = std::memcmp(corner, clear_bytes, 4) == 0;
-        const bool center_drew = std::memcmp(center, clear_bytes, 4) != 0 &&
-                                 (center[0] != 0 || center[1] != 0 || center[2] != 0);
-        if (corner_is_clear && center_drew) {
-            std::printf("VK13-DYNREND-CANARY: PASS (native lane dynamic rendering: NULL-renderpass "
-                        "pipeline + vkCmdBegin/EndRenderingKHR clear+draw reached the host)\n");
+        VkSpecializationInfo present_empty{};
+        stages[1].pSpecializationInfo = &present_empty;
+        if (!check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpci, nullptr,
+                                             &empty_pipeline),
+                   "vkCreateGraphicsPipelines(present-empty specialization)")) {
+            goto teardown;
+        }
+
+        const std::uint32_t size_selector = 9;
+        const std::uint32_t magenta_selector = 13;
+        VkSpecializationMapEntry vs_entry{0, 0, sizeof(size_selector)};
+        VkSpecializationInfo vs_small{};
+        vs_small.mapEntryCount = 1;
+        vs_small.pMapEntries = &vs_entry;
+        vs_small.dataSize = sizeof(size_selector);
+        vs_small.pData = &size_selector;
+        VkSpecializationInfo fs_magenta{};
+        fs_magenta.mapEntryCount = 1;
+        fs_magenta.pMapEntries = &fs_entry;
+        fs_magenta.dataSize = sizeof(magenta_selector);
+        fs_magenta.pData = &magenta_selector;
+        stages[0].pSpecializationInfo = &vs_small;
+        stages[1].pSpecializationInfo = &fs_magenta;
+        if (!check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpci, nullptr,
+                                             &dual_pipeline),
+                   "vkCreateGraphicsPipelines(dual-stage specialization)")) {
+            goto teardown;
+        }
+
+        if (render_and_check(commands[1], green_pipeline, false, green, green, "fragment=7") &&
+            render_and_check(commands[2], empty_pipeline, false, red, red, "present-empty") &&
+            render_and_check(commands[3], dual_pipeline, false, magenta, clear_bytes,
+                             "vertex=9+fragment=13")) {
+            std::printf("VK13-DYNREND-CANARY: PASS (graphics specialization default, fragment, "
+                        "present-empty, and dual-stage values reached exact GPU pixels)\n");
             rc = 0;
         } else {
-            std::printf("VK13-DYNREND-CANARY: FAIL (dynamic rendering did not produce the expected "
-                        "pixels: corner_is_clear=%d center_drew=%d)\n",
-                        corner_is_clear ? 1 : 0, center_drew ? 1 : 0);
+            std::printf("VK13-DYNREND-CANARY: FAIL (graphics specialization pixels wrong)\n");
             rc = 1;
         }
     }
@@ -559,6 +649,12 @@ teardown:
         vkDestroyCommandPool(device, pool, nullptr);
     if (pipeline != VK_NULL_HANDLE)
         vkDestroyPipeline(device, pipeline, nullptr);
+    if (green_pipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(device, green_pipeline, nullptr);
+    if (empty_pipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(device, empty_pipeline, nullptr);
+    if (dual_pipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(device, dual_pipeline, nullptr);
     if (layout != VK_NULL_HANDLE)
         vkDestroyPipelineLayout(device, layout, nullptr);
     if (frag != VK_NULL_HANDLE)

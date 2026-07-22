@@ -436,6 +436,32 @@ void test_graphics_pipeline() {
         p.stages[0].pSpecializationInfo = &si;
         VKR_CHECK(!icd_subset::graphics_pipeline_ok(&p.ci, false, false, false, false, false, false,
                                                     &why));
+        // A specialization-capable worker admits the stage shape. Pointer/count content is
+        // checked by the bounded extraction + shared validator after this predicate.
+        si.mapEntryCount = 1;
+        si.pMapEntries = nullptr;
+        VKR_CHECK(icd_subset::graphics_pipeline_ok(&p.ci, false, false, false, false, false, false,
+                                                   &why, true));
+    }
+    {
+        VkSpecializationInfo si{};
+        si.mapEntryCount = 1;
+        VKR_CHECK(!icd_subset::pipeline_specialization_pointer_shape_ok(&si, &why));
+        VKR_CHECK_EQ(std::string(why),
+                     std::string("pipeline specialization has nonzero mapEntryCount but null "
+                                 "pMapEntries"));
+        VkSpecializationMapEntry ignored_entry{};
+        si.mapEntryCount = 0;
+        si.pMapEntries = &ignored_entry; // ignored when count is zero
+        si.dataSize = 1;
+        VKR_CHECK(!icd_subset::pipeline_specialization_pointer_shape_ok(&si, &why));
+        VKR_CHECK_EQ(std::string(why),
+                     std::string("pipeline specialization has nonzero dataSize but null pData"));
+        std::uint32_t ignored_data = 0;
+        si.dataSize = 0;
+        si.pData = &ignored_data; // ignored when size is zero
+        VKR_CHECK(icd_subset::pipeline_specialization_pointer_shape_ok(&si, &why));
+        VKR_CHECK(icd_subset::pipeline_specialization_pointer_shape_ok(nullptr, &why));
     }
     {
         ValidPipeline p; // a sample MASK > 32 samples is not carried
@@ -1292,8 +1318,11 @@ void test_compute_subset() {
     VkSpecializationInfo spec{};
     {
         auto c = ci;
-        c.stage.pSpecializationInfo = &spec; // named reject (the known fast-follow)
+        c.stage.pSpecializationInfo = &spec; // old-worker capability absence stays a named reject
         VKR_CHECK(!icd_subset::compute_pipeline_ok(&c, false, false, false, false, &why));
+        spec.dataSize = 1;
+        spec.pData = nullptr;
+        VKR_CHECK(icd_subset::compute_pipeline_ok(&c, false, false, false, false, &why, true));
     }
     {
         auto c = ci;

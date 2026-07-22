@@ -110,6 +110,7 @@ vkrpc::DeviceCaps caps_from_props(const VkPhysicalDeviceProperties& p) {
     c.core_indirect_draw = 1;
     c.core_indirect_draw_scalar_payload = 1;
     c.core_indirect_draw_count = 1;
+    c.pipeline_specialization = 1;
     return c;
 }
 
@@ -12400,6 +12401,18 @@ RealVulkanBackend::create_graphics_pipelines(const vkrpc::CreateGraphicsPipeline
         resp.reason = "unknown device handle";
         return resp;
     }
+    {
+        std::vector<const vkrpc::SpecializationInfoDesc*> infos;
+        infos.reserve(req.stages.size());
+        for (const vkrpc::ShaderStageDesc& stage : req.stages) {
+            infos.push_back(&stage.specialization);
+        }
+        if (!vkrpc::pipeline_specialization_ok(
+                infos, vkrpc::kMaxSpecializationDataBytesPerGraphicsRequest, resp.reason)) {
+            resp.ok = false;
+            return resp;
+        }
+    }
     // (GL/zink): FAITHFUL graphics pipeline -- build the full create-info from the carried
     // state (any stages / vertex input / topology / rasterization / multisample / colour-blend /
     // dynamic state); the host driver gates it. pipelineCache is ignored (no-op). The depth-stencil
@@ -12410,6 +12423,11 @@ RealVulkanBackend::create_graphics_pipelines(const vkrpc::CreateGraphicsPipeline
     // enable rejects BEFORE the host sees it (mock == real, the ICD's predicate mirrored).
     std::vector<VkPipelineShaderStageRequiredSubgroupSizeCreateInfo> stage_subgroup(
         req.stages.size());
+    // Specialization storage is indexed by stage and fully sized before any Vk pointer is
+    // published. The request owns each data blob through the synchronous host create call.
+    std::vector<VkSpecializationInfo> stage_specialization(req.stages.size());
+    std::vector<std::vector<VkSpecializationMapEntry>> stage_specialization_entries(
+        req.stages.size());
     std::size_t stage_idx = 0;
     for (const vkrpc::ShaderStageDesc& s : req.stages) {
         const auto sm = shader_modules_.find(s.module);
@@ -12418,11 +12436,32 @@ RealVulkanBackend::create_graphics_pipelines(const vkrpc::CreateGraphicsPipeline
             resp.reason = "pipeline stage references a shader module not on the device";
             return resp;
         }
+        if (!vkrpc::pipeline_entry_point_name_ok(s.entry, resp.reason)) {
+            resp.ok = false;
+            return resp;
+        }
         VkPipelineShaderStageCreateInfo st{};
         st.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         st.stage = static_cast<VkShaderStageFlagBits>(s.stage);
         st.module = sm->second.vk;
         st.pName = s.entry.empty() ? "main" : s.entry.c_str();
+        if (s.specialization.present != 0) {
+            auto& entries = stage_specialization_entries[stage_idx];
+            entries.reserve(s.specialization.map_entries.size());
+            for (const vkrpc::SpecializationMapEntryDesc& entry : s.specialization.map_entries) {
+                VkSpecializationMapEntry vk_entry{};
+                vk_entry.constantID = static_cast<std::uint32_t>(entry.constant_id);
+                vk_entry.offset = static_cast<std::uint32_t>(entry.offset);
+                vk_entry.size = static_cast<std::size_t>(entry.size);
+                entries.push_back(vk_entry);
+            }
+            VkSpecializationInfo& info = stage_specialization[stage_idx];
+            info.mapEntryCount = static_cast<std::uint32_t>(entries.size());
+            info.pMapEntries = entries.empty() ? nullptr : entries.data();
+            info.dataSize = s.specialization.data.size();
+            info.pData = s.specialization.data.empty() ? nullptr : s.specialization.data.data();
+            st.pSpecializationInfo = &info;
+        }
         if (s.stage_flags != 0 || s.required_subgroup_size != 0) {
             if ((dev->second.vk13_feature_bits & vkrpc::kVk13FeatureSubgroupSizeControl) == 0) {
                 resp.ok = false;
@@ -12885,6 +12924,11 @@ RealVulkanBackend::create_compute_pipelines(const vkrpc::CreateComputePipelinesR
         resp.reason = "unknown device handle";
         return resp;
     }
+    if (!vkrpc::pipeline_specialization_ok(
+            {&req.specialization}, vkrpc::kMaxSpecializationDataBytesPerStage, resp.reason)) {
+        resp.ok = false;
+        return resp;
+    }
     if (req.pipeline_cache != 0) {
         resp.ok = false;
         resp.reason = "compute pipeline requires pipelineCache == VK_NULL_HANDLE";
@@ -12907,12 +12951,36 @@ RealVulkanBackend::create_compute_pipelines(const vkrpc::CreateComputePipelinesR
         resp.reason = "compute pipeline entry point must be non-empty";
         return resp;
     }
+    if (!vkrpc::pipeline_entry_point_name_ok(req.entry_point, resp.reason)) {
+        resp.ok = false;
+        return resp;
+    }
     VkComputePipelineCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = sm->second.vk;
     ci.stage.pName = req.entry_point.c_str();
+    std::vector<VkSpecializationMapEntry> specialization_entries;
+    VkSpecializationInfo specialization_info{};
+    if (req.specialization.present != 0) {
+        specialization_entries.reserve(req.specialization.map_entries.size());
+        for (const vkrpc::SpecializationMapEntryDesc& entry : req.specialization.map_entries) {
+            VkSpecializationMapEntry vk_entry{};
+            vk_entry.constantID = static_cast<std::uint32_t>(entry.constant_id);
+            vk_entry.offset = static_cast<std::uint32_t>(entry.offset);
+            vk_entry.size = static_cast<std::size_t>(entry.size);
+            specialization_entries.push_back(vk_entry);
+        }
+        specialization_info.mapEntryCount =
+            static_cast<std::uint32_t>(specialization_entries.size());
+        specialization_info.pMapEntries =
+            specialization_entries.empty() ? nullptr : specialization_entries.data();
+        specialization_info.dataSize = req.specialization.data.size();
+        specialization_info.pData =
+            req.specialization.data.empty() ? nullptr : req.specialization.data.data();
+        ci.stage.pSpecializationInfo = &specialization_info;
+    }
     ci.layout = layout->second.vk;
     ci.basePipelineIndex = -1;
     // Vulkan 1.3 support (subgroupSizeControl): the compute stage's admitted flags + required-size

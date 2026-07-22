@@ -793,9 +793,9 @@ inline bool bind_descriptor_sets_ok(VkPipelineBindPoint bind_point, std::uint32_
 // GL/zink: FAITHFUL graphics-pipeline admission. The full rasterization / multisample /
 // colour-blend / depth-stencil / viewport-count / tessellation state is now CARRIED, so the host
 // driver gates it; the predicate only fail-closes on state the wire does NOT carry: a pipeline /
-// per-stage pNext or flags, derivatives, per-stage SPECIALIZATION constants, an explicit sample
-// MASK, and STATIC viewports/scissors (zink uses dynamic). The depth-determining state keeps its
-// hardened worker-side cross-check (a depth render pass needs depth-stencil state).
+// per-stage pNext or flags, derivatives, specialization when the worker capability is absent, an
+// explicit sample MASK, and STATIC viewports/scissors (zink uses dynamic). The depth-determining
+// state keeps its hardened worker-side cross-check (a depth render pass needs depth-stencil state).
 // Native lane, dynamic rendering: `allow_dynamic_rendering_
 // pnext` is TRUE only when the caller is on the native lane AND the device enabled
 // VK_KHR_dynamic_rendering. It ADMITS exactly one top-level pNext -- VkPipelineRenderingCreateInfo
@@ -820,7 +820,8 @@ inline bool bind_descriptor_sets_ok(VkPipelineBindPoint bind_point, std::uint32_
 //     (VALID bit cleared), the spec-allowed "no feedback" answer.
 inline bool pipeline_stage_shape_ok(const VkPipelineShaderStageCreateInfo& s,
                                     bool allow_subgroup_size_control, bool allow_full_subgroups,
-                                    bool is_compute, const char** reason) {
+                                    bool is_compute, const char** reason,
+                                    bool allow_specialization = false) {
     VkPipelineShaderStageCreateFlags allowed_flags = 0;
     if (allow_subgroup_size_control) {
         allowed_flags |= VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT;
@@ -842,8 +843,27 @@ inline bool pipeline_stage_shape_ok(const VkPipelineShaderStageCreateInfo& s,
         *reason = "pipeline stage pNext not supported";
         return false;
     }
-    if (s.pSpecializationInfo != nullptr) {
+    if (s.pSpecializationInfo != nullptr && !allow_specialization) {
         *reason = "pipeline stage specialization constants not supported";
+        return false;
+    }
+    return true;
+}
+
+// Specialization arrays are copied only after the capability and bounded-count gates. Keep the
+// remaining Vulkan pointer/count rules pure so unit tests can pin both null rejection and the
+// spec's ignored-pointer behavior at zero count/size.
+inline bool pipeline_specialization_pointer_shape_ok(const VkSpecializationInfo* info,
+                                                     const char** reason) {
+    if (info == nullptr) {
+        return true;
+    }
+    if (info->mapEntryCount != 0 && info->pMapEntries == nullptr) {
+        *reason = "pipeline specialization has nonzero mapEntryCount but null pMapEntries";
+        return false;
+    }
+    if (info->dataSize != 0 && info->pData == nullptr) {
+        *reason = "pipeline specialization has nonzero dataSize but null pData";
         return false;
     }
     return true;
@@ -853,7 +873,8 @@ inline bool graphics_pipeline_ok(const VkGraphicsPipelineCreateInfo* ci,
                                  bool allow_dynamic_rendering_pnext, bool allow_cache_control_flags,
                                  bool allow_subgroup_size_control, bool allow_pipeline_feedback,
                                  bool allow_vertex_attribute_divisor,
-                                 bool allow_rasterization_stream, const char** reason) {
+                                 bool allow_rasterization_stream, const char** reason,
+                                 bool allow_specialization = false) {
     VkPipelineCreateFlags allowed_flags = 0;
     if (allow_cache_control_flags) {
         allowed_flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
@@ -881,8 +902,8 @@ inline bool graphics_pipeline_ok(const VkGraphicsPipelineCreateInfo* ci,
     }
     for (std::uint32_t i = 0; i < ci->stageCount; ++i) {
         if (!pipeline_stage_shape_ok(ci->pStages[i], allow_subgroup_size_control,
-                                     /*allow_full_subgroups=*/false, /*is_compute=*/false,
-                                     reason)) {
+                                     /*allow_full_subgroups=*/false, /*is_compute=*/false, reason,
+                                     allow_specialization)) {
             return false;
         }
     }
@@ -1059,13 +1080,13 @@ inline bool bind_pipeline_ok(VkPipelineBindPoint bind_point, const char** reason
 }
 
 // Compute: FAITHFUL compute-pipeline admission -- fail-closed on everything the wire
-// does not carry: derivatives, SPECIALIZATION constants (a named reject; carrying them is a
-// separate follow-up), and any shape the 1.3 allow_* bools (documented above
+// does not carry: derivatives, specialization when the worker capability is absent, and any
+// shape the 1.3 allow_* bools (documented above
 // graphics_pipeline_ok) do not admit. The stage must be exactly COMPUTE with a module + a name.
 inline bool compute_pipeline_ok(const VkComputePipelineCreateInfo* ci,
                                 bool allow_cache_control_flags, bool allow_subgroup_size_control,
                                 bool allow_full_subgroups, bool allow_pipeline_feedback,
-                                const char** reason) {
+                                const char** reason, bool allow_specialization = false) {
     VkPipelineCreateFlags allowed_flags = 0;
     if (allow_cache_control_flags) {
         allowed_flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
@@ -1092,7 +1113,7 @@ inline bool compute_pipeline_ok(const VkComputePipelineCreateInfo* ci,
     }
     const VkPipelineShaderStageCreateInfo& s = ci->stage;
     if (!pipeline_stage_shape_ok(s, allow_subgroup_size_control, allow_full_subgroups,
-                                 /*is_compute=*/true, reason)) {
+                                 /*is_compute=*/true, reason, allow_specialization)) {
         return false;
     }
     if (s.stage != VK_SHADER_STAGE_COMPUTE_BIT || s.module == VK_NULL_HANDLE ||
