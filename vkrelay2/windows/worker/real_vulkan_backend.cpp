@@ -23,6 +23,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -4448,6 +4449,7 @@ vkrpc::CreateImageResponse RealVulkanBackend::create_image(const vkrpc::CreateIm
     im.array_layers = ici.arrayLayers;
     im.alignment = mr.alignment;
     im.memory_type_bits = mr.memoryTypeBits;
+    image_tombstones_.forget(h);
     images_.emplace(h, im);
     dev->second.images.insert(h);
     resp.ok = true;
@@ -4602,6 +4604,8 @@ vkrpc::StatusResponse RealVulkanBackend::destroy_image(const vkrpc::HandleReques
         vkDestroyImage(dev->second.vk, it->second.vk, nullptr);
         dev->second.images.erase(req.handle);
     }
+    image_tombstones_.remember(
+        {req.handle, vkrpc::ImageOrigin::App, vkrpc::ImageDestroyCause::DestroyImage, 0});
     images_.erase(it);
     resp.ok = true;
     resp.reason = "ok";
@@ -5737,6 +5741,8 @@ vkrpc::StatusResponse RealVulkanBackend::destroy_swapchain(const vkrpc::HandleRe
     // The swapchain's images die with it: drop their resolvable entries so a destroyed
     // swapchain's image handle can no longer be referenced by record_command_buffer.
     for (const std::uint64_t img : it->second.images) {
+        image_tombstones_.remember({img, vkrpc::ImageOrigin::Swapchain,
+                                    vkrpc::ImageDestroyCause::DestroySwapchain, req.handle});
         images_.erase(img);
     }
     swapchains_.erase(it);
@@ -5783,6 +5789,7 @@ bool RealVulkanBackend::ensure_swapchain_images(std::uint64_t swapchain_handle, 
         meta.extent = sc.extent;
         meta.mip_levels = 1;
         meta.array_layers = 1;
+        image_tombstones_.forget(handle);
         images_.emplace(handle, meta);
     }
     return true;
@@ -7103,8 +7110,17 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
                 std::vector<VkImage> imgs;
                 for (const vkrpc::ImageMemoryBarrier2& im : d.image) {
                     const auto img = images_.find(im.image);
-                    if (img == images_.end() || img->second.device != device) {
-                        resp.reason = "sync2 image barrier references an image not on the device";
+                    if (img == images_.end()) {
+                        resp.reason =
+                            vkrpc::describe_missing_sync2_image(image_tombstones_, im.image);
+                        return false;
+                    }
+                    if (img->second.device != device) {
+                        std::ostringstream reason;
+                        reason << "sync2 image barrier references image " << im.image
+                               << " on device " << img->second.device
+                               << ", command buffer device is " << device;
+                        resp.reason = reason.str();
                         return false;
                     }
                     if (img->second.app_created && img->second.bound_memory == 0) {

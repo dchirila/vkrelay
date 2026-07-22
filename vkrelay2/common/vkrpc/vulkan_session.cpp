@@ -55,7 +55,7 @@ class DecodedOpTrace {
             return;
         }
         std::fprintf(stderr, "vkrelay2-optrace: path=%s\n", path);
-        out_ << "{\"event\":\"header\",\"version\":2,\"max_recordings\":" << kMaxRecordings
+        out_ << "{\"event\":\"header\",\"version\":3,\"max_recordings\":" << kMaxRecordings
              << ",\"max_commands\":" << kMaxCommands
              << ",\"max_upload_ranges\":" << kMaxUploadRanges << ",\"max_events\":" << kMaxEvents
              << "}\n";
@@ -107,8 +107,10 @@ class DecodedOpTrace {
                  << "\",\"deps_raw_hash\":\"" << hex(deps_raw.value)
                  << "\",\"deps_ordinal_hash\":\"" << hex(deps_ordinal.value)
                  << "\",\"deps_scalar_hash\":\"" << hex(deps_scalar.value)
-                 << "\",\"deps_handle_hash\":\"" << hex(deps_handles.value) << "\",\"handles\":\""
-                 << named << '"';
+                 << "\",\"deps_handle_hash\":\"" << hex(deps_handles.value)
+                 << "\",\"dependency_images\":[";
+            write_dependency_images(c.deps2);
+            out_ << "],\"handles\":\"" << named << '"';
             write_command_details(c);
             out_ << "}\n";
             ++commands_;
@@ -346,6 +348,38 @@ class DecodedOpTrace {
             out_ << "\"image#" << ordinal("image", resp.images[i]) << "\"";
         }
         out_ << "]}\n";
+        if (resp.ok) {
+            swapchain_images_[req.swapchain] = resp.images;
+        }
+    }
+
+    void destroy_image(std::uint32_t request_id, const HandleRequest& req,
+                       const StatusResponse& resp) {
+        if (!can_emit()) {
+            return;
+        }
+        out_ << "{\"event\":\"destroy_image\",\"seq\":" << seq_++ << ",\"request\":" << request_id
+             << ",\"ok\":" << (resp.ok ? "true" : "false") << ",\"image\":\"image#"
+             << ordinal("image", req.handle) << "\"}\n";
+    }
+
+    void destroy_swapchain(std::uint32_t request_id, const HandleRequest& req,
+                           const StatusResponse& resp) {
+        if (!can_emit()) {
+            return;
+        }
+        out_ << "{\"event\":\"destroy_swapchain\",\"seq\":" << seq_++
+             << ",\"request\":" << request_id << ",\"ok\":" << (resp.ok ? "true" : "false")
+             << ",\"swapchain\":\"swapchain#" << ordinal("swapchain", req.handle)
+             << "\",\"images\":[";
+        const auto found = swapchain_images_.find(req.handle);
+        if (found != swapchain_images_.end()) {
+            write_handle_ordinals("image", found->second);
+            if (resp.ok) {
+                swapchain_images_.erase(found);
+            }
+        }
+        out_ << "]}\n";
     }
 
     void create_image_view(std::uint32_t request_id, const CreateImageViewRequest& req,
@@ -446,6 +480,21 @@ class DecodedOpTrace {
                 out_ << ',';
             }
             out_ << '"' << category << '#' << ordinal(category, values[i]) << '"';
+        }
+    }
+
+    void write_dependency_images(const std::vector<DependencyInfo2>& deps) {
+        bool first = true;
+        for (std::size_t dependency = 0; dependency < deps.size(); ++dependency) {
+            for (std::size_t barrier = 0; barrier < deps[dependency].image.size(); ++barrier) {
+                if (!first) {
+                    out_ << ',';
+                }
+                first = false;
+                out_ << "{\"dependency\":" << dependency << ",\"barrier\":" << barrier
+                     << ",\"image\":\"image#"
+                     << ordinal("image", deps[dependency].image[barrier].image) << "\"}";
+            }
         }
     }
 
@@ -683,6 +732,7 @@ class DecodedOpTrace {
     std::ofstream out_;
     std::map<std::pair<std::string, std::uint64_t>, std::uint64_t> ordinals_;
     std::map<std::string, std::uint64_t> next_ordinal_;
+    std::map<std::uint64_t, std::vector<std::uint64_t>> swapchain_images_;
     std::uint64_t seq_ = 0;
     std::uint64_t recordings_ = 0;
     std::uint64_t commands_ = 0;
@@ -2748,6 +2798,52 @@ bool core_indirect_count_draw_args(const RecordedCommand& command, CoreIndirectC
     args.count_buffer = command.indirect_count_buffer;
     args.count_buffer_offset = command.indirect_count_buffer_offset;
     return true;
+}
+
+void ImageTombstoneRing::remember(ImageTombstone tombstone) {
+    forget(tombstone.image);
+    if (entries_.size() == kCapacity) {
+        entries_.erase(entries_.begin());
+    }
+    entries_.push_back(tombstone);
+}
+
+void ImageTombstoneRing::forget(std::uint64_t image) {
+    entries_.erase(
+        std::remove_if(entries_.begin(), entries_.end(),
+                       [image](const ImageTombstone& entry) { return entry.image == image; }),
+        entries_.end());
+}
+
+const ImageTombstone* ImageTombstoneRing::find(std::uint64_t image) const {
+    for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+        if (it->image == image) {
+            return &*it;
+        }
+    }
+    return nullptr;
+}
+
+std::string describe_missing_sync2_image(const ImageTombstoneRing& tombstones,
+                                         std::uint64_t image) {
+    const ImageTombstone* tombstone = tombstones.find(image);
+    std::ostringstream reason;
+    if (tombstone == nullptr) {
+        reason << "sync2 image barrier references unknown image handle " << image
+               << " (never seen or tombstone expired)";
+    } else {
+        const char* cause = tombstone->cause == ImageDestroyCause::DestroyImage
+                                ? "destroy_image"
+                                : "destroy_swapchain";
+        if (tombstone->origin == ImageOrigin::App) {
+            reason << "sync2 image barrier references destroyed app image " << image << " ("
+                   << cause << ')';
+        } else {
+            reason << "sync2 image barrier references destroyed swapchain image " << image
+                   << " (swapchain " << tombstone->swapchain << ", " << cause << ')';
+        }
+    }
+    return reason.str();
 }
 
 bool validate_dependency_info2(const DependencyInfo2& d, std::string& reason) {
@@ -7646,6 +7742,7 @@ CreateImageResponse MockVulkanBackend::create_image(const CreateImageRequest& re
     im.array_layers = req.array_layers > 0 ? req.array_layers : 1;
     im.alignment = 256;
     im.memory_type_bits = type_bits;
+    image_tombstones_.forget(h);
     images_.emplace(h, im);
     dev->second.images.insert(h);
     resp.ok = true;
@@ -7685,6 +7782,7 @@ StatusResponse MockVulkanBackend::destroy_image(const HandleRequest& req) {
     if (dev != devices_.end()) {
         dev->second.images.erase(req.handle);
     }
+    image_tombstones_.remember({req.handle, ImageOrigin::App, ImageDestroyCause::DestroyImage, 0});
     images_.erase(it);
     resp.ok = true;
     resp.reason = "ok";
@@ -8076,6 +8174,8 @@ StatusResponse MockVulkanBackend::destroy_swapchain(const HandleRequest& req) {
     // The swapchain's images die with it: drop their resolvable entries so a destroyed
     // swapchain's image handle can no longer be referenced by record_command_buffer.
     for (const std::uint64_t img : it->second.images) {
+        image_tombstones_.remember(
+            {img, ImageOrigin::Swapchain, ImageDestroyCause::DestroySwapchain, req.handle});
         images_.erase(img);
     }
     swapchains_.erase(it);
@@ -8100,6 +8200,7 @@ void MockVulkanBackend::ensure_swapchain_images(std::uint64_t swapchain_handle, 
         meta.surface = sc.surface;
         meta.transfer_dst = sc.transfer_dst;
         meta.format = sc.image_format;
+        image_tombstones_.forget(img);
         images_.emplace(img, meta);
     }
 }
@@ -9046,8 +9147,16 @@ StatusResponse MockVulkanBackend::record_command_buffer(const RecordCommandBuffe
                 }
                 for (const ImageMemoryBarrier2& im : d.image) {
                     const auto img = images_.find(im.image);
-                    if (img == images_.end() || img->second.device != device) {
-                        resp.reason = "sync2 image barrier references an image not on the device";
+                    if (img == images_.end()) {
+                        resp.reason = describe_missing_sync2_image(image_tombstones_, im.image);
+                        return false;
+                    }
+                    if (img->second.device != device) {
+                        std::ostringstream reason;
+                        reason << "sync2 image barrier references image " << im.image
+                               << " on device " << img->second.device
+                               << ", command buffer device is " << device;
+                        resp.reason = reason.str();
                         return false;
                     }
                     if (img->second.app_created && img->second.bound_memory == 0) {
@@ -12499,7 +12608,10 @@ void serve_vulkan_rpc(RpcChannel& channel, VulkanBackend& backend) {
                 break;
             case RpcOp::DestroySwapchain:
                 if (parse_body()) {
-                    reply(backend.destroy_swapchain(HandleRequest::from_body(body)).to_body());
+                    const HandleRequest dreq = HandleRequest::from_body(body);
+                    const StatusResponse dresp = backend.destroy_swapchain(dreq);
+                    op_trace.destroy_swapchain(req.request_id, dreq, dresp);
+                    reply(dresp.to_body());
                 }
                 break;
             case RpcOp::GetSwapchainImages:
@@ -13024,7 +13136,10 @@ void serve_vulkan_rpc(RpcChannel& channel, VulkanBackend& backend) {
             }
             case RpcOp::DestroyImage:
                 if (parse_body()) {
-                    reply(backend.destroy_image(HandleRequest::from_body(body)).to_body());
+                    const HandleRequest dreq = HandleRequest::from_body(body);
+                    const StatusResponse dresp = backend.destroy_image(dreq);
+                    op_trace.destroy_image(req.request_id, dreq, dresp);
+                    reply(dresp.to_body());
                 }
                 break;
             case RpcOp::BindImageMemory: {

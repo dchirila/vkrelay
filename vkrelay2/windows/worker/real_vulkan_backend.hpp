@@ -1051,7 +1051,8 @@ class RealVulkanBackend : public vkrpc::VulkanBackend, public sidecar::SidecarBa
     // (members destroy in reverse order -- the WndProc must never enqueue into a destroyed ring).
     sidecar::InputQueue input_queue_;
     std::map<std::uint64_t, RealSwapchain> swapchains_;
-    std::map<std::uint64_t, RealImage> images_;              // swapchain image handle -> metadata
+    std::map<std::uint64_t, RealImage> images_; // swapchain image handle -> metadata
+    vkrpc::ImageTombstoneRing image_tombstones_;
     std::map<std::uint64_t, RealCmdBuffer> command_buffers_; // command buffer handle -> metadata
     // Draw-surface object tables.
     std::map<std::uint64_t, RealImageView> image_views_;

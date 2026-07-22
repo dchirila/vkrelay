@@ -3033,7 +3033,10 @@ VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice, VkSwapchainKHR swapchai
     try {
         vkrpc::HandleRequest req;
         req.handle = from_handle(swapchain);
-        (void) vkrpc::destroy_swapchain(*g_rpc, next_id(), req);
+        const std::uint32_t request_id = next_id();
+        icd_trace("DestroySwapchain request=%u swapchain=%llu", request_id,
+                  static_cast<unsigned long long>(req.handle));
+        (void) vkrpc::destroy_swapchain(*g_rpc, request_id, req);
     } catch (const std::exception&) {
     }
 }
@@ -4935,7 +4938,10 @@ VKAPI_ATTR void VKAPI_CALL DestroyImage(VkDevice, VkImage image, const VkAllocat
     try {
         vkrpc::HandleRequest req;
         req.handle = from_handle(image);
-        (void) vkrpc::destroy_image(*g_rpc, next_id(), req);
+        const std::uint32_t request_id = next_id();
+        icd_trace("DestroyImage request=%u image=%llu", request_id,
+                  static_cast<unsigned long long>(req.handle));
+        (void) vkrpc::destroy_image(*g_rpc, request_id, req);
         g_image_reqs.erase(from_handle(image));
         g_image_subresource.erase(from_handle(image));
     } catch (const std::exception&) {
@@ -6358,6 +6364,9 @@ bool flatten_dependency_info2(const VkDependencyInfo* dep, vkrpc::DependencyInfo
         im.level_count = static_cast<long long>(b.subresourceRange.levelCount);
         im.base_layer = static_cast<long long>(b.subresourceRange.baseArrayLayer);
         im.layer_count = static_cast<long long>(b.subresourceRange.layerCount);
+        icd_trace("Sync2ImageBarrier index=%u image=%llu old_layout=%d new_layout=%d", i,
+                  static_cast<unsigned long long>(im.image), static_cast<int>(b.oldLayout),
+                  static_cast<int>(b.newLayout));
         out.image.push_back(im);
     }
     return true;

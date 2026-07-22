@@ -2417,6 +2417,8 @@ void test_record_invalidated_by_destroy_swapchain() {
     vkrpc::CreateDeviceRequest cdr;
     cdr.instance = ci.instance;
     cdr.physical_device = en.devices.front().handle;
+    cdr.enabled_extensions = {vkrpc::kSync2ExtensionName};
+    cdr.synchronization2_feature_enabled = 1;
     const vkrpc::CreateDeviceResponse cd = backend.create_device(cdr);
     vkrpc::GetDeviceQueueRequest gq;
     gq.device = cd.device;
@@ -2454,6 +2456,71 @@ void test_record_invalidated_by_destroy_swapchain() {
     VKR_CHECK(bufs.ok && bufs.command_buffers.size() == 1);
     const std::uint64_t cmd = bufs.command_buffers[0];
 
+    const auto sync2_record = [&](std::uint64_t image) {
+        vkrpc::ImageMemoryBarrier2 barrier;
+        barrier.src_stage = 0x1;    // TOP_OF_PIPE
+        barrier.dst_stage = 0x1000; // TRANSFER
+        barrier.old_layout = 0;     // UNDEFINED
+        barrier.new_layout = 7;     // TRANSFER_DST_OPTIMAL
+        barrier.src_queue_family = vkrpc::kVkQueueFamilyIgnored;
+        barrier.dst_queue_family = vkrpc::kVkQueueFamilyIgnored;
+        barrier.image = image;
+        barrier.aspect = vkrpc::kImageAspectColor;
+        barrier.level_count = 1;
+        barrier.layer_count = 1;
+        vkrpc::DependencyInfo2 dependency;
+        dependency.image.push_back(barrier);
+        vkrpc::RecordedCommand command;
+        command.kind = "pipeline_barrier2";
+        command.deps2.push_back(dependency);
+        vkrpc::RecordCommandBufferRequest request;
+        request.command_buffer = cmd;
+        request.commands.push_back(command);
+        return request;
+    };
+
+    // Split the two pre-existing failure classes: a never-seen handle is distinct from a live
+    // image owned by another device. The real backend mirrors these exact reason shapes.
+    const std::uint64_t unknown_image = 0xDEADBEEF;
+    const vkrpc::StatusResponse unknown =
+        backend.record_command_buffer(sync2_record(unknown_image));
+    VKR_CHECK(!unknown.ok);
+    VKR_CHECK_EQ(unknown.reason, "sync2 image barrier references unknown image handle " +
+                                     std::to_string(unknown_image) +
+                                     " (never seen or tombstone expired)");
+
+    vkrpc::CreateDeviceRequest other_cdr = cdr;
+    const vkrpc::CreateDeviceResponse other_device = backend.create_device(other_cdr);
+    VKR_CHECK(other_device.ok);
+    vkrpc::CreateImageRequest other_ir;
+    other_ir.device = other_device.device;
+    other_ir.image_type = vkrpc::kImageType2D;
+    other_ir.format = vkrpc::kFormatR8G8B8A8Unorm;
+    other_ir.width = 1;
+    other_ir.height = 1;
+    other_ir.depth = 1;
+    other_ir.mip_levels = 1;
+    other_ir.array_layers = 1;
+    other_ir.samples = 1;
+    other_ir.tiling = vkrpc::kImageTilingOptimal;
+    other_ir.usage = vkrpc::kImageUsageTransferDst;
+    other_ir.sharing_mode = 0;
+    other_ir.initial_layout = 0;
+    const vkrpc::CreateImageResponse other_image = backend.create_image(other_ir);
+    VKR_CHECK(other_image.ok);
+    const vkrpc::StatusResponse wrong_device =
+        backend.record_command_buffer(sync2_record(other_image.image));
+    VKR_CHECK(!wrong_device.ok);
+    VKR_CHECK_EQ(wrong_device.reason,
+                 "sync2 image barrier references image " + std::to_string(other_image.image) +
+                     " on device " + std::to_string(other_device.device) +
+                     ", command buffer device is " + std::to_string(cd.device));
+
+    // Capture a sync2 barrier while the image is live, but defer sending the request until after
+    // swapchain destruction. This is the worker-side shape of the ICD's vkCmd* -> destroy ->
+    // vkEndCommandBuffer batching window; it remains deliberately rejected.
+    const vkrpc::RecordCommandBufferRequest stale_sync2 = sync2_record(imgs.images[0]);
+
     // Record a clear against the swapchain image, then submit OK.
     vkrpc::RecordCommandBufferRequest rec;
     rec.command_buffer = cmd;
@@ -2473,6 +2540,11 @@ void test_record_invalidated_by_destroy_swapchain() {
     h.handle = sc.swapchain;
     VKR_CHECK(backend.destroy_swapchain(h).ok);
     VKR_CHECK(!backend.queue_submit(sub).ok);
+    const vkrpc::StatusResponse stale = backend.record_command_buffer(stale_sync2);
+    VKR_CHECK(!stale.ok);
+    VKR_CHECK_EQ(stale.reason, "sync2 image barrier references destroyed swapchain image " +
+                                   std::to_string(imgs.images[0]) + " (swapchain " +
+                                   std::to_string(sc.swapchain) + ", destroy_swapchain)");
 }
 
 // record/submit command fields decode wide: a missing image/stage becomes a sentinel the
@@ -6621,6 +6693,8 @@ void test_image_command_invalidation_mock() {
     vkrpc::CreateDeviceRequest cdr;
     cdr.instance = ci.instance;
     cdr.physical_device = phys;
+    cdr.enabled_extensions = {vkrpc::kSync2ExtensionName};
+    cdr.synchronization2_feature_enabled = 1;
     const vkrpc::CreateDeviceResponse cd = backend.create_device(cdr);
     const std::uint64_t dev = cd.device;
 
@@ -6684,12 +6758,36 @@ void test_image_command_invalidation_mock() {
     rc.commands = {bar};
     VKR_CHECK(backend.record_command_buffer(rc).ok);
 
+    vkrpc::ImageMemoryBarrier2 sync2_barrier;
+    sync2_barrier.src_stage = 0x1;
+    sync2_barrier.dst_stage = 0x1000;
+    sync2_barrier.old_layout = 0;
+    sync2_barrier.new_layout = 7;
+    sync2_barrier.src_queue_family = vkrpc::kVkQueueFamilyIgnored;
+    sync2_barrier.dst_queue_family = vkrpc::kVkQueueFamilyIgnored;
+    sync2_barrier.image = img.image;
+    sync2_barrier.aspect = vkrpc::kImageAspectColor;
+    sync2_barrier.level_count = 1;
+    sync2_barrier.layer_count = 1;
+    vkrpc::DependencyInfo2 sync2_dependency;
+    sync2_dependency.image.push_back(sync2_barrier);
+    vkrpc::RecordedCommand sync2_command;
+    sync2_command.kind = "pipeline_barrier2";
+    sync2_command.deps2.push_back(sync2_dependency);
+    vkrpc::RecordCommandBufferRequest stale_sync2;
+    stale_sync2.command_buffer = cmd;
+    stale_sync2.commands.push_back(sync2_command);
+
     vkrpc::QueueSubmitRequest qs;
     qs.queue = queue;
     qs.command_buffers = {cmd};
     VKR_CHECK(backend.queue_submit(qs).ok); // submittable while the image lives
     VKR_CHECK(backend.destroy_image({img.image}).ok);
     VKR_CHECK(!backend.queue_submit(qs).ok); // destroying the image invalidated the recorded CB
+    const vkrpc::StatusResponse stale = backend.record_command_buffer(stale_sync2);
+    VKR_CHECK(!stale.ok);
+    VKR_CHECK_EQ(stale.reason, "sync2 image barrier references destroyed app image " +
+                                   std::to_string(img.image) + " (destroy_image)");
 }
 
 // Sampler, combined-image-sampler, and texture-upload wire round-trips.

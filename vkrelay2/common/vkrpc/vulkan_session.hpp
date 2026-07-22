@@ -789,6 +789,34 @@ struct DependencyInfo2 {
 // backend additionally checks buffer/image handle liveness on the CB's device. Returns false + sets
 // `reason` on the first violation.
 bool validate_dependency_info2(const DependencyInfo2& d, std::string& reason);
+
+// Diagnostic-only history for image handles removed from the live registry. Command recording is
+// batched by the ICD, so a barrier captured locally can arrive after an immediate image/swapchain
+// destroy RPC. Keeping a small bounded history lets the record-time rejection distinguish that
+// ordering from a handle the worker has never seen, without retaining or accepting a dead VkImage.
+enum class ImageOrigin { App, Swapchain };
+enum class ImageDestroyCause { DestroyImage, DestroySwapchain };
+struct ImageTombstone {
+    std::uint64_t image = 0;
+    ImageOrigin origin = ImageOrigin::App;
+    ImageDestroyCause cause = ImageDestroyCause::DestroyImage;
+    std::uint64_t swapchain = 0;
+};
+class ImageTombstoneRing {
+  public:
+    static constexpr std::size_t kCapacity = 64;
+
+    void remember(ImageTombstone tombstone);
+    void forget(std::uint64_t image);
+    const ImageTombstone* find(std::uint64_t image) const;
+
+  private:
+    std::vector<ImageTombstone> entries_;
+};
+
+// Exact mock/real-parity reason for a missing sync2 image. Live-but-wrong-device is deliberately
+// handled separately by each backend so the diagnostic can include both device handles.
+std::string describe_missing_sync2_image(const ImageTombstoneRing& tombstones, std::uint64_t image);
 // Hard semantic caps: explicit per-array bounds so malformed input is
 // rejected structurally, with overflow-safe length arithmetic (like the wait_events invariant).
 constexpr std::uint64_t kMaxSync2Dependencies = 256;   // DependencyInfo2 per command
@@ -4067,6 +4095,7 @@ class MockVulkanBackend : public VulkanBackend, public sidecar::SidecarBackend {
     sidecar::InputQueue input_queue_;
     std::map<std::uint64_t, Swapchain> swapchains_;
     std::map<std::uint64_t, Image> images_; // swapchain image handle -> resolvable metadata
+    ImageTombstoneRing image_tombstones_;
     // Draw-surface object tables.
     std::map<std::uint64_t, ImageView> image_views_;
     std::map<std::uint64_t, BufferView> buffer_views_; // (GL/zink): texel buffer views
