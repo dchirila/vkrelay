@@ -1,12 +1,10 @@
-# vkrelay2 focused window-capture dev helper.
+# vkrelay2 worker-window capture and topology helper.
 #
 # Finds a vkrelay2 worker window (class prefix vkrelay2_worker_win_) and saves a PNG of its CLIENT
-# area + an optional JSON metadata sidecar -- for eyeballing placeholder chrome / popups / z-order /
-# focus during bring-up.
+# area + an optional JSON metadata sidecar. It can also report every matching top-level worker HWND
+# without capturing one, for catalog topology assertions.
 #
-# IMPORTANT -- this is a DEVELOPER CONVENIENCE, NOT a gate. The trustworthy, occlusion/minimize-proof
-# capture path is the worker's OWN source layers (vkrelay2-capture + DebugCaptureWindow). This
-# helper scrapes the desktop, so its limits are real and documented:
+# This helper can support a smoke gate, but it still scrapes a host HWND and has real limits:
 #   - PrintWindow returns black/solid frames for flip-model Vulkan (DXGI) surface content;
 #   - the CopyFromScreen fallback (-AllowForegroundFallback) needs the window visible + unoccluded;
 #   - minimized / off-screen windows are unreliable with either method.
@@ -16,13 +14,15 @@
 # Write-Output'd -- or written through a closure-captured local -- from inside the delegate is LOST
 # (pipeline scope mismatch). Collect via a $global ArrayList instead.
 #
-# Output: one "RESULT status=... [unique_colors=N] [client=WxH] ..." line on stdout.
-# Exit codes: 0 captured ok, 2 no matching window / bad args, 3 capture failed / degenerate.
+# Output: exactly one "RESULT status=... [unique_colors=N] [client=WxH] ..." line on stdout.
+# Exit codes: 0 captured/reported ok, 2 selection/topology/bad args, 3 capture failed/degenerate.
 #
 # Usage:
 #   capture_window.ps1 -OutputPng out.png [-EmitJson out.json]
 #       [-Hwnd <n> | -ProcessId <n> | -TitleMatch <substr>] [-ClassPrefix vkrelay2_worker_win_]
-#       [-AllowForegroundFallback] [-MinUniqueColors <n>] [-MaxWaitSec 10] [-WarmupSec 1]
+#       [-ExpectedWindowCount <n>] [-AllowForegroundFallback] [-MinUniqueColors <n>]
+#       [-CaptureAttempts 3] [-RetryDelayMs 500] [-MaxWaitSec 10] [-WarmupSec 1]
+#   capture_window.ps1 -ListWindows [-EmitJson topology.json] [-ExpectedWindowCount <n>]
 #   (-TitleMatch pairs with the worker's debug title tag: run the worker with
 #    VKRELAY2_DEBUG_WINDOW_TITLES=1 so titles read "vkrelay2 [xid=0x...]".)
 param(
@@ -32,8 +32,12 @@ param(
     [int]$ProcessId = 0,
     [string]$TitleMatch = "",
     [string]$ClassPrefix = "vkrelay2_worker_win_",
+    [switch]$ListWindows,
+    [int]$ExpectedWindowCount = 0,
     [switch]$AllowForegroundFallback,
     [int]$MinUniqueColors = 0,
+    [int]$CaptureAttempts = 3,
+    [int]$RetryDelayMs = 500,
     [int]$MaxWaitSec = 10,
     [int]$WarmupSec = 1
 )
@@ -70,7 +74,14 @@ public class Vkr2Cap {
 # monitors virtualize client sizes and PrintWindow yields cropped/black-banded bitmaps.
 [void][Vkr2Cap]::SetProcessDpiAwarenessContext([IntPtr]::new(-4))
 
-if (-not $OutputPng) { Write-Output "RESULT status=bad_args (need -OutputPng)"; exit 2 }
+if (-not $ListWindows -and -not $OutputPng) {
+    Write-Output "RESULT status=bad_args reason=need_output_png"
+    exit 2
+}
+if ($ExpectedWindowCount -lt 0 -or $CaptureAttempts -lt 1 -or $RetryDelayMs -lt 0) {
+    Write-Output "RESULT status=bad_args reason=invalid_count_or_retry"
+    exit 2
+}
 
 function Find-Vkr2Windows {
     $global:vkr2_found = New-Object System.Collections.ArrayList
@@ -83,25 +94,56 @@ function Find-Vkr2Windows {
         # Skip zero-sized HWNDs (dead leftovers a teardown has not reaped yet).
         $r = New-Object Vkr2Cap+RECT
         [Vkr2Cap]::GetClientRect($h, [ref]$r) | Out-Null
-        if (($r.Right - $r.Left) -le 0 -or ($r.Bottom - $r.Top) -le 0) { return $true }
+        $cw = $r.Right - $r.Left
+        $ch = $r.Bottom - $r.Top
+        if ($cw -le 0 -or $ch -le 0) { return $true }
+        $wr = New-Object Vkr2Cap+RECT
+        [Vkr2Cap]::GetWindowRect($h, [ref]$wr) | Out-Null
+        $origin = New-Object Vkr2Cap+POINT
+        [Vkr2Cap]::ClientToScreen($h, [ref]$origin) | Out-Null
+        $ww = $wr.Right - $wr.Left
+        $wh = $wr.Bottom - $wr.Top
         $t = New-Object System.Text.StringBuilder 512
         [Vkr2Cap]::GetWindowTextW($h, $t, $t.Capacity) | Out-Null
         $owner = [uint32]0
         [Vkr2Cap]::GetWindowThreadProcessId($h, [ref]$owner) | Out-Null
         [void]$global:vkr2_found.Add([pscustomobject]@{
-                Hwnd = $h; Class = $c.ToString(); Title = $t.ToString(); Pid = [int]$owner
+                Hwnd = $h
+                Class = $c.ToString()
+                Title = $t.ToString()
+                Pid = [int]$owner
+                ClientX = $origin.X
+                ClientY = $origin.Y
+                ClientW = $cw
+                ClientH = $ch
+                WindowX = $wr.Left
+                WindowY = $wr.Top
+                WindowW = $ww
+                WindowH = $wh
+                Chrome = ($wh -gt $ch) -or ($ww -gt $cw)
             })
         return $true
     }
     [Vkr2Cap]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
-    return $global:vkr2_found
+    return @($global:vkr2_found | Sort-Object Pid, @{Expression = { [Int64]$_.Hwnd } })
 }
 
-function Select-Target($rows) {
-    if ($Hwnd -ne 0) { return ($rows | Where-Object { [Int64]$_.Hwnd -eq $Hwnd } | Select-Object -First 1) }
-    if ($ProcessId -ne 0) { return ($rows | Where-Object { $_.Pid -eq $ProcessId } | Select-Object -First 1) }
-    if ($TitleMatch) { return ($rows | Where-Object { $_.Title -match [regex]::Escape($TitleMatch) } | Select-Object -First 1) }
-    return ($rows | Select-Object -First 1)
+function Select-Candidates($rows) {
+    if ($Hwnd -ne 0) { return @($rows | Where-Object { [Int64]$_.Hwnd -eq $Hwnd }) }
+    if ($ProcessId -ne 0) { return @($rows | Where-Object { $_.Pid -eq $ProcessId }) }
+    if ($TitleMatch) {
+        return @($rows | Where-Object { $_.Title -match [regex]::Escape($TitleMatch) })
+    }
+    return @($rows)
+}
+
+function Write-Metadata($path, $payload) {
+    if (-not $path) { return }
+    $jdir = Split-Path -Parent $path
+    if ($jdir -and -not (Test-Path $jdir)) {
+        New-Item -ItemType Directory -Force -Path $jdir | Out-Null
+    }
+    ($payload | ConvertTo-Json -Depth 5 -Compress) | Set-Content -Path $path -Encoding utf8
 }
 
 function Measure-UniqueColors($bmp, $w, $h) {
@@ -113,65 +155,131 @@ function Measure-UniqueColors($bmp, $w, $h) {
     return $colors.Count
 }
 
-# Poll for a matching window (try at least once even when -MaxWaitSec is 0).
+# Poll for a stable matching topology (try at least once even when -MaxWaitSec is 0).
 $deadline = (Get-Date).AddSeconds($MaxWaitSec)
-$picked = $null
+$candidates = @()
 do {
-    $picked = Select-Target (@(Find-Vkr2Windows))
-    if ($picked) { break }
+    $candidates = @(Select-Candidates @(Find-Vkr2Windows))
+    $countSatisfied = $ExpectedWindowCount -eq 0 -or $candidates.Count -eq $ExpectedWindowCount
+    if ($candidates.Count -gt 0 -and $countSatisfied) { break }
     if ((Get-Date) -ge $deadline) { break }
     Start-Sleep -Milliseconds 250
 } while ($true)
-if (-not $picked) { Write-Output "RESULT status=hwnd_not_found class_prefix=$ClassPrefix"; exit 2 }
+if ($candidates.Count -eq 0) {
+    Write-Output "RESULT status=hwnd_not_found window_count=0 class_prefix=$ClassPrefix"
+    exit 2
+}
+if ($ExpectedWindowCount -gt 0 -and $candidates.Count -ne $ExpectedWindowCount) {
+    Write-Metadata $EmitJson ([ordered]@{
+            status = "topology_mismatch"
+            expected_window_count = $ExpectedWindowCount
+            window_count = $candidates.Count
+            windows = $candidates
+        })
+    Write-Output "RESULT status=topology_mismatch window_count=$($candidates.Count) expected_window_count=$ExpectedWindowCount"
+    exit 2
+}
+if ($ListWindows) {
+    Write-Metadata $EmitJson ([ordered]@{
+            status = "ok"
+            window_count = $candidates.Count
+            windows = $candidates
+        })
+    Write-Output "RESULT status=ok topology_only=True window_count=$($candidates.Count)"
+    exit 0
+}
+if ($candidates.Count -ne 1) {
+    Write-Metadata $EmitJson ([ordered]@{
+            status = "ambiguous"
+            window_count = $candidates.Count
+            windows = $candidates
+        })
+    Write-Output "RESULT status=ambiguous window_count=$($candidates.Count) reason=use_selector"
+    exit 2
+}
+$picked = $candidates[0]
 
 if ($WarmupSec -gt 0) { Start-Sleep -Seconds $WarmupSec }
 
 $hwnd = [IntPtr]$picked.Hwnd
-$client = New-Object Vkr2Cap+RECT
-$window = New-Object Vkr2Cap+RECT
-[Vkr2Cap]::GetClientRect($hwnd, [ref]$client) | Out-Null
-[Vkr2Cap]::GetWindowRect($hwnd, [ref]$window) | Out-Null
-$cw = $client.Right - $client.Left
-$ch = $client.Bottom - $client.Top
-$ww = $window.Right - $window.Left
-$wh = $window.Bottom - $window.Top
-$hasChrome = ($wh -gt $ch) -or ($ww -gt $cw)
+$cw = $picked.ClientW
+$ch = $picked.ClientH
+$ww = $picked.WindowW
+$wh = $picked.WindowH
+$hasChrome = $picked.Chrome
 if ($cw -le 0 -or $ch -le 0) { Write-Output "RESULT status=zero_client title=`"$($picked.Title)`""; exit 3 }
 
 Add-Type -AssemblyName System.Drawing
 $bmp = New-Object System.Drawing.Bitmap $cw, $ch
 $method = "printwindow"
 $fallback = $false
+$unique = 0
+$captured = $false
+$attemptUsed = 0
+$retryThreshold = if ($MinUniqueColors -gt 0) { $MinUniqueColors } else { 3 }
 try {
-    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-    try {
-        $hdc = $gfx.GetHdc()
+    for ($attempt = 1; $attempt -le $CaptureAttempts; $attempt++) {
+        $attemptUsed = $attempt
+        $method = "printwindow"
+        $fallback = $false
+        $captured = $false
+        $unique = 0
+        $printed = $false
+        $gfx = [System.Drawing.Graphics]::FromImage($bmp)
         try {
-            $flags = [Vkr2Cap]::PW_CLIENTONLY -bor [Vkr2Cap]::PW_RENDERFULLCONTENT
-            if (-not [Vkr2Cap]::PrintWindow($hwnd, $hdc, $flags)) {
-                Write-Output "RESULT status=printwindow_failed client=${cw}x${ch}"; exit 3
-            }
-        } finally { $gfx.ReleaseHdc($hdc) }
-    } finally { $gfx.Dispose() }
-
-    $unique = Measure-UniqueColors $bmp $cw $ch
-
-    # PrintWindow can return a solid frame for flip-model (Vulkan/DXGI) content. With explicit
-    # opt-in, fall back to copying the client area FROM THE SCREEN (needs the window visible).
-    if ($unique -le 2 -and $AllowForegroundFallback) {
-        [void][Vkr2Cap]::ShowWindow($hwnd, [Vkr2Cap]::SW_SHOWNOACTIVATE)
-        [void][Vkr2Cap]::BringWindowToTop($hwnd)
-        [void][Vkr2Cap]::SetForegroundWindow($hwnd)
-        Start-Sleep -Milliseconds 300
-        $origin = New-Object Vkr2Cap+POINT
-        if ([Vkr2Cap]::ClientToScreen($hwnd, [ref]$origin)) {
-            $g2 = [System.Drawing.Graphics]::FromImage($bmp)
+            $gfx.Clear([System.Drawing.Color]::Black)
+            $hdc = $gfx.GetHdc()
             try {
-                $g2.CopyFromScreen($origin.X, $origin.Y, 0, 0, (New-Object System.Drawing.Size($cw, $ch)))
-            } finally { $g2.Dispose() }
-            $method = "copyfromscreen"; $fallback = $true
+                $flags = [Vkr2Cap]::PW_CLIENTONLY -bor [Vkr2Cap]::PW_RENDERFULLCONTENT
+                $printed = [Vkr2Cap]::PrintWindow($hwnd, $hdc, $flags)
+            } finally {
+                $gfx.ReleaseHdc($hdc)
+            }
+        } finally {
+            $gfx.Dispose()
+        }
+        if ($printed) {
+            $captured = $true
             $unique = Measure-UniqueColors $bmp $cw $ch
         }
+
+        # PrintWindow can return a solid frame for flip-model (Vulkan/DXGI) content. With explicit
+        # opt-in, fall back to copying the client area FROM THE SCREEN (needs it unoccluded).
+        if ((-not $printed -or $unique -lt $retryThreshold) -and $AllowForegroundFallback) {
+            [void][Vkr2Cap]::ShowWindow($hwnd, [Vkr2Cap]::SW_SHOWNOACTIVATE)
+            [void][Vkr2Cap]::BringWindowToTop($hwnd)
+            [void][Vkr2Cap]::SetForegroundWindow($hwnd)
+            Start-Sleep -Milliseconds 300
+            $origin = New-Object Vkr2Cap+POINT
+            if ([Vkr2Cap]::ClientToScreen($hwnd, [ref]$origin)) {
+                $g2 = [System.Drawing.Graphics]::FromImage($bmp)
+                try {
+                    $g2.CopyFromScreen(
+                        $origin.X,
+                        $origin.Y,
+                        0,
+                        0,
+                        (New-Object System.Drawing.Size($cw, $ch))
+                    )
+                } finally {
+                    $g2.Dispose()
+                }
+                $captured = $true
+                $method = "copyfromscreen"
+                $fallback = $true
+                $unique = Measure-UniqueColors $bmp $cw $ch
+            }
+        }
+
+        if ($captured -and $unique -ge $retryThreshold) { break }
+        if ($attempt -lt $CaptureAttempts -and $RetryDelayMs -gt 0) {
+            Start-Sleep -Milliseconds $RetryDelayMs
+        }
+    }
+
+    if (-not $captured) {
+        Write-Output "RESULT status=capture_failed client=${cw}x${ch} attempts=$attemptUsed"
+        exit 3
     }
 
     $dir = Split-Path -Parent $OutputPng
@@ -180,6 +288,11 @@ try {
 
     if ($EmitJson) {
         $meta = [ordered]@{
+            status        = if ($MinUniqueColors -gt 0 -and $unique -lt $MinUniqueColors) {
+                "degenerate"
+            } else {
+                "ok"
+            }
             hwnd          = [Int64]$picked.Hwnd
             class         = $picked.Class
             title         = $picked.Title
@@ -190,18 +303,20 @@ try {
             dpi_awareness = "per-monitor-v2"
             method        = $method
             fallback_used = $fallback
+            capture_attempts = $attemptUsed
             unique_colors = $unique
+            window_count  = $candidates.Count
+            windows       = $candidates
             png           = $OutputPng
         }
-        $jdir = Split-Path -Parent $EmitJson
-        if ($jdir -and -not (Test-Path $jdir)) { New-Item -ItemType Directory -Force -Path $jdir | Out-Null }
-        ($meta | ConvertTo-Json -Compress) | Set-Content -Path $EmitJson -Encoding utf8
+        Write-Metadata $EmitJson $meta
     }
 
     $degenerate = ($MinUniqueColors -gt 0 -and $unique -lt $MinUniqueColors)
     $status = if ($degenerate) { "degenerate" } else { "ok" }
-    Write-Output ("RESULT status={0} unique_colors={1} client={2}x{3} chrome={4} method={5} fallback={6} title=`"{7}`" png={8}" -f `
-            $status, $unique, $cw, $ch, $hasChrome, $method, $fallback, $picked.Title, $OutputPng)
+    Write-Output ("RESULT status={0} unique_colors={1} client={2}x{3} chrome={4} method={5} fallback={6} attempts={7} window_count={8} title=`"{9}`" png={10}" -f `
+            $status, $unique, $cw, $ch, $hasChrome, $method, $fallback, $attemptUsed, `
+            $candidates.Count, $picked.Title, $OutputPng)
     if ($degenerate) { exit 3 }
 } finally { $bmp.Dispose() }
 exit 0
