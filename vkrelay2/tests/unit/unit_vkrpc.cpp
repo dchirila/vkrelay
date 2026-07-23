@@ -6838,7 +6838,7 @@ void test_recording_resource_leases_mock() {
     const std::uint64_t pool = backend.create_command_pool(create_pool).command_pool;
     vkrpc::AllocateCommandBuffersRequest allocate_cbs;
     allocate_cbs.command_pool = pool;
-    allocate_cbs.count = 2;
+    allocate_cbs.count = 4;
     const auto cbs = backend.allocate_command_buffers(allocate_cbs).command_buffers;
     vkrpc::GetDeviceQueueRequest get_queue;
     get_queue.device = device.device;
@@ -6926,9 +6926,9 @@ void test_recording_resource_leases_mock() {
     vkrpc::LeasedDestroyRequest leased_destroy;
     leased_destroy.handle = image.image;
     leased_destroy.leases = {{cbs[0], 1}};
-    vkrpc::LeasedDestroyRequest skipped_generation = leased_destroy;
-    skipped_generation.leases = {{cbs[0], 3}};
-    VKR_CHECK(!backend.destroy_image_leased(skipped_generation).ok);
+    vkrpc::LeasedDestroyRequest zero_generation = leased_destroy;
+    zero_generation.leases = {{cbs[0], 0}};
+    VKR_CHECK(!backend.destroy_image_leased(zero_generation).ok);
     VKR_CHECK(backend.destroy_image_leased(leased_destroy).ok);
     VKR_CHECK(backend.record_command_buffer(recording).ok);
     vkrpc::QueueSubmitRequest submit;
@@ -6984,6 +6984,59 @@ void test_recording_resource_leases_mock() {
     bind.first_binding = 0;
     bind.vertex_buffers = {buffer.buffer};
     bind.vertex_buffer_offsets = {0};
+
+    // Begin assigns generations locally, while only End ships a record. An abandoned generation 1
+    // is therefore invisible to the worker: the first delivered epoch 2 is valid, not a protocol
+    // skip. Once 2 is adopted, 1 is stale.
+    vkrpc::RecordCommandBufferRequest skipped_recording;
+    skipped_recording.command_buffer = cbs[2];
+    skipped_recording.recording_generation = 2;
+    VKR_CHECK(backend.record_command_buffer(skipped_recording).ok);
+    vkrpc::RecordCommandBufferRequest stale_recording = skipped_recording;
+    stale_recording.recording_generation = 1;
+    const vkrpc::StatusResponse stale_record_response =
+        backend.record_command_buffer(stale_recording);
+    VKR_CHECK(!stale_record_response.ok);
+    VKR_CHECK_EQ(stale_record_response.reason, "recording generation is stale");
+
+    // The same non-contiguous contract applies before End: a destroy in active epoch 2 can reach a
+    // worker that still knows epoch 0. The matching record exposes the retired buffer, then a later
+    // delivered epoch 4 releases the older exact lease. A lease older than 4 is stale.
+    const auto skipped_buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(skipped_buffer.ok);
+    allocate_memory.allocation_size = skipped_buffer.mem_size;
+    const auto skipped_memory = backend.allocate_memory(allocate_memory);
+    VKR_CHECK(skipped_memory.ok);
+    VKR_CHECK(backend.bind_buffer_memory({skipped_buffer.buffer, skipped_memory.memory, 0}).ok);
+    vkrpc::LeasedDestroyRequest skipped_destroy;
+    skipped_destroy.handle = skipped_buffer.buffer;
+    skipped_destroy.leases = {{cbs[3], 2}};
+    VKR_CHECK(backend.destroy_buffer_leased(skipped_destroy).ok);
+    vkrpc::RecordCommandBufferRequest skipped_leased_record;
+    skipped_leased_record.command_buffer = cbs[3];
+    skipped_leased_record.recording_generation = 2;
+    skipped_leased_record.commands = {bind};
+    skipped_leased_record.commands[0].vertex_buffers = {skipped_buffer.buffer};
+    VKR_CHECK(backend.record_command_buffer(skipped_leased_record).ok);
+    VKR_CHECK_EQ(backend.lifetime_lease_stats().retired_resources, static_cast<std::size_t>(1));
+    skipped_leased_record.recording_generation = 4;
+    skipped_leased_record.commands.clear();
+    VKR_CHECK(backend.record_command_buffer(skipped_leased_record).ok);
+    VKR_CHECK_EQ(backend.lifetime_lease_stats().retired_resources, static_cast<std::size_t>(0));
+    VKR_CHECK(backend.free_memory({skipped_memory.memory}).ok);
+
+    const auto stale_lease_buffer = backend.create_buffer(create_buffer);
+    VKR_CHECK(stale_lease_buffer.ok);
+    vkrpc::LeasedDestroyRequest stale_destroy;
+    stale_destroy.handle = stale_lease_buffer.buffer;
+    stale_destroy.leases = {{cbs[3], 3}};
+    const vkrpc::StatusResponse stale_destroy_response =
+        backend.destroy_buffer_leased(stale_destroy);
+    VKR_CHECK(!stale_destroy_response.ok);
+    VKR_CHECK_EQ(stale_destroy_response.reason,
+                 "leased buffer destroy references an invalid command-buffer generation");
+    VKR_CHECK(backend.destroy_buffer({stale_lease_buffer.buffer}).ok);
+
     vkrpc::RecordCommandBufferRequest buffer_recording;
     buffer_recording.command_buffer = cbs[1];
     buffer_recording.recording_generation = 1;
@@ -7089,7 +7142,7 @@ void test_recording_resource_leases_mock() {
     VKR_CHECK(backend.retire_command_buffer_recordings(retire).ok);
     VKR_CHECK_EQ(backend.lifetime_lease_stats().retired_resources, static_cast<std::size_t>(0));
 
-    // DestroyCommandPool implicitly frees every CB and releases even a pending next generation.
+    // DestroyCommandPool implicitly frees every CB and releases even a pending future generation.
     const auto pool_buffer = backend.create_buffer(create_buffer);
     VKR_CHECK(pool_buffer.ok);
     vkrpc::LeasedDestroyRequest pool_destroy;

@@ -4131,16 +4131,14 @@ RealVulkanBackend::destroy_buffer_leased(const vkrpc::LeasedDestroyRequest& req)
     std::set<RecordingLeaseKey> leases;
     for (const vkrpc::CommandBufferLease& lease : req.leases) {
         const auto cb = command_buffers_.find(lease.command_buffer);
-        const bool current_generation =
+        // Begin-assigned epochs can skip at the worker when an intermediate recording is
+        // abandoned/reset without an End RPC. Admit any non-stale epoch; device ownership and the
+        // bounded retired-resource/lease tables remain the resource-abuse boundary.
+        const bool non_stale_generation =
             cb != command_buffers_.end() && lease.recording_generation != 0 &&
-            lease.recording_generation == cb->second.recording_generation;
-        const bool pending_next_generation =
-            cb != command_buffers_.end() &&
-            cb->second.recording_generation != std::numeric_limits<std::uint64_t>::max() &&
-            lease.recording_generation == cb->second.recording_generation + 1;
+            lease.recording_generation >= cb->second.recording_generation;
         if (lease.recording_generation == 0 || cb == command_buffers_.end() ||
-            cb->second.device != it->second.device ||
-            (!current_generation && !pending_next_generation) ||
+            cb->second.device != it->second.device || !non_stale_generation ||
             !leases.emplace(lease.command_buffer, lease.recording_generation).second) {
             resp.reason = "leased buffer destroy references an invalid command-buffer generation";
             return resp;
@@ -4769,16 +4767,12 @@ RealVulkanBackend::destroy_image_leased(const vkrpc::LeasedDestroyRequest& req) 
     std::set<RecordingLeaseKey> leases;
     for (const vkrpc::CommandBufferLease& lease : req.leases) {
         const auto cb = command_buffers_.find(lease.command_buffer);
-        const bool current_generation =
+        // See destroy_buffer_leased: honest active epochs may be greater than current + 1 here.
+        const bool non_stale_generation =
             cb != command_buffers_.end() && lease.recording_generation != 0 &&
-            lease.recording_generation == cb->second.recording_generation;
-        const bool pending_next_generation =
-            cb != command_buffers_.end() &&
-            cb->second.recording_generation != std::numeric_limits<std::uint64_t>::max() &&
-            lease.recording_generation == cb->second.recording_generation + 1;
+            lease.recording_generation >= cb->second.recording_generation;
         if (lease.recording_generation == 0 || cb == command_buffers_.end() ||
-            cb->second.device != it->second.device ||
-            (!current_generation && !pending_next_generation) ||
+            cb->second.device != it->second.device || !non_stale_generation ||
             !leases.emplace(lease.command_buffer, lease.recording_generation).second) {
             resp.reason = "leased image destroy references an invalid command-buffer generation";
             return resp;
@@ -6267,12 +6261,8 @@ RealVulkanBackend::record_command_buffer(const vkrpc::RecordCommandBufferRequest
         resp.reason = "recording generation is stale";
         return resp;
     }
-    if (req.recording_generation != 0 &&
-        (cb->second.recording_generation == std::numeric_limits<std::uint64_t>::max() ||
-         req.recording_generation > cb->second.recording_generation + 1)) {
-        resp.reason = "recording generation skipped the next generation";
-        return resp;
-    }
+    // Epochs are monotonic but non-contiguous at this boundary: an abandoned/reset ICD recording
+    // has a Begin-assigned epoch but never emits RecordCommandBuffer.
     if (req.recording_generation != 0 &&
         req.recording_generation > cb->second.recording_generation) {
         release_recording_leases_for_command_buffer(req.command_buffer, req.recording_generation);

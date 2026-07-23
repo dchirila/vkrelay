@@ -1212,8 +1212,10 @@ constexpr int kMaxDynamicRenderingColorAttachments = 8;
 
 struct RecordCommandBufferRequest {
     std::uint64_t command_buffer = 0;
-    // Additive generation identity for leased resources. Zero is the legacy spelling and keeps
-    // the pre-lease record/invalidation contract.
+    // Additive monotonic epoch identity for leased resources. Epochs are NOT required to be
+    // contiguous at the worker boundary: the ICD assigns one at Begin, while an abandoned/reset
+    // recording may never produce a RecordCommandBuffer RPC. Zero is the legacy spelling and
+    // keeps the pre-lease record/invalidation contract.
     std::uint64_t recording_generation = 0;
     bool one_time_submit = false;
     std::vector<RecordedCommand> commands;

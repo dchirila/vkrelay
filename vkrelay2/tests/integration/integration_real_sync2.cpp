@@ -171,11 +171,14 @@ int main() {
 
     vkrpc::LeasedDestroyRequest leased_destroy;
     leased_destroy.handle = buffer.buffer;
-    leased_destroy.leases = {{bufs.command_buffers[0], 1}};
+    // Generation 1 was begun and abandoned without an End RPC. The worker still knows epoch 0, so
+    // both the pre-record destroy and the first delivered record at epoch 2 prove that generations
+    // are monotonic identities rather than a contiguous worker-visible sequence.
+    leased_destroy.leases = {{bufs.command_buffers[0], 2}};
     VKR_CHECK(backend.destroy_buffer_leased(leased_destroy).ok);
     vkrpc::RecordCommandBufferRequest leased_record;
     leased_record.command_buffer = bufs.command_buffers[0];
-    leased_record.recording_generation = 1;
+    leased_record.recording_generation = 2;
     vkrpc::RecordedCommand leased_barrier;
     leased_barrier.kind = "pipeline_barrier2";
     vkrpc::DependencyInfo2 leased_dependency;
@@ -199,9 +202,15 @@ int main() {
     VKR_CHECK(backend.queue_submit2(leased_submit).ok);
     VKR_CHECK(backend.device_wait_idle({cd.device}).ok);
     vkrpc::RetireCommandBufferRecordingsRequest retire;
-    retire.recordings = {{bufs.command_buffers[0], 1}};
+    retire.recordings = {{bufs.command_buffers[0], 2}};
     VKR_CHECK(backend.retire_command_buffer_recordings(retire).ok);
     VKR_CHECK(backend.free_memory({memory.memory}).ok);
+
+    vkrpc::RecordCommandBufferRequest stale_record = leased_record;
+    stale_record.recording_generation = 1;
+    const vkrpc::StatusResponse stale_response = backend.record_command_buffer(stale_record);
+    VKR_CHECK(!stale_response.ok);
+    VKR_CHECK_EQ(stale_response.reason, "recording generation is stale");
 
     // The after-successful-record twin: a leased destroy of the current generation must preserve
     // its host command buffer and keep it submittable.
@@ -212,15 +221,16 @@ int main() {
     VKR_CHECK(post_record_memory.ok);
     VKR_CHECK(
         backend.bind_buffer_memory({post_record_buffer.buffer, post_record_memory.memory, 0}).ok);
-    leased_record.recording_generation = 2;
+    // Epoch 3 is also abandoned locally; the next delivered epoch 4 remains valid.
+    leased_record.recording_generation = 4;
     leased_record.commands[0].deps2[0].buffer[0].buffer = post_record_buffer.buffer;
     VKR_CHECK(backend.record_command_buffer(leased_record).ok);
     leased_destroy.handle = post_record_buffer.buffer;
-    leased_destroy.leases = {{bufs.command_buffers[0], 2}};
+    leased_destroy.leases = {{bufs.command_buffers[0], 4}};
     VKR_CHECK(backend.destroy_buffer_leased(leased_destroy).ok);
     VKR_CHECK(backend.queue_submit2(leased_submit).ok);
     VKR_CHECK(backend.device_wait_idle({cd.device}).ok);
-    retire.recordings = {{bufs.command_buffers[0], 2}};
+    retire.recordings = {{bufs.command_buffers[0], 4}};
     VKR_CHECK(backend.retire_command_buffer_recordings(retire).ok);
     VKR_CHECK(backend.free_memory({post_record_memory.memory}).ok);
 
@@ -234,7 +244,7 @@ int main() {
     VKR_CHECK(teardown_memory.ok);
     VKR_CHECK(backend.bind_buffer_memory({teardown_buffer.buffer, teardown_memory.memory, 0}).ok);
     leased_destroy.handle = teardown_buffer.buffer;
-    leased_destroy.leases = {{bufs.command_buffers[0], 3}};
+    leased_destroy.leases = {{bufs.command_buffers[0], 5}};
     VKR_CHECK(backend.destroy_buffer_leased(leased_destroy).ok);
     VKR_CHECK(backend.free_memory({teardown_memory.memory}).ok);
     const vkrpc::LifetimeLeaseStats teardown_stats = backend.lifetime_lease_stats();

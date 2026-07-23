@@ -437,6 +437,7 @@ int main() {
 
         VkCommandPoolCreateInfo cpci2{};
         cpci2.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci2.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         cpci2.queueFamilyIndex = 0;
         if (vkCreateCommandPool(device, &cpci2, nullptr, &cpool) != VK_SUCCESS) {
             goto teardown;
@@ -599,6 +600,16 @@ int main() {
                         "sync2 submit path)\n");
             goto teardown;
         }
+
+        // Re-beginning an executable command buffer is the normal primary retirement path for
+        // generation-scoped lifetime leases. The ICD must retire the exact prior generation at
+        // the worker before opening the next epoch; the worker-side greater-generation cleanup is
+        // only a backstop for lease-less abandoned recordings that emitted no RPC.
+        if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS || vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+            std::printf("VK13-SYNC2-CANARY: FAIL (lifetime lease retirement on re-begin)\n");
+            goto teardown;
+        }
+        std::printf("VK13-SYNC2-CANARY: lifetime lease retired on command-buffer re-begin\n");
 
         std::printf(
             "VK13-SYNC2-CANARY: PASS (native lane serves VK_KHR_synchronization2: a compute "

@@ -53,9 +53,10 @@ assert_lifetime_canaries() { # <label> <captured output>
     local label="$1"
     local out="$2"
     if ! printf '%s\n' "${out}" | grep -q "recording lifetime lease preserved" ||
-       ! printf '%s\n' "${out}" | grep -q "sync2 image lifetime lease survived destroy before End";
+       ! printf '%s\n' "${out}" | grep -q "sync2 image lifetime lease survived destroy before End" ||
+       ! printf '%s\n' "${out}" | grep -q "lifetime lease retired on command-buffer re-begin";
     then
-        echo "VK13-SYNC2-SMOKE: FAIL (${label}: lifetime-lease canaries did not both pass)"
+        echo "VK13-SYNC2-SMOKE: FAIL (${label}: lifetime-lease canaries did not all pass)"
         exit 1
     fi
 }
