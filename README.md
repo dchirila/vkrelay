@@ -104,6 +104,7 @@ a diagnostic bundle under `/tmp/vkrelay2-logs-<pid>` and prints the exact path.
   behavior, and unsupported shapes
 - [Troubleshooting](docs/troubleshooting.md): startup failures, daemon health, Zink, Xwayland, and
   diagnostic bundles
+- [Testing](docs/testing.md): test layers, real-application render catalog, and aggregate smoke gate
 - [Development](docs/development.md): source layout, test layers, tracing, profiling, and capture
   tools
 

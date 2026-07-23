@@ -74,6 +74,9 @@ The repository intentionally tests boundaries at several levels:
 CTest covers compiled tests. The `linux/launcher/run_*_smoke.sh` scripts are targeted end-to-end
 gates and may require a real daemon, display components, and GPU.
 
+See [Testing](testing.md) for the real-application render catalog, aggregate smoke gate, strict
+dependency mode, capture artifacts, and focused commands.
+
 ## Runtime Tracing
 
 Useful opt-in variables include:

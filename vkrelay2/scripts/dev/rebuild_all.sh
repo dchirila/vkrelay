@@ -16,6 +16,7 @@
 #   scripts/dev/rebuild_all.sh --tests         # build both, then ctest both
 #   scripts/dev/rebuild_all.sh --lint          # build both, then clang-format --Werror + bash -n
 #   scripts/dev/rebuild_all.sh --all           # build + tests + lint (the full dual-platform gate)
+#   scripts/dev/rebuild_all.sh --smoke-gate    # build, then strict on-screen/app smoke gate
 #   scripts/dev/rebuild_all.sh --clean         # wipe both build dirs first (full reconfigure)
 #   scripts/dev/rebuild_all.sh --release       # use the *-release presets
 #   scripts/dev/rebuild_all.sh --linux-only    # skip the Windows half
@@ -33,6 +34,7 @@ do_lint=0
 do_clean=0
 do_linux=1
 do_windows=1
+do_smoke_gate=0
 flavor="debug"
 check_deps_only=0
 for arg in "$@"; do
@@ -43,6 +45,7 @@ for arg in "$@"; do
             do_tests=1
             do_lint=1
             ;;
+        --smoke-gate) do_smoke_gate=1 ;;
         --clean) do_clean=1 ;;
         --release) flavor="release" ;;
         --linux-only) do_windows=0 ;;
@@ -519,6 +522,13 @@ if ((do_lint)); then
     ok "bash -n clean (${n} scripts)"
 fi
 
+if ((do_smoke_gate)); then
+    step "strict end-to-end smoke gate"
+    bash "${repo_root}/linux/launcher/gate.sh" \
+        "${repo_root}/build/${linux_preset}" --strict
+    ok "end-to-end smoke gate OK"
+fi
+
 step "DONE"
 summary=""
 ((do_linux)) && summary+="linux "
@@ -526,6 +536,7 @@ summary=""
 summary+="built"
 ((do_tests)) && summary+=" + tests"
 ((do_lint)) && summary+=" + lint"
+((do_smoke_gate)) && summary+=" + smoke gate"
 ok "${summary}"
 
 # the launcher (vkrun) prefers RELEASE artifacts, but

@@ -6,8 +6,25 @@ between minor releases.
 
 ## Unreleased
 
+### Testing
+
+- Added a bounded real-application GL/Zink regression runner for glxgears and glmark2, with renderer,
+  progress, clean-exit, and relay/Mesa error assertions.
+- Added a final-presentation render catalog for vkcube, glxgears, glmark2, and OpenSCAD. It captures
+  the composed worker HWND, asserts deterministic one-window topology and native chrome, and applies
+  calibrated unique-color thresholds while retaining PNG, JSON, application, and session artifacts.
+- Added an opt-in aggregate end-to-end gate that composes the existing deterministic graphics and
+  window-system runners with the application catalog. `rebuild_all.sh --smoke-gate` runs its strict
+  dependency mode without making the normal build GPU-dependent.
+- Hardened the Windows HWND capture helper with deterministic topology reporting, ambiguous-selection
+  rejection, exact window-count assertions, and bounded solid-frame retries.
+
 ### Graphics
 
+- Fixed real GL/Zink applications failing `vkEndCommandBuffer` after an abandoned recording skipped
+  a worker-visible generation. Recording generations are now treated as nonzero monotonic epoch
+  identities rather than a contiguous RPC sequence, with mock, real-host, ICD re-begin, and
+  real-application regression coverage.
 - Added Vulkan graphics and compute pipeline specialization constants, including capability-gated
   binary-tail RPC transport, bounded fail-closed validation, exact preservation of non-null empty
   specialization info, and observable default/overridden/dual-stage GPU coverage.

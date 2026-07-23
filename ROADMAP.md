@@ -48,6 +48,7 @@ sidecar policy for selected-output fullscreen and guest work areas. Important co
 | Private Xwayland retirement | Submit the seatless pointer-warp and damage guards upstream; replace the known-unsafe distro table with a capability/version decision when possible | Stock server passes the rotate/move smokes |
 | Reproducible Xwayland baselines | Extend the offline hash-pinned baseline beyond Jammy while retaining signed distro-source acquisition and provenance checks | Rebuilt package identity + app smoke on each distro |
 | Popup first-paint flash | Tune the first-paint holdoff that can expose a short black frame | Screenshot burst during menu creation |
+| Embedded child surfaces | Design sidecar-authoritative child-surface topology and composition without a host `SetParent` shortcut | Reduced embedded-viewport canary with geometry, lifetime, and counter-advance assertions |
 | Non-Qt DPI defaults | Set an appropriate `xrdb`/`Xft.dpi` policy for GTK and other X11 clients | Cross-DPI toolkit comparison |
 | Dynamic monitor changes | Add a transactional display/RandR update, or a clearer restart-required workflow | Hotplug, rotation, resolution, and work-area tests |
 | Mock host extents | Model the host envelope explicitly so malformed imageless-framebuffer containment is testable | Mock/real admission parity tests |
@@ -108,6 +109,11 @@ one fail-closed run should replace speculation with its exact named-reject list.
 | Imageless-framebuffer cache eviction | Add a reverse index so attachment-view destruction reclaims cached regular framebuffers | Low–Med | Unit tests + resize soak |
 | Queue-filtered idle promotion | Use the queue already carried by records when multi-queue support begins | Low | Unit + canary |
 | Worker lifecycle flakes | Eliminate intermittent heartbeat/kill/teardown fast failures seen only under residual load | Low–Med | Repeated full-gate loop |
+| Complete RPC smoke coverage | Add dispatch-loop operation counters and a debug snapshot/diff query; selective traces cannot prove that every operation ran | Med | Aggregate smoke rejects any unallowlisted zero-count operation |
+| Worker abuse survival | Exercise rapid connects, malformed/oversized frames, and concurrent clients, then require a healthy liveness probe | Med | Bounded live-worker abuse runner |
+| Host-failure classification | Correlate supervisor/worker death with Windows Error Reporting while keeping harness/setup failures distinct | Med | Deliberate worker crash classified separately from capture failure |
+| Window stress automation | Drive repeated real host resize/move input while a GL workload renders | Med | App, worker, and daemon remain live with clean logs |
+| Developer smoke automation | Offer an explicitly installed post-commit hook that selects the small or full smoke gate from touched paths | Low | Hook self-test; never installed by the build |
 
 ## Performance
 
