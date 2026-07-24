@@ -50,7 +50,8 @@ The catalog runs these rows sequentially through the production `vkrun` path:
 
 Each installed application must produce exactly one visible worker top-level with native chrome and
 meet its calibrated sparse-grid unique-color threshold. Captures, topology JSON, app output, and
-session logs are retained under the printed artifact directory.
+session logs are retained under the printed artifact directory and scanned together for fatal
+relay, Mesa, worker, and application signatures.
 
 ```bash
 # Missing external applications are reported as skips.
@@ -86,6 +87,8 @@ bash linux/launcher/gate.sh build/linux-release --strict --keep-going
 
 Set `VKRELAY2_SMOKE_GATE_DIR` to retain the aggregate logs at a chosen path and
 `VKRELAY2_SMOKE_GPU` to override the default `integrated` selector for the frame-transition stage.
+`VKRELAY2_SMOKE_STAGE_TIMEOUT` overrides the normal per-stage 360-second budget, while
+`VKRELAY2_CATALOG_STAGE_TIMEOUT` overrides the catalog's 900-second multi-row budget.
 The gate is opt-in: the normal build remains usable on machines without a display or host GPU.
 
 ## Final HWND capture

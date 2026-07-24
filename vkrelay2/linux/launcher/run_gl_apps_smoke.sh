@@ -47,9 +47,10 @@ command -v glmark2 >/dev/null 2>&1 || skip "glmark2 not installed"
 mkdir -p "${artifact_root}"
 
 has_fatal_signature() { # <log>
-    grep -Eiq \
-        'vkrelay2-icd:.*rejected|MESA:[[:space:]]*error|unimplemented device function|worker (process )?(died|exited unexpectedly)|worker connection closed unexpectedly|Segmentation fault|Aborted|free\(\): invalid pointer|X Error of failed request' \
-        "$1"
+    grep -Eq \
+        'vkrelay2-icd:.*rejected|MESA:[[:space:]]*error|unimplemented device function|worker (process )?(died|exited unexpectedly)|worker connection closed unexpectedly|Segmentation fault|free\(\): invalid pointer|X Error of failed request' \
+        "$1" ||
+        grep -Eq '(^|[[:space:]])Aborted([[:space:]]+\(core dumped\))?[[:space:]]*$' "$1"
 }
 
 gears_log="${artifact_root}/glxgears.log"

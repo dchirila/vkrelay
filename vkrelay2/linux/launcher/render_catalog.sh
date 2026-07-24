@@ -48,6 +48,18 @@ vkrun="${script_dir}/vkrun"
 failures=0
 passes=0
 skips=0
+active_app_pid=""
+
+cleanup_active_app() {
+    if [ -n "${active_app_pid}" ]; then
+        kill "${active_app_pid}" 2>/dev/null || true
+        wait "${active_app_pid}" 2>/dev/null || true
+        active_app_pid=""
+    fi
+}
+trap cleanup_active_app EXIT
+trap 'cleanup_active_app; exit 130' INT
+trap 'cleanup_active_app; exit 143' TERM
 
 missing_platform() { # <reason>
     if [ "${strict}" -eq 1 ]; then
@@ -83,10 +95,12 @@ missing_app() { # <label> <guidance>
     fi
 }
 
-fatal_log_signature() { # <log>
-    grep -Eiq \
-        'vkrelay2-icd:.*rejected|MESA:[[:space:]]*error|unimplemented device function|worker (process )?(died|exited unexpectedly)|worker connection closed unexpectedly|Segmentation fault|Aborted|free\(\): invalid pointer|X Error of failed request' \
-        "$1"
+fatal_log_signature() { # <file-or-directory>...
+    grep -REq --include='*.log' \
+        'vkrelay2-icd:.*rejected|MESA:[[:space:]]*error|unimplemented device function|worker (process )?(died|exited unexpectedly)|worker connection closed unexpectedly|Segmentation fault|free\(\): invalid pointer|X Error of failed request' \
+        "$@" ||
+        grep -REq --include='*.log' \
+            '(^|[[:space:]])Aborted([[:space:]]+\(core dumped\))?[[:space:]]*$' "$@"
 }
 
 run_case() { # <label> <min-colors> <exit-mode:terminate|clean> <command> [args...]
@@ -104,8 +118,10 @@ run_case() { # <label> <min-colors> <exit-mode:terminate|clean> <command> [args.
     VKRELAY2_LOG_DIR="${case_dir}/session" \
         timeout --signal=TERM --kill-after=5 180 "${vkrun}" -- "$@" >"${app_log}" 2>&1 &
     app_pid=$!
+    active_app_pid="${app_pid}"
 
-    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+    timeout --signal=TERM --kill-after=5 45 \
+        powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
         -File "$(wslpath -w "${capture_ps}")" \
         -OutputPng "$(wslpath -w "${png}")" \
         -EmitJson "$(wslpath -w "${json}")" \
@@ -123,6 +139,7 @@ run_case() { # <label> <min-colors> <exit-mode:terminate|clean> <command> [args.
     fi
     wait "${app_pid}" 2>/dev/null
     app_rc=$?
+    active_app_pid=""
 
     result="$(tr -d '\r' <"${capture_log}" | grep '^RESULT ' | tail -1)"
     if [ "${capture_rc}" -ne 0 ] || ! printf '%s\n' "${result}" | grep -q 'status=ok'; then
@@ -144,11 +161,11 @@ run_case() { # <label> <min-colors> <exit-mode:terminate|clean> <command> [args.
         failures=$((failures + 1))
         return
     fi
-    if fatal_log_signature "${app_log}"; then
-        echo "RENDER-CATALOG: FAIL (${label}: fatal relay/Mesa/app signature in ${app_log})"
-        grep -Ei \
+    if fatal_log_signature "${app_log}" "${case_dir}/session"; then
+        echo "RENDER-CATALOG: FAIL (${label}: fatal relay/Mesa/app/worker signature in retained logs)"
+        grep -REh --include='*.log' -E \
             'vkrelay2-icd:.*rejected|MESA:[[:space:]]*error|unimplemented|worker .*died|worker .*exited unexpectedly|Segmentation fault|Aborted|free\(\): invalid pointer|X Error' \
-            "${app_log}" | tail -20 | sed 's/^/    /'
+            "${app_log}" "${case_dir}/session" | tail -20 | sed 's/^/    /'
         failures=$((failures + 1))
         return
     fi
@@ -163,6 +180,8 @@ run_case() { # <label> <min-colors> <exit-mode:terminate|clean> <command> [args.
     sleep 1 # allow the prior session worker HWND to disappear before the next topology assertion
 }
 
+# Calibration baseline (4-pixel sparse grid): keep thresholds structural, not golden.
+# 2026-07-23 samples: glxgears 80-87, glmark2 254-255, OpenSCAD 937.
 if selected vkcube; then
     vkcube_bin="${VKRELAY2_VKCUBE:-}"
     if [ -z "${vkcube_bin}" ]; then

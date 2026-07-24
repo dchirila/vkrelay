@@ -39,15 +39,15 @@ mkdir -p "${artifact_root}"
 failures=0
 passes=0
 
-run_stage() { # <name> <command...>
-    local name="$1"
-    shift
+run_stage_with_budget() { # <name> <seconds> <command...>
+    local name="$1" budget="$2"
+    shift 2
     local log="${artifact_root}/${name}.log"
     local rc
     echo
     echo "SMOKE-GATE: >>> ${name}"
     set +e
-    timeout --signal=TERM --kill-after=10 360 "$@" 2>&1 | tee "${log}"
+    timeout --signal=TERM --kill-after=10 "${budget}" "$@" 2>&1 | tee "${log}"
     rc=${PIPESTATUS[0]}
     set -e
     if [ "${rc}" -eq 0 ]; then
@@ -64,6 +64,12 @@ run_stage() { # <name> <command...>
     return 0
 }
 
+run_stage() { # <name> <command...>
+    local name="$1"
+    shift
+    run_stage_with_budget "${name}" "${VKRELAY2_SMOKE_STAGE_TIMEOUT:-360}" "$@"
+}
+
 # Turn on errexit only after run_stage exists; each stage temporarily disables it to collect rc.
 set -e
 
@@ -77,7 +83,8 @@ run_stage real-gl-apps bash "${script_dir}/run_gl_apps_smoke.sh" "${build_dir}"
 catalog_args=("${build_dir}")
 [ "${strict}" -eq 1 ] && catalog_args+=(--strict)
 VKRELAY2_RENDER_CATALOG_DIR="${artifact_root}/render-catalog" \
-    run_stage render-catalog bash "${script_dir}/render_catalog.sh" "${catalog_args[@]}"
+    run_stage_with_budget render-catalog "${VKRELAY2_CATALOG_STAGE_TIMEOUT:-900}" \
+    bash "${script_dir}/render_catalog.sh" "${catalog_args[@]}"
 
 run_stage lifecycle bash "${script_dir}/run_lifecycle_smoke.sh" "${build_dir}"
 run_stage input bash "${script_dir}/run_input_smoke.sh" "${build_dir}"
